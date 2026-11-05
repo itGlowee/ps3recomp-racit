@@ -3123,15 +3123,16 @@ static void eng_present(void* user, u32 surface)
     eng_dump_frame(src);
 }
 
-static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-                         void* out, u32 out_pitch)
+static int eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                        void* out, u32 out_pitch)
 {
     (void)user;
     id<MTLTexture> t = eng_obj(surface);
-    if (!t || !out || !out_pitch || !w || !h) return;
-    if (x + w > [t width] || y + h > [t height]) return;
+    if (!t || !out || !out_pitch || !w || !h) return -1;
+    if (x + w > [t width] || y + h > [t height]) return -1;
     [t getBytes:out bytesPerRow:out_pitch
      fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
+    return 0;
 }
 
 static const rsx_draw_backend s_engine_backend = {

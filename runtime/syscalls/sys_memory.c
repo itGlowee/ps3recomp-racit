@@ -1,7 +1,9 @@
+#include <errno.h>
 /*
  * ps3recomp - Memory management syscalls (implementation)
  */
 
+#include <stdlib.h>
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
@@ -41,6 +43,57 @@ static void bump_lock(void)   { pthread_mutex_lock(&s_bump_mtx); }
 static void bump_unlock(void) { pthread_mutex_unlock(&s_bump_mtx); }
 #endif
 
+/* Ranges sys_memory_free gave back, for the next allocation that fits. The
+ * window used to be a bump allocator only: a freed range was never handed out
+ * again, so every allocate/free cycle took fresh address space (and kept the
+ * old range's pages committed) until the 256 MB window ran out and allocate
+ * returned ENOMEM -- a failure only a long session reaches. A free range that
+ * ends at the bump pointer lowers it instead; neighbours merge. Under the
+ * bump lock. (A Crack in Time allocates once, at boot; this is for titles
+ * that cycle.) */
+static struct { uint32_t addr, size; } s_free_ranges[SYS_MEMORY_ALLOC_MAX * 2];
+static int s_n_free_ranges;
+
+static void free_range_add(uint32_t addr, uint32_t size)
+{
+    for (int merged = 1; merged; ) {
+        merged = 0;
+        for (int i = 0; i < s_n_free_ranges; i++) {
+            const uint32_t a = s_free_ranges[i].addr, s = s_free_ranges[i].size;
+            if (a + s == addr) { addr = a; size += s; }
+            else if (addr + size == a) { size += s; }
+            else continue;
+            s_free_ranges[i] = s_free_ranges[--s_n_free_ranges];
+            merged = 1;
+            break;
+        }
+    }
+    if (addr + size == g_sys_mem_bump_ptr) { g_sys_mem_bump_ptr = addr; return; }
+    if (s_n_free_ranges < (int)(sizeof s_free_ranges / sizeof s_free_ranges[0])) {
+        s_free_ranges[s_n_free_ranges].addr = addr;
+        s_free_ranges[s_n_free_ranges].size = size;
+        s_n_free_ranges++;
+    }
+}
+
+/* The smallest free range holding `size` at `alignment`; 0 if none. */
+static uint32_t free_range_take(uint32_t size, uint32_t alignment)
+{
+    int best = -1; uint32_t at = 0;
+    for (int i = 0; i < s_n_free_ranges; i++) {
+        const uint32_t a = VM_ALIGN_UP(s_free_ranges[i].addr, alignment);
+        const uint32_t end = s_free_ranges[i].addr + s_free_ranges[i].size;
+        if (a >= end || end - a < size) continue;
+        if (best < 0 || s_free_ranges[i].size < s_free_ranges[best].size) { best = i; at = a; }
+    }
+    if (best < 0) return 0;
+    const uint32_t lo = s_free_ranges[best].addr, end = lo + s_free_ranges[best].size;
+    s_free_ranges[best] = s_free_ranges[--s_n_free_ranges];
+    if (at > lo) free_range_add(lo, at - lo);
+    if (at + size < end) free_range_add(at + size, end - (at + size));
+    return at;
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -64,8 +117,14 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     uint32_t flags     = LV2_ARG_U32(ctx, 1);
     uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
 
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
-            size, flags);
+    {   /* PORT PATCH (racacit): this fires ~170k/s once the game starts retrying;
+         * log only when SYS_MEMORY_TRACE is set. */
+        static int trace = -1;
+        if (trace < 0) trace = getenv("SYS_MEMORY_TRACE") != NULL;
+        if (trace)
+            fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X) lr=0x%08X r30=0x%X r26=0x%X\n",
+                    size, flags, (unsigned)ctx->lr, (unsigned)ctx->gpr[30], (unsigned)ctx->gpr[26]);
+    }
 
     /* Determine alignment based on page size flags */
     uint32_t alignment;
@@ -86,15 +145,6 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     if (g_sys_mem_bump_ptr == 0)
         g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
 
-    /* Align bump pointer */
-    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
-
-    /* Check if we have room */
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
-        bump_unlock();
-        return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-
     /* Find a free allocation slot */
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
@@ -102,11 +152,23 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     }
     if (slot < 0) {
         bump_unlock();
+        { static int _n; if ((_n < 5 && (_n++, 1))) fprintf(stderr, "[sys_memory] ENOMEM (no slot)\n"); }
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
-    uint32_t alloc_addr = g_sys_mem_bump_ptr;
-    g_sys_mem_bump_ptr += size;
+    /* A range given back earlier, else the bump pointer. */
+    uint32_t alloc_addr = free_range_take(size, alignment);
+    const int reused = alloc_addr != 0;
+    if (!reused) {
+        g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
+        if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+            bump_unlock();
+            { static int _n; if ((_n < 5 && (_n++, 1))) fprintf(stderr, "[sys_memory] ENOMEM (bump exhausted) size=0x%X total=0x%X lr=0x%08X\n", size, (unsigned)s_total_allocated, (unsigned)ctx->lr); }
+            return (int64_t)(int32_t)CELL_ENOMEM;
+        }
+        alloc_addr = g_sys_mem_bump_ptr;
+        g_sys_mem_bump_ptr += size;
+    }
     s_total_allocated += size;
 
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
@@ -121,11 +183,15 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     /* Commit the pages (window is outside the pre-committed main region);
      * fresh commits are already zeroed by the OS */
     if (vm_commit(alloc_addr, size) != CELL_OK) {
+        { static int _n; if ((_n < 3 && (_n++, 1))) fprintf(stderr, "[sys_memory] vm_commit(0x%08X, 0x%X) FAILED errno=%d vm_base=%p ppu_vm_size=0x%X\n",
+              alloc_addr, size, errno, (void*)vm_base, (unsigned)ppu_vm_size); }
         a->active = 0;
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
+    /* A reused range holds what its last owner left; fresh pages are zero. */
+    if (reused) memset(vm_to_host(alloc_addr), 0, size);
 
-    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
+    fprintf(stderr, "[sys_memory] allocate -> 0x%08X%s\n", alloc_addr, reused ? " (reused)" : "");
 
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);
@@ -142,14 +208,19 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
+    { static int _n; if ((_n < 5 && (_n++, 1))) fprintf(stderr, "[sys_memory] free(0x%08X) lr=0x%08X\n", addr, (unsigned)ctx->lr); }
 
+    bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
             s_total_allocated -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
+            free_range_add(addr, g_sys_mem_allocs[i].size);
+            bump_unlock();
             return CELL_OK;
         }
     }
+    bump_unlock();
 
     return (int64_t)(int32_t)CELL_EINVAL;
 }
@@ -321,6 +392,7 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
 
     if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
         bump_unlock();
+        { static int _n; if ((_n < 5 && (_n++, 1))) fprintf(stderr, "[sys_memory] ENOMEM (bump exhausted) size=0x%X total=0x%X lr=0x%08X\n", size, (unsigned)s_total_allocated, (unsigned)ctx->lr); }
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
@@ -426,6 +498,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, VM_PAGE_SIZE);
     if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
         bump_unlock();
+        { static int _n; if ((_n < 5 && (_n++, 1))) fprintf(stderr, "[sys_memory] ENOMEM (bump exhausted) size=0x%X total=0x%X lr=0x%08X\n", size, (unsigned)s_total_allocated, (unsigned)ctx->lr); }
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
     uint32_t addr = g_sys_mem_bump_ptr;

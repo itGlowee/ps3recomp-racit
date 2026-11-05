@@ -86,7 +86,6 @@ static const char* content_root(void)
 static char s_content_info_path[CELL_GAME_PATH_MAX] = "";
 static char s_usrdir_path[CELL_GAME_PATH_MAX] = "";
 static char s_tmp_path[CELL_GAME_PATH_MAX] = "";
-static char s_exit_param[256] = "";
 
 static int  s_boot_checked = 0;
 static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;

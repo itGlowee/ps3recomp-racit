@@ -453,7 +453,14 @@ static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
 
 static void apply_affinity(pthread_t pt, DWORD_PTR mask)
 {
-#if defined(__linux__)
+#if defined(__ANDROID__)
+    /* Bionic has no pthread_setaffinity_np: set it for the calling thread
+     * only (which is how every caller here uses it). */
+    cpu_set_t set; CPU_ZERO(&set);
+    for (unsigned i = 0; i < 8 * sizeof mask && i < CPU_SETSIZE; i++)
+        if (mask & ((DWORD_PTR)1 << i)) CPU_SET(i, &set);
+    if (pthread_equal(pt, pthread_self())) sched_setaffinity(0, sizeof set, &set);
+#elif defined(__linux__)
     cpu_set_t set; CPU_ZERO(&set);
     for (unsigned i = 0; i < 8 * sizeof mask && i < CPU_SETSIZE; i++)
         if (mask & ((DWORD_PTR)1 << i)) CPU_SET(i, &set);

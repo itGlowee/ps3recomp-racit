@@ -236,11 +236,12 @@ static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.
  * the readback hook has to put those back into the guest's A8R8G8B8. */
 static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
 
-static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
-                          void* out, u32 pitch)
+static int stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
+                         void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y; (void)pitch;
-    if (w == 1 && h == 1) memcpy(out, g_stub_pixel, 4);
+    if (w == 1 && h == 1) { memcpy(out, g_stub_pixel, 4); return 0; }
+    return -1;
 }
 
 static const rsx_draw_backend g_stub_backend = {

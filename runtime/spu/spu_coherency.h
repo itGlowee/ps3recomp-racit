@@ -53,7 +53,17 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
+/* Has any SPU ever reserved this 128-byte line? Lock-free read of the bitmap
+ * spu_coherency.c maintains; inline because it runs on every PPU store. */
+extern unsigned char spu_coh_bitmap_g[];
+extern volatile int spu_coh_armed_g;
 int spu_coh_is_reserved(uint32_t addr);
+static inline int spu_coh_is_reserved_fast(uint32_t addr)
+{
+    if (!spu_coh_armed_g) return 0;
+    uint32_t line = addr >> 7;
+    return (spu_coh_bitmap_g[line >> 3] >> (line & 7)) & 1u;
+}
 
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host

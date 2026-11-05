@@ -58,6 +58,10 @@ int rsx_hlsl_to_spirv(const char* hlsl, int stage,
                       u32* words, u32 max_words, u32* out_words,
                       char* log, u32 log_size);
 
+/* Translations answered from the SPIR-V cache (memory, or the file named by
+ * RSX_SHADER_CACHE) and translations actually run, since start. */
+void rsx_hlsl_to_spirv_cache_stats(unsigned long* hits, unsigned long* misses);
+
 #ifdef __cplusplus
 }
 #endif

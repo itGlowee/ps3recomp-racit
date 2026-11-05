@@ -81,7 +81,11 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
 static SRWLOCK s_completion_lock = SRWLOCK_INIT;
 #define COMPLETION_LOCK() AcquireSRWLockExclusive(&s_completion_lock)
 #define COMPLETION_UNLOCK() ReleaseSRWLockExclusive(&s_completion_lock)
+#ifdef _MSC_VER
 #define COMPLETION_TLS __declspec(thread)
+#else   /* clang/mingw ignores __declspec(thread): it would be ONE global */
+#define COMPLETION_TLS __thread
+#endif
 #else
 #include <pthread.h>
 static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;

@@ -67,6 +67,11 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
  * ATTRn semantics selected by input_mask.  The mask is checked against a
  * fresh static analysis; any uncertainty or missing referenced bit falls
  * back to all 16 inputs. */
+/* TRANSFORM_BRANCH_BITS the next translation resolves BRB/CLB against, and
+ * whether a program has any (then its pipelines are keyed on the bits). */
+extern u32 rsx_vp_branch_bits;
+int rsx_vp_uses_branch_bits(const void* ucode, u32 bytes);
+
 int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);

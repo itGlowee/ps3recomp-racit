@@ -92,45 +92,6 @@ static LwCondSlot s_lwcond[MAX_LWCOND];
 static u32 s_lwcond_next = 0;
 
 /* ---------------------------------------------------------------------------
- * Internal: Thread table
- * -----------------------------------------------------------------------*/
-#define MAX_PRX_THREADS 64
-
-typedef struct {
-    int in_use;
-    u64 thread_id;
-    sys_ppu_thread_entry_t entry;
-    u64 arg;
-    u64 exitcode;
-    int joined;
-    int detached;
-#ifdef _WIN32
-    HANDLE handle;
-#else
-    pthread_t pt;
-#endif
-} PrxThreadSlot;
-
-static PrxThreadSlot s_threads[MAX_PRX_THREADS];
-static u64 s_next_thread_id = 0x10000; /* start high to avoid collision with sys_ppu_thread */
-
-#ifdef _WIN32
-static DWORD WINAPI prx_thread_entry(LPVOID param)
-{
-    PrxThreadSlot* t = (PrxThreadSlot*)param;
-    t->entry(t->arg);
-    return 0;
-}
-#else
-static void* prx_thread_entry(void* param)
-{
-    PrxThreadSlot* t = (PrxThreadSlot*)param;
-    t->entry(t->arg);
-    return NULL;
-}
-#endif
-
-/* ---------------------------------------------------------------------------
  * Internal: Heap table
  * -----------------------------------------------------------------------*/
 #define MAX_HEAPS 16
@@ -894,7 +855,7 @@ static u32 yz_heap_alloc(u32 size, u32 align)
     u32 user = (raw + 16 + align - 1) & ~(align - 1);
     { static int dbg = -1;
       if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
-      if (dbg) { static int n = 0; if (n++ < 400)
+      if (dbg) { static int n = 0; if ((n < 400 && (n++, 1)))
           fprintf(stderr, "[heap] alloc size=%u align=%u -> 0x%08X (raw 0x%08X, bin %u)%c",
                   size, align, user, raw, b, 10); } }
     vm_write32(user - 4,  user - raw);
@@ -913,7 +874,7 @@ static void yz_heap_free(u32 user)
     u32 raw = user - off;
     { static int dbg = -1;
       if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
-      if (dbg) { static int n = 0; if (n++ < 400)
+      if (dbg) { static int n = 0; if ((n < 400 && (n++, 1)))
           fprintf(stderr, "[heap] free  0x%08X (bin %u)%c", user, b, 10); } }
     vm_write32(user - 12, 0);                            /* poison: catch double free */
     slot_lock();

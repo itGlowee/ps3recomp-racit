@@ -88,7 +88,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
               memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
               if (strstr(tmp, pat)) {
                   static int _n = 0;
-                  if (_n++ < 4) {
+                  if ((_n < 4 && (_n++, 1))) {
                       uint32_t sp = (uint32_t)ctx->gpr[1];
                       fprintf(stderr, "[TTY_BT] \"%.70s\" tid=%llu cia=0x%08X lr=0x%08X chain:",
                               tmp, (unsigned long long)ctx->thread_id,
@@ -112,7 +112,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
             char tmp[256]; uint32_t n = len < 255 ? len : 255;
             memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
             if (strstr(tmp, "NULL pointer") || strstr(tmp, "E2004090") || strstr(tmp, "CRICRS")) {
-                static int _cb = 0; if (_cb++ < 4) {
+                static int _cb = 0; if ((_cb < 4 && (_cb++, 1))) {
                     uint32_t sp = (uint32_t)ctx->gpr[1];
                     fprintf(stderr, "[CRIBT] \"%.60s\" cia=0x%08X lr=0x%08X chain:", tmp,
                             (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -136,7 +136,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
             memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
             if (strstr(tmp, "ASSERT") || strstr(tmp, "Tuner") || strstr(tmp, "usertrace") ||
                 strstr(tmp, "libspurs")) {
-                static int _ab = 0; if (_ab++ < 4) {
+                static int _ab = 0; if ((_ab < 4 && (_ab++, 1))) {
                     uint32_t sp = (uint32_t)ctx->gpr[1];
                     fprintf(stderr, "\n[ASSERTBT] \"%.70s\" cia=0x%08X lr=0x%08X chain:", tmp,
                             (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -163,7 +163,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
                 strstr(ptmp, "out of memory on request")) {
                 extern void ppu_log_host_chain(const char*);
                 static int _pn = 0;
-                if (_pn++ < 3) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
+                if ((_pn < 3 && (_pn++, 1))) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
             }
         }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
@@ -308,6 +308,7 @@ typedef struct {
     spu_thread_handle_t host_thread;
     spu_thread_event_t  finish_event;
     int                 running;
+    int                 host_live;   /* host_thread spawned and not yet closed / joined */
     spu_ppu_fallback_fn fb_handler;
     void*               fb_user;
     /* Live spu_context while a lifted worker is running on its host thread
@@ -698,6 +699,33 @@ static void spu_spawn_host_thread(spu_thread_handle_t* out,
 }
 #endif
 
+/* The host thread of an SPU thread's last run, done with: its handle closed
+ * (Windows) or the thread joined (POSIX; detached when not waiting). group_join
+ * used to do this only for a thread still running when the guest joined it,
+ * but both thread procs clear `running` as they finish -- so every thread that
+ * was already done kept its handle and kernel thread object until the next
+ * start overwrote the handle, and on POSIX was never joined at all: its whole
+ * stack reservation stayed mapped. Called at join, before a restart, and when
+ * the group is destroyed. */
+static void spu_host_thread_reap(spu_thread_t* t, int wait)
+{
+    if (!t->host_live) return;
+#ifdef _WIN32
+    (void)wait;
+    if (t->host_thread) CloseHandle(t->host_thread);
+    t->host_thread = NULL;
+#else
+    if (wait) {
+        pthread_join(t->host_thread, NULL);
+        pthread_mutex_destroy(&t->finish_event.mu);
+        pthread_cond_destroy(&t->finish_event.cv);
+    } else {
+        pthread_detach(t->host_thread);
+    }
+#endif
+    t->host_live = 0;
+}
+
 /* Host-thread entry for a thread running its image's own lifted SPU code.
  *
  * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
@@ -887,7 +915,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * only scratch is either reading the wrong descriptor or the descriptor
          * does not name the buffer we expect. */
         { static int _wd = -1; if (_wd < 0) _wd = getenv("SPU_WORKDESC_DUMP") ? 1 : 0;
-          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 3) {
+          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if ((_n < 3 && (_n++, 1))) {
               fprintf(stderr, "[WORKDESC] tid=0x%X ea=0x%08X:%c", t->tid, work_ea, 10);
               for (int r = 0; r < 16; r++) {
                   fprintf(stderr, "  +0x%03X:", r * 16);
@@ -896,13 +924,13 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
                   fprintf(stderr, "%c", 10);
               } } } }
         { static int _wh = -1; if (_wh < 0) _wh = getenv("SPU_WORKDESC_HDR") ? 1 : 0;
-          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 40)
+          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if ((_n < 40 && (_n++, 1)))
               fprintf(stderr, "[WORKHDR] tid=0x%X ea=0x%08X w0=%u w1=%u f2=%g f3=%g%c",
                       t->tid, work_ea, vm_read_be32(work_ea), vm_read_be32(work_ea+4),
                       (double)*(const float*)&(const uint32_t){0}, 0.0, 10); }
           if (_wh && work_ea > 0x1000000u && vm_base) { } }
         { static int _sd = -1; if (_sd < 0) _sd = getenv("SPU_SEED_DBG") ? 1 : 0;
-          if (_sd) { static int _n = 0; if (_n++ < 12)
+          if (_sd) { static int _n = 0; if ((_n < 12 && (_n++, 1)))
               fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
                       t->tid, entry, t->args_ea, work_ea, 10); } }
         /* Do NOT seed the inbound mailbox. It is the reply channel for the
@@ -916,7 +944,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
               extern uint64_t g_spu_interp_steps;
               double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
-              static int _n = 0; if (_n++ < 20)
+              static int _n = 0; if ((_n < 20 && (_n++, 1)))
                   fprintf(stderr, "[spu-speed] tid=0x%X %llu insns in %.3f s = %.1f M/s%c",
                           t->tid, (unsigned long long)g_spu_interp_steps, sec,
                           sec > 0 ? g_spu_interp_steps / sec / 1e6 : 0.0, 10); } }
@@ -1014,6 +1042,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 d.img_ea   = t->img_ea;
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
+                spu_host_thread_reap(t, 0);   /* a previous run's, if never joined */
                 t->running = 1;
 #ifdef _WIN32
                 if (!t->finish_event)
@@ -1023,11 +1052,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                               spu_exec_thread_proc, t,
                                               STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+                t->host_live = t->host_thread != NULL;
 #else
                 pthread_mutex_init(&t->finish_event.mu, NULL);
                 pthread_cond_init(&t->finish_event.cv, NULL);
                 t->finish_event.done = 0;
                 spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
+                t->host_live = 1;
 #endif
                 fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
                         "args=0x%08X -> LIFTED SPU execution (image %d, "
@@ -1135,6 +1166,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
             instant++;
             continue;
         }
+        spu_host_thread_reap(t, 0);   /* a previous run's, if never joined */
 #ifdef _WIN32
         /* Manual-reset event so multiple group_join callers all see "set" */
         if (!t->finish_event)
@@ -1144,11 +1176,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                       spu_fallback_thread_proc, t,
                                       STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        t->host_live = t->host_thread != NULL;
 #else
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
         t->finish_event.done = 0;
         spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t);
+        t->host_live = 1;
 #endif
         /* Start handshake for a persistent worker: do not let group_start
          * return until the worker has published its live context.
@@ -1239,20 +1273,14 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
 #ifdef _WIN32
                 if (t->finish_event)
                     WaitForSingleObject(t->finish_event, INFINITE);
-                if (t->host_thread) {
-                    CloseHandle(t->host_thread);
-                    t->host_thread = NULL;
-                }
 #else
                 pthread_mutex_lock(&t->finish_event.mu);
                 while (!t->finish_event.done)
                     pthread_cond_wait(&t->finish_event.cv, &t->finish_event.mu);
                 pthread_mutex_unlock(&t->finish_event.mu);
-                pthread_join(t->host_thread, NULL);
-                pthread_mutex_destroy(&t->finish_event.mu);
-                pthread_cond_destroy(&t->finish_event.cv);
 #endif
             }
+            spu_host_thread_reap(t, 1);   /* finished before the join or just now */
             if (t->exit_status < worst) worst = t->exit_status;
         }
         /* ALL_THREADS_EXIT is only the DEFAULT. A thread that stopped on
@@ -1281,12 +1309,20 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
                                    0);
     }
 
-    vm_write_be32(cause_ea,  g->cause);
-    vm_write_be32(status_ea, (uint32_t)g->exit_status);
-
     fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
             id, g->cause, g->exit_status, g->event_queue_id);
     fflush(stderr);
+    /* PORT FIX (racacit): LV2 joins first, then returns CELL_EFAULT if either
+     * output pointer is NULL -- without writing through it. libspurs' handler
+     * thread (spurs_handler_entry) joins its kernel group with (NULL, NULL)
+     * and ASSERTS the result is EFAULT ("unexpected value 0x0" otherwise,
+     * which aborts real-libsre SPURS). RPCS3's HLE handler checks the same. */
+    if (!cause_ea || !status_ea) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Du;   /* CELL_EFAULT */
+        return (int64_t)(int32_t)0x8001000Du;
+    }
+    vm_write_be32(cause_ea,  g->cause);
+    vm_write_be32(status_ea, (uint32_t)g->exit_status);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1313,6 +1349,10 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
             uint32_t idx = g->thread_indices[i];
             if (idx < MAX_SPU_THREADS) {
                 spu_thread_t* t = &s_spu_threads[idx];
+                spu_host_thread_reap(t, !t->running);
+#ifdef _WIN32
+                if (t->finish_event && !t->running) { CloseHandle(t->finish_event); t->finish_event = NULL; }
+#endif
                 if (t->local_store) {
                     free(t->local_store);
                     t->local_store = NULL;
@@ -1452,7 +1492,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
          * real fix is resident SPU threads, or a printf port that resolves
          * to its thread; this is the floor until one of those exists. */
         static int warned = 0;
-        if (warned++ < 8) {
+        if ((warned < 8 && (warned++, 1))) {
             fprintf(stderr, "[SPU] write_spu_mb: thread 0x%X not found -- "
                             "dropping the word and reporting CELL_OK, as the "
                             "unimplemented stub did\n", tid);
@@ -1510,7 +1550,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
             }
             if (spu_channel_has_data(&c->ch_in_mbox)) {
                 static int _n = 0;
-                if (_n++ < 8)
+                if ((_n < 8 && (_n++, 1)))
                     fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> BUSY after "
                             "%d ms (mailbox still holds 0x%08X)\n",
                             tid, val, waited, c->ch_in_mbox.value);
@@ -1518,13 +1558,13 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
                 return (int64_t)(int32_t)CELL_EBUSY;
             }
             { static int _n = 0;
-              if (_n++ < 8)
+              if ((_n < 8 && (_n++, 1)))
                   fprintf(stderr, "[SPU] write_spu_mb tid=0x%X: waited %d ms for the "
                           "mailbox to drain\n", tid, waited); }
         }
 
         { static int _n = 0;
-          if (_n++ < 32)
+          if ((_n < 32 && (_n++, 1)))
               fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> live worker\n",
                       tid, val); }
         spu_channel_write(&c->ch_in_mbox, val);
@@ -1723,7 +1763,7 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     }
     if (!q && t && t->connected_queue) q = t->connected_queue;
     if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
-    { static int s_d = 0; if (getenv("SPU_MBOXTRACE") && s_d++ < 64)
+    { static int s_d = 0; if (getenv("SPU_MBOXTRACE") && (s_d < 64 && (s_d++, 1)))
         fprintf(stderr, "[SPU->PPU] deliver? spu=0x%X intr=%d val=0x%08X q=%u (thread %s)\n",
                 spu_id, is_intr, value, q, t ? "found" : "MISSING"); }
     if (!q) return;
@@ -1732,7 +1772,7 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     sys_event_queue_push_by_id(q,
         ((uint64_t)spu_id << 32) | (is_intr ? 0x2u : 0x1u),
         (uint64_t)value, 0, 0);
-    { static int s_w = 0; if (s_w++ < 32)
+    { static int s_w = 0; if ((s_w < 32 && (s_w++, 1)))
         fprintf(stderr, "[SPU->PPU] mbox deliver spu=0x%X intr=%d val=0x%08X -> q=%u\n",
                 spu_id, is_intr, value, q); }
 }
@@ -2046,7 +2086,7 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
      * it unsatisfied. Print the guest caller chain for the first few so the
      * retry loop can be identified. */
     { static int _bt_n = 0;
-      if (_bt_n++ < 3) {
+      if ((_bt_n < 3 && (_bt_n++, 1))) {
           /* Matches func_entry in the generated ppu_recomp.h. */
           struct lv2_bt_fentry { uint64_t addr; void* func; const char* name; };
           extern const struct lv2_bt_fentry function_table[];
@@ -2308,8 +2348,11 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
         return -1;
     }
+    { extern int spurs_hle_write_snr(uint32_t, uint32_t, uint32_t);
+      if (spurs_hle_write_snr(tid, num, val)) { ctx->gpr[3] = 0; return 0; } }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
+        { static int n = 0; if (n++ < 12) fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X: NO SUCH THREAD\n", tid, num + 1, val); }
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
         return -1;
     }

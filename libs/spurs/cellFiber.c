@@ -24,6 +24,15 @@
 #include <windows.h>
 #else
 #include <ucontext.h>
+#if defined(__ANDROID__)
+/* Bionic declares ucontext_t but none of the context routines. A Crack in
+ * Time never makes a PPU fiber; if anything ever does, say so and stop. */
+static void fiber_unsupported(void) { fprintf(stderr, "[cellFiber] PPU fibers are not supported on Android%c", 10); abort(); }
+static int getcontext(ucontext_t* u) { (void)u; fiber_unsupported(); return -1; }
+static void makecontext(ucontext_t* u, void (*f)(void), int argc, ...) { (void)u; (void)f; (void)argc; fiber_unsupported(); }
+static int swapcontext(ucontext_t* a, const ucontext_t* b) { (void)a; (void)b; fiber_unsupported(); return -1; }
+static int setcontext(const ucontext_t* u) { (void)u; fiber_unsupported(); return -1; }
+#endif
 
 #if defined(__APPLE__)
 /* getcontext() points uc_mcontext at ucontext_t's own __mcontext_data member

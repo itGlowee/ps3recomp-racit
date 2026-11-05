@@ -29,6 +29,17 @@
 #ifdef st_ctime
 #  undef st_ctime
 #endif
+/* A host file's modification time in seconds (the macro is gone, see above). */
+static long long host_mtime(const struct stat* st)
+{
+#ifdef _WIN32
+    return (long long)st->st_mtime;
+#elif defined(__APPLE__)
+    return (long long)st->st_mtimespec.tv_sec;
+#else
+    return (long long)st->st_mtim.tv_sec;
+#endif
+}
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -52,6 +63,22 @@
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
+/* racacit: save data lives under the same /dev_hdd0 the rest of the runtime
+ * maps (PS3_HDD0_ROOT), not under ./gamedata relative to the working
+ * directory -- on Android the working directory is "/" and not writable, and
+ * on Windows it depends on how the exe was launched. */
+static const char* save_root(void)
+{
+    static int init = 0;
+    if (!init) {
+        init = 1;
+        const char* h = getenv("PS3_HDD0_ROOT");
+        if (h && *h)
+            snprintf(s_save_root, sizeof s_save_root, "%s/home/00000001/savedata", h);
+    }
+    return s_save_root;
+}
+
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
 {
@@ -72,7 +99,7 @@ static void ensure_dirs(const char* path)
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
-    snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
+    snprintf(buf, buf_size, "%s/%s", save_root(), dirName);
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
         if (*p == '/') *p = '\\';
@@ -379,6 +406,158 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
  * `selected` receives the chosen directory ("" when none): the first listed
  * entry, else the new-save name, else the focus name. For a save with nothing
  * listed the new-save name wins -- headless, there is no user to pick. */
+/* ---- The native save screen ---------------------------------------------
+ * Where the PS3 shows its save list (the List calls), the player picks on
+ * rsx_host_ui_save_pick's screen: the saves the title's funcList offered,
+ * each with the ICON0, location and play time it wrote, plus "New save"
+ * when offered. Without a window (or RACACIT_SAVE_UI=0) the old headless
+ * choice below applies. */
+#include "../video/rsx_host_ui.h"
+extern unsigned char* stbi_load_from_memory(const unsigned char* buffer, int len, int* x, int* y,
+                                            int* comp, int req_comp);
+extern void stbi_image_free(void* p);
+
+/* The list call's result when the player backed out of the screen. */
+#define SAVEDATA_PICK_CANCELLED 0x7FFF0C01
+#define SAVEDATA_CELL_CANCEL 1   /* CELL_CANCEL: the system list was closed */
+static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
+
+/* Delete from the screen: the save (and its write backup) moves to
+ * <savedata>/../savedata_deleted/<dir>_<time>, so a wrong press is never the
+ * end of a save. */
+static int savedata_delete_dir(const char* dir)
+{
+    if (!dir || !dir[0] || strchr(dir, '/') || strchr(dir, '\\') || dir[0] == '.') return -1;
+    char from[1024], to[1100], stamp[32];
+    time_t t = time(NULL);
+    struct tm lt;
+#ifdef _WIN32
+    localtime_s(&lt, &t);
+#else
+    localtime_r(&t, &lt);
+#endif
+    strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", &lt);
+    snprintf(to, sizeof to, "%s/../savedata_deleted", save_root());
+    ensure_dirs(to);
+    build_save_path(from, sizeof from, dir);
+    snprintf(to, sizeof to, "%s/../savedata_deleted/%s_%s", save_root(), dir, stamp);
+    if (rename(from, to) != 0) {
+        printf("[cellSaveData] delete '%s': could not move it (errno %d)%c", dir, errno, 10);
+        return -1;
+    }
+    snprintf(from, sizeof from, "%s/../savedata_backup/%s", save_root(), dir);
+    snprintf(to, sizeof to, "%s/../savedata_deleted/%s_%s_backup", save_root(), dir, stamp);
+    if (dir_exists(from)) rename(from, to);
+    printf("[cellSaveData] save '%s' deleted from the save screen (kept in savedata_deleted)%c", dir, 10);
+    return 0;
+}
+
+static unsigned char* savedata_load_icon(const char* save_path, int* w, int* h)
+{
+    char p[1100];
+    snprintf(p, sizeof p, "%s/ICON0.PNG", save_path);
+    FILE* f = fopen(p, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char* buf = (n > 0 && n < (8 << 20)) ? (unsigned char*)malloc((size_t)n) : NULL;
+    const size_t got = buf ? fread(buf, 1, (size_t)n, f) : 0;
+    fclose(f);
+    if (!buf || got != (size_t)n) { free(buf); return NULL; }
+    int comp = 0;
+    unsigned char* px = stbi_load_from_memory(buf, (int)n, w, h, &comp, 4);
+    free(buf);
+    return px;
+}
+
+/* One row of the save screen from the save on disk; 0 when there is none. */
+static int savedata_fill_entry(rsx_save_entry* s, const char* nm)
+{
+    char path[1024];
+    build_save_path(path, sizeof path, nm);
+    if (!nm[0] || !dir_exists(path)) return 0;
+    memset(s, 0, sizeof *s);
+    snprintf(s->dir, sizeof s->dir, "%s", nm);
+    CellSaveDataSystemFileParam sfo;
+    read_param_sfo(path, &sfo);
+    snprintf(s->title, sizeof s->title, "%s", sfo.title);
+    snprintf(s->subtitle, sizeof s->subtitle, "%s", sfo.subTitle);
+    snprintf(s->detail, sizeof s->detail, "%s", sfo.detail);
+    /* A file's time, not the folder's: writing a file inside does not
+     * touch the folder's on Windows. */
+    static const char* const probe[] = { "PARAM.SFO", "GAME.SAV" };
+    for (int pi = 0; pi < 2; pi++) {
+        char fp[1100]; struct stat st;
+        snprintf(fp, sizeof fp, "%s/%s", path, probe[pi]);
+        if (stat(fp, &st) == 0 && host_mtime(&st) > s->mtime) s->mtime = host_mtime(&st);
+    }
+    if (s->mtime) {
+        time_t t = (time_t)s->mtime; struct tm lt;
+#ifdef _WIN32
+        localtime_s(&lt, &t);
+#else
+        localtime_r(&t, &lt);
+#endif
+        strftime(s->when, sizeof s->when, "%b %d, %Y  %H:%M", &lt);
+    }
+    s->icon = savedata_load_icon(path, &s->icon_w, &s->icon_h);
+    return 1;
+}
+
+/* Newest first, as the system list sorts by default. */
+static void savedata_sort_entries(rsx_save_entry* e, int n)
+{
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && e[j].mtime > e[j - 1].mtime; j--) { rsx_save_entry t = e[j]; e[j] = e[j - 1]; e[j - 1] = t; }
+}
+
+static void savedata_free_entries(rsx_save_entry* e, int n)
+{
+    for (int i = 0; i < n; i++) if (e[i].icon) stbi_image_free((void*)e[i].icon);
+    free(e);
+}
+
+/* 1: `selected` holds the choice; 0: the player backed out; -1: no screen. */
+static int savedata_ui_pick(int is_save, uint32_t fixed, uint32_t fixed_n, uint32_t new_name,
+                            uint32_t focus_pos, uint32_t focus, char selected[64])
+{
+    if (fixed_n > 64) fixed_n = 64;
+    rsx_save_entry* e = (rsx_save_entry*)calloc(fixed_n ? fixed_n : 1, sizeof *e);
+    if (!e) return -1;
+    int n = 0;
+    for (uint32_t k = 0; fixed && k < fixed_n; k++) {
+        char nm[33];
+        for (int i = 0; i < 32; i++) nm[i] = (char)vm_read8(fixed + k * 48 + (uint32_t)i);
+        nm[32] = '\0';
+        n += savedata_fill_entry(&e[n], nm);
+    }
+    savedata_sort_entries(e, n);
+
+    char focus_name[33] = "";
+    if (focus) { for (int i = 0; i < 32; i++) focus_name[i] = (char)vm_read8(focus + (uint32_t)i); focus_name[32] = 0; }
+    const int allow_new = is_save && new_name;
+    int initial = allow_new ? RSX_SAVE_PICK_NEW : 0;
+    switch (focus_pos) {   /* CELL_SAVEDATA_FOCUSPOS_* */
+    case 0: for (int i = 0; i < n; i++) if (focus_name[0] && !strcmp(e[i].dir, focus_name)) initial = i; break;
+    case 1: if (n) initial = 0; break;                   /* list head */
+    case 2: if (n) initial = n - 1; break;               /* list tail */
+    case 3: if (n) initial = 0; break;                   /* latest    */
+    case 4: if (n) initial = n - 1; break;               /* oldest    */
+    case 5: if (allow_new) initial = RSX_SAVE_PICK_NEW; break;
+    default: if (!is_save && n) initial = 0; break;
+    }
+    int r = RSX_SAVE_PICK_UNAVAILABLE;
+    if (n || allow_new) r = rsx_host_ui_save_pick(is_save, e, n, allow_new, initial, savedata_delete_dir);
+    int out = -1;
+    if (r == RSX_SAVE_PICK_CANCEL) out = 0;
+    else if (r == RSX_SAVE_PICK_NEW && new_name) {
+        for (int i = 0; i < 63; i++) { selected[i] = (char)vm_read8(new_name + (uint32_t)i); if (!selected[i]) break; }
+        selected[63] = '\0';
+        out = 1;
+    } else if (r >= 0 && r < n) { snprintf(selected, 64, "%s", e[r].dir); out = 1; }
+    savedata_free_entries(e, n);
+    return out;
+}
+
 static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* dirList,
                                 uint32_t dirCount, uint32_t setBuf_ea, int is_save,
                                 uint32_t userdata_ea, const char* who, char selected[64])
@@ -414,9 +593,60 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
     const uint32_t fixed_n = vm_read32(set_ea + 8), fixed = vm_read32(set_ea + 12);
     const uint32_t newd = vm_read32(set_ea + 16), focus = vm_read32(set_ea + 4);
     const uint32_t new_name = newd ? vm_read32(newd + 4) : 0;
+    /* focusPosition: where the system list would put the cursor -- 0 = the
+     * named directory, 5 = "new save data". A title that names a directory
+     * means "this slot" (an in-game save of the current game), and honouring
+     * it keeps a save from opening a fresh slot every time. */
+    const uint32_t focus_pos = vm_read32(set_ea + 0);
+    printf("[cellSaveData] %s focusPosition=%u focusDir=%s%c", who, focus_pos,
+           focus ? "set" : "none", 10);
+    if (!strcmp(who, "funcList") && result >= 0) {
+        const int ui = savedata_ui_pick(is_save, fixed, fixed_n, new_name, focus_pos, focus, selected);
+        if (ui == 1) {
+            printf("[cellSaveData] %s: the player chose '%s' on the save screen%c", who, selected, 10);
+            return result;
+        }
+        if (ui == 0) {
+            printf("[cellSaveData] %s: the player backed out of the save screen%c", who, 10);
+            selected[0] = '\0';
+            return SAVEDATA_PICK_CANCELLED;
+        }
+    }
     uint32_t pick = 0;
-    if (is_save && new_name && fixed_n == 0) pick = new_name;
-    else if (fixed_n && fixed)               pick = fixed;
+    if (focus_pos == 0 && focus && vm_read8(focus) != 0) pick = focus;
+    else
+    /* A save that offers "new save data" next to existing ones: on hardware
+     * the player picks in the system list; headless, the new slot is the
+     * choice that cannot destroy anything. (A Crack in Time's New Game lists
+     * the existing save AND a new one; taking the listed one overwrote the
+     * player's save.) */
+    if (is_save && new_name)                 pick = new_name;
+    else if (fixed_n && fixed) {
+        pick = fixed;
+        /* A load from several saves: the player would pick in the system
+         * list; headless, continue the most recently written one. Entries
+         * are CellSaveDataDirList (dirName[32] first, 48 bytes each). */
+        if (!is_save && fixed_n > 1) {
+            time_t best_t = 0;
+            for (uint32_t k = 0; k < fixed_n && k < 64; k++) {
+                char nm[33];
+                for (int i = 0; i < 32; i++) nm[i] = (char)vm_read8(fixed + k * 48 + (uint32_t)i);
+                nm[32] = '\0';
+                /* A file's time, not the folder's: overwriting a file
+                 * inside does not touch the folder's on Windows. */
+                static const char* const probe[] = { "PARAM.SFO", "GAME.SAV", "" };
+                for (int pi = 0; pi < 3; pi++) {
+                    char path[1024];
+                    snprintf(path, sizeof path, "%s/%s/%s", save_root(), nm, probe[pi]);
+                    struct stat st;
+                    if (nm[0] && stat(path, &st) == 0) {
+                        if (host_mtime(&st) > best_t) { best_t = host_mtime(&st); pick = fixed + k * 48; }
+                        break;
+                    }
+                }
+            }
+        }
+    }
     else if (new_name)                       pick = new_name;
     else if (focus)                          pick = focus;
     if (pick) {
@@ -436,12 +666,12 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
-    ensure_dirs(s_save_root);
+    ensure_dirs(save_root());
 
 #ifdef _WIN32
     {
         char search[1024];
-        snprintf(search, sizeof(search), "%s\\*", s_save_root);
+        snprintf(search, sizeof(search), "%s\\*", save_root());
         for (char* p = search; *p; p++) {
             if (*p == '/') *p = '\\';
         }
@@ -470,7 +700,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
     }
 #else
     {
-        DIR* dp = opendir(s_save_root);
+        DIR* dp = opendir(save_root());
         if (!dp)
             return 0;
 
@@ -480,7 +710,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 continue;
             /* Check it's a directory */
             char full[1024];
-            snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);
+            snprintf(full, sizeof(full), "%s/%s", save_root(), de->d_name);
             if (!dir_exists(full))
                 continue;
             if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)
@@ -644,6 +874,92 @@ static u32 enumerate_save_files(const char* save_path,
     return count;
 }
 
+/* Before a save file is replaced, keep the version it replaces in
+ * <savedata>/../savedata_backup/<dir>/<name>: a title that autosaves (A Crack
+ * in Time does at every mission update) rewrites the player's only copy many
+ * times a session, and a bad write would otherwise lose it. One generation,
+ * outside the save directory so the title's own file list never sees it. */
+static void backup_before_write(const char* save_path, const char* name, const char* file_path)
+{
+    FILE* in = fopen(file_path, "rb");
+    if (!in) return;   /* a new file: nothing to keep */
+    const char* dir = save_path + strlen(save_path);
+    while (dir > save_path && dir[-1] != '/' && dir[-1] != '\\') dir--;
+    char bdir[1024], bpath[1100];
+    snprintf(bdir, sizeof bdir, "%s/../savedata_backup/%s", save_root(), dir);
+    ensure_dirs(bdir);
+    snprintf(bpath, sizeof bpath, "%s/%s", bdir, name);
+    FILE* out = fopen(bpath, "wb");
+    if (out) {
+        char buf[65536]; size_t n;
+        while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+        fclose(out);
+    }
+    fclose(in);
+}
+
+/* [save-flags] (A Crack in Time, files starting "IGSD"): the level scripts'
+ * SAVE table is stored in GAME.SAV as entries "name\0 type value" (type 1 =
+ * a boolean byte). Every read and write is compared with the previous one and
+ * each write logs what changed: "+name" (newly true), "name: true -> false"
+ * (story flags never go back -- the owner's v52 save had
+ * ss1_battle_complete false after defeated_vorselon, which stalled the story
+ * with no sector 2; scripts/dev/fix_save_flag.py repairs a save). */
+#define SAVE_FLAGS_MAX 2048
+static struct { char name[48]; uint8_t on; } s_sf[SAVE_FLAGS_MAX];
+static int s_sf_n = -1;   /* -1: nothing read or written yet */
+static void save_flags_note(const uint8_t* b, u32 n, int is_write)
+{
+    if (n < 64 || memcmp(b, "IGSD", 4)) return;
+    static struct { char name[48]; uint8_t on; int run; } cur[SAVE_FLAGS_MAX];
+    int nc = 0;
+    u32 next = 0;   /* where the entry after the last one parsed starts (a string's text runs into it) */
+    /* The table is one unbroken chain of entries; a name-like run elsewhere in
+     * the file (or one started mid-name) is not a flag. Entries are grouped in
+     * runs of back-to-back entries and only the longest run is kept (v53 logged
+     * a bogus "+layed" / "WARNING layed" once). */
+    static int run_n[1024]; int run = -1;
+#define SF_ENTRY() do { if (i != next || run < 0) { if (run < 1023) run++; run_n[run] = 0; } run_n[run]++; } while (0)
+    for (u32 i = 0x100; i + 3 < n && nc < SAVE_FLAGS_MAX; i++) {
+        const uint8_t c = b[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')) continue;
+        const uint8_t p = b[i - 1];
+        if (i != next && ((p >= 'A' && p <= 'Z') || (p >= 'a' && p <= 'z') || (p >= '0' && p <= '9') || p == '_')) continue;
+        u32 e = i;
+        while (e < n && e - i < 47 && ((b[e] >= 'A' && b[e] <= 'Z') || (b[e] >= 'a' && b[e] <= 'z') || (b[e] >= '0' && b[e] <= '9') || b[e] == '_')) e++;
+        if (e - i < 3 || e + 2 >= n || b[e] != 0) continue;
+        if (b[e + 1] == 3) { SF_ENTRY(); i = e + 5; next = e + 6; continue; }   /* a number: 4 bytes */
+        if (b[e + 1] == 4 && e + 6 <= n) {                                   /* a string: u32 length, text (no NUL) */
+            const u32 len = ((u32)b[e + 2] << 24) | ((u32)b[e + 3] << 16) | ((u32)b[e + 4] << 8) | b[e + 5];
+            if (len < 256) { SF_ENTRY(); i = e + 5 + len; next = e + 6 + len; }
+            continue;
+        }
+        if (b[e + 1] != 1 || b[e + 2] > 1) continue;
+        SF_ENTRY();
+        memcpy(cur[nc].name, b + i, e - i); cur[nc].name[e - i] = 0; cur[nc].on = b[e + 2]; cur[nc].run = run; nc++;
+        i = e + 2; next = e + 3;
+    }
+#undef SF_ENTRY
+    {   int best = 0; for (int r = 1; r <= run; r++) if (run_n[r] > run_n[best]) best = r;
+        int k = 0; for (int a = 0; a < nc; a++) if (cur[a].run == best) cur[k++] = cur[a];
+        nc = k; }
+    if (is_write && s_sf_n >= 0) {
+        char line[1024]; int o = snprintf(line, sizeof line, "[save-flags] save:"), changes = 0;
+        for (int a = 0; a < nc; a++) {          /* newly true */
+            int was = -1; for (int k = 0; k < s_sf_n; k++) if (!strcmp(s_sf[k].name, cur[a].name)) { was = s_sf[k].on; break; }
+            if (cur[a].on && was != 1 && o < 900) { o += snprintf(line + o, sizeof line - o, " +%s", cur[a].name); changes++; }
+        }
+        for (int k = 0; k < s_sf_n; k++) {      /* true before, false or gone now */
+            if (!s_sf[k].on) continue;
+            int now = -1; for (int a = 0; a < nc; a++) if (!strcmp(cur[a].name, s_sf[k].name)) { now = cur[a].on; break; }
+            if (now != 1) { fprintf(stderr, "[save-flags] WARNING %s: true -> %s%c", s_sf[k].name, now == 0 ? "false" : "missing", 10); changes++; }
+        }
+        if (changes && o > 18) fprintf(stderr, "%s%c", line, 10);
+    } else if (s_sf_n < 0) fprintf(stderr, "[save-flags] %s: %d story flags%c", is_write ? "first save" : "loaded", nc, 10);
+    for (int a = 0; a < nc; a++) { memcpy(s_sf[a].name, cur[a].name, sizeof s_sf[a].name); s_sf[a].on = cur[a].on; }
+    s_sf_n = nc;
+}
+
 /* Execute file callback: read/write/delete files in the save directory */
 static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 {
@@ -695,6 +1011,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     case CELL_SAVEDATA_FILEOP_WRITE:
     case CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC: {
         ensure_dirs(save_path);
+        if (set->fileOffset == 0) backup_before_write(save_path, name, file_path);
         const char* mode;
         if (set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0) {
             mode = "wb";
@@ -920,6 +1237,9 @@ static s32 savedata_execute(const char* dirName, int is_save,
                    fileSet.fileOperation, fileSet.fileType,
                    fileSet.fileName ? fileSet.fileName : "", fileSet.fileOffset,
                    fileSet.fileSize, fileSet.fileBufSize, exc);
+            if (exc > 0 && fileSet.fileBuf && fileSet.fileOperation <= CELL_SAVEDATA_FILEOP_WRITE)
+                save_flags_note((const uint8_t*)fileSet.fileBuf, (u32)exc,
+                                fileSet.fileOperation == CELL_SAVEDATA_FILEOP_WRITE);
             if (exc < 0) { free(fileList); return exc; }
             exc_size = (u32)exc;
         }
@@ -941,6 +1261,24 @@ static s32 savedata_execute(const char* dirName, int is_save,
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
+
+/* The list save/load utilities are a system UI on hardware: they take a
+ * second or more. Done instantly, A Crack in Time's New Game never moved
+ * on after its save -- its front end polls once a frame and the save thread
+ * had set and cleared its busy flag before the first poll. RACACIT_SAVE_UI_MS
+ * (default 1000) is how long the call takes. */
+static void savedata_ui_delay(const char* who)
+{
+    static long ms = -1;
+    if (ms < 0) { const char* e = getenv("RACACIT_SAVE_UI_MS"); ms = e ? atol(e) : 1000; }
+    if (ms <= 0) return;
+    printf("[cellSaveData] %s: system UI time %ld ms%c", who, ms, 10);
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    usleep((useconds_t)ms * 1000);
+#endif
+}
 
 s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
                            CellSaveDataSetBuf* setBuf,
@@ -988,6 +1326,7 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
                                           (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
     (void)listSet;
 
+    if (cbResult.result == SAVEDATA_PICK_CANCELLED) { free(dirList); return SAVEDATA_CELL_CANCEL; }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
@@ -1001,6 +1340,7 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
 
     s32 result = savedata_execute(selectedDir, 1, setBuf, funcStat, funcFile, userdata);
     free(dirList);
+    savedata_ui_delay("ListSave2");
     return result;
 }
 
@@ -1048,6 +1388,7 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
                                           (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
     (void)listSet;
 
+    if (cbResult.result == SAVEDATA_PICK_CANCELLED) { free(dirList); return SAVEDATA_CELL_CANCEL; }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
@@ -1128,7 +1469,7 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
         }
         printf("[cellSaveData] savedata_fixed: cbresult=%d listed=%u/%u prefix='%s' root='%s'\n",
                result, listed, count,
-               prefix ? (const char*)(vm_base + prefix) : "", s_save_root);
+               prefix ? (const char*)(vm_base + prefix) : "", save_root());
         SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_CBRESULT, w);
     }
     if (!funcStat)
@@ -1185,6 +1526,25 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
     if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
     printf("[cellSaveData] ListAutoLoad(version=%u)\n", version);
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+}
+
+/* The save twin of ListAutoLoad: the title's funcFixed picks (or names) the
+ * directory from the list, then funcStat/funcFile write it, with no dialog.
+ * A Crack in Time autosaves through this at every mission update; left
+ * unregistered, the import faked CELL_OK without running a callback, and the
+ * level script that asked for the save waited for it forever -- in Zolar
+ * Forest that left Ratchet without control after the opening scene. */
+s32 cellSaveDataListAutoSave(u32 version, u32 errDialog,
+                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata)
+{
+    (void)container;
+    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+    printf("[cellSaveData] ListAutoSave(version=%u)\n", version);
+    return savedata_fixed(1, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
@@ -1261,8 +1621,21 @@ s32 cellSaveDataDelete2(u32 container)
 {
     printf("[cellSaveData] Delete2(container=%u)\n", container);
 
-    /* Without a directory name we can't delete anything meaningful.
-       This variant typically shows a UI for deletion - just succeed. */
+    /* The system's "delete save data" list (the title menu's DELETE): the
+     * save screen in its delete mode, over every save of this title. Without
+     * a window there is nothing to show; succeed as before. */
+    CellSaveDataDirList* dirs = (CellSaveDataDirList*)calloc(64, sizeof *dirs);
+    rsx_save_entry* e = (rsx_save_entry*)calloc(64, sizeof *e);
+    if (!dirs || !e) { free(dirs); free(e); return CELL_OK; }
+    u32 count = enumerate_save_dirs("", dirs, 64);
+    if (count > 64) count = 64;
+    int n = 0;
+    for (u32 i = 0; i < count; i++) n += savedata_fill_entry(&e[n], dirs[i].dirName);
+    free(dirs);
+    savedata_sort_entries(e, n);
+    const int r = rsx_host_ui_save_pick(RSX_SAVE_MODE_DELETE, e, n, 0, 0, savedata_delete_dir);
+    savedata_free_entries(e, n);
+    printf("[cellSaveData] Delete2: save screen %s%c", r == RSX_SAVE_PICK_UNAVAILABLE ? "not available" : "closed", 10);
     return CELL_OK;
 }
 
@@ -1486,6 +1859,19 @@ static void hle_cellSaveDataUserAutoLoad(ppu_context* ctx)
 void ps3_savedata_list_auto_load(ppu_context* ctx)
 {
     ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoLoad(
+        (u32)ctx->gpr[3], (u32)ctx->gpr[4],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
+}
+
+/* ListAutoSave, the same: userdata is its ninth argument. */
+void ps3_savedata_list_auto_save(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoSave(
         (u32)ctx->gpr[3], (u32)ctx->gpr[4],
         (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
         (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],

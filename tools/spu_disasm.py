@@ -144,6 +144,9 @@ RI10_TABLE: dict[int, str] = {
     0b00010100: "andi",   # and word immediate
     0b00000100: "ori",    # or word immediate
     0b00000101: "orhi",   # or halfword immediate            (op8 0x05)
+    0b00000110: "orbi",   # or byte immediate                (op8 0x06)
+    0b01000101: "xorhi",  # xor halfword immediate           (op8 0x45)
+    0b01000110: "xorbi",  # xor byte immediate               (op8 0x46)
     0b00010101: "andhi",  # and halfword immediate           (op8 0x15)
     0b00010110: "andbi",  # and byte immediate               (op8 0x16)
     0b01000100: "xori",   # xor word immediate

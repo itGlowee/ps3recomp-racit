@@ -160,7 +160,10 @@ int rsx_fp_collect_constants(
 {
     if (!ucode || !out)
         return -1;
-    memset(out, 0, sizeof(*out));
+    /* Only the count: the block is 2048 slots (32 KB) and every consumer reads
+     * just the first `count`. Clearing it all, per draw, was ~28% of the draw
+     * engine's time in A Crack in Time. */
+    out->count = 0;
 
     u32 off = 0;
     while (off + 16 <= max_bytes) {
@@ -186,10 +189,38 @@ int rsx_fp_collect_constants(
     return -1;
 }
 
+u32 rsx_fp_texture_mask(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0xFFFFu;
+    u32 mask = 0, off = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        if (!(w2 & FP_BRANCH)) {
+            const u32 opcode = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+            if (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXD ||
+                opcode == OP_TXB || opcode == OP_TXL)
+                mask |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
+        }
+        if (fp_instruction_has_constant(w1, w2, w3)) off += 16;
+        if (w0 & FP_END) return mask;
+    }
+    return 0xFFFFu;                 /* no end: say every unit */
+}
+
 static u64 fp_hash_bytes(const void* data, u32 size, u64 hash)
 {
     const u8* bytes = (const u8*)data;
-    for (u32 i = 0; i < size; ++i) {
+    u32 i = 0;
+    for (; i + 8 <= size; i += 8) {      /* a cache key: word-wise is enough */
+        u64 w; memcpy(&w, bytes + i, 8);
+        hash ^= w;
+        hash *= 1099511628211ull;
+    }
+    for (; i < size; ++i) {
         hash ^= bytes[i];
         hash *= 1099511628211ull;
     }
@@ -329,13 +360,39 @@ static void decode_src(u32 w, int abs_bit, Src* s)
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
+/* The backend renders at this multiple of the guest's resolution
+ * (RACACIT_RES_SCALE); SV_POSITION then counts the backend's pixels, and WPOS
+ * is the guest's, so it is divided back. */
+float rsx_fp_wpos_scale = 1.0f;
+static int s_fp_buffered;   /* the program being built reads its constants from PSConstants */
+
 static const char* input_expr(u32 input_src)
 {
     static const char* tc[8] = {
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: {                         /* WPOS */
+        /* A buffered program takes the factor per draw from fp_alpha.y: a pass
+         * the engine draws at more than its guest size (A Crack in Time's
+         * 480x352 4x-multisampled effects pass, drawn at 960x704 by
+         * eng_aa_scale) must still see the guest's pixel. A zero there (a
+         * caller that does not set it) means the scale baked below. */
+        if (s_fp_buffered) {
+            static char wposb[160];
+            if (!wposb[0])
+                snprintf(wposb, sizeof wposb,
+                         "(input.position * float4((fp_alpha.y != 0.0 ? fp_alpha.yy : float2(%.9g, %.9g)), 1.0, 1.0))",
+                         1.0 / rsx_fp_wpos_scale, 1.0 / rsx_fp_wpos_scale);
+            return wposb;
+        }
+        if (rsx_fp_wpos_scale == 1.0f) return "input.position";
+        static char wpos[96];
+        if (!wpos[0])
+            snprintf(wpos, sizeof wpos, "(input.position * float4(%.9g, %.9g, 1.0, 1.0))",
+                     1.0 / rsx_fp_wpos_scale, 1.0 / rsx_fp_wpos_scale);
+        return wpos;
+    }
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
@@ -415,6 +472,68 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
 }
 
+/* How cube units are declared when a program has any (see the texture bank
+ * below). 0: each unit individually at t<unit> (D3D12 / Metal). 1: the 2D
+ * array stays at t0 and cube units come from a second array, TextureCube
+ * rsx_texcube[16] at t48 -- two fixed bindings, which is what a Vulkan
+ * descriptor set layout shared by every pipeline can express. */
+int rsx_fp_cube_array_style = 0;
+u32 rsx_fp_shadow_mask = 0;
+u8  rsx_fp_shadow_func[16];
+/* Units whose TEXTURE_ADDRESS unsigned remap is BIASED (bits 12-15 = 1): the
+ * RSX returns every channel as 2x-1, the way normal maps and G-buffers are
+ * stored. A Crack in Time's shadow-light pass reads its normal buffer so and
+ * dots it with the light direction straight away; read raw, N.L came out ~0
+ * and each character shadow volume shaded its whole box black. */
+u32 rsx_fp_biased_mask = 0;
+
+/* TEXTURE_ADDRESS gamma, 4 bits a unit (R, G, B, A): those channels are
+ * converted from sRGB to linear on read. A Crack in Time marks its colour
+ * maps so and lights in linear space; read raw, every level whose materials
+ * set it came out washed out and overbright (Molonoth, Tombli, Vorselon's
+ * ship). rsx_gamma() is in every program's prologue. */
+u64 rsx_fp_gamma_mask = 0;
+/* The program's colour outputs are converted from linear to sRGB on write
+ * (rsx_srgb_enc in the prologue). */
+int rsx_fp_srgb_out = 0;
+int rsx_fp_dynamic_tex = 0;
+static int s_fp_dyn;     /* rsx_fp_dynamic_tex, for a buffered program (it needs the block) */
+
+/* A fetch's value as the unit returns it (rsx_fp_gamma_mask, then
+ * rsx_fp_biased_mask). */
+static void fp_tex_remap(char* rhs, size_t n, u32 unit)
+{
+    if (s_fp_dyn) {
+        char t[704];
+        snprintf(t, sizeof t, "rsx_texmode(%s, %uu)", rhs, unit & 15u);
+        snprintf(rhs, n, "%s", t);
+        return;
+    }
+    const u32 gm = (u32)(rsx_fp_gamma_mask >> ((unit & 15u) * 4u)) & 0xFu;
+    if (gm) {
+        char t[704];
+        snprintf(t, sizeof t, "rsx_gamma(%s, float4(%u, %u, %u, %u))", rhs,
+                 gm & 1u, (gm >> 1) & 1u, (gm >> 2) & 1u, (gm >> 3) & 1u);
+        snprintf(rhs, n, "%s", t);
+    }
+    if (!((rsx_fp_biased_mask >> (unit & 15u)) & 1u)) return;
+    char t[704];
+    snprintf(t, sizeof t, "((%s) * 2.0 - 1.0)", rhs);
+    snprintf(rhs, n, "%s", t);
+}
+
+/* The HLSL expression naming texture unit `u` for this program. */
+static void fp_tex_name(char* out, size_t n, u32 cube_mask, u32 u)
+{
+    const int cube = (cube_mask >> u) & 1u;
+    if (rsx_fp_cube_array_style)
+        snprintf(out, n, cube ? "rsx_texcube[%u]" : "rsx_tex[%u]", u);
+    else if (cube_mask)
+        snprintf(out, n, "rsx_tex%u", u);
+    else
+        snprintf(out, n, "rsx_tex[%u]", u);
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     int buffered, char* out, u32 out_size, u32* out_constant_count)
@@ -422,6 +541,8 @@ static int rsx_fp_decompile_internal(
     if (!ucode || !out || out_size == 0) return -1;
 
     u32 buffered_constant_count = 0;
+    s_fp_dyn = rsx_fp_dynamic_tex && buffered;
+    s_fp_buffered = buffered;
     if (buffered) {
         rsx_fp_constant_block constants;
         const int result =
@@ -488,6 +609,19 @@ static int rsx_fp_decompile_internal(
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
+        /* Texture lookups this decompiler does not compare or does not do at
+         * all: TXD anywhere, TXB/TXL or a cube map on a depth-compare unit
+         * (those sample the raw depth). Logged once each, to see whether a
+         * title uses them. */
+        if (!is_branch && (opcode == OP_TXD || opcode == OP_TXB || opcode == OP_TXL || opcode == OP_TEX || opcode == OP_TXP)) {
+            const int shadow = (rsx_fp_shadow_mask >> tex_unit) & 1u, cube = (tex_cube_mask >> tex_unit) & 1u;
+            const int kind = opcode == OP_TXD ? 0 : (shadow && cube) ? 1 : (shadow && (opcode == OP_TXB || opcode == OP_TXL)) ? 2 : -1;
+            static u8 said[3];
+            if (kind >= 0 && !said[kind]) { said[kind] = 1;
+                fprintf(stderr, "[rsx fp] %s on texture unit %u%s: %s%c", rsx_fp_opcode_name(opcode), tex_unit,
+                        shadow ? " (depth compare)" : "", cube ? "cube map" : "2D",
+                        10); }
+        }
 
         /* Execution condition (exec_if) + condition-code write (set_cond).
          * Faithful to RPCS3 FragmentProgramDecompiler {GetRawCond, AddCodeCond,
@@ -671,43 +805,49 @@ static int rsx_fp_decompile_internal(
         case OP_SGT: snprintf(rhs, sizeof(rhs), "(float4)((%s) >  (%s))", a, b); break;
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
-        case OP_TEX:
-            if ((tex_cube_mask >> tex_unit) & 1u)
-                /* Cubemap: sample with the full 3-component direction vector. */
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_cube_mask)
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
-            else
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+        case OP_TEX: {
+            char tn[32];
+            fp_tex_name(tn, sizeof tn, tex_cube_mask, tex_unit);
+            if (((rsx_fp_shadow_mask >> tex_unit) & 1u) && !((tex_cube_mask >> tex_unit) & 1u)) {
+                snprintf(rhs, sizeof(rhs), "rsx_shadow(%s, rsx_samp[%u], (%s).xyz, %u)", tn, tex_unit, a,
+                         (unsigned)rsx_fp_shadow_func[tex_unit & 15u]);
+                break;
+            }
+            /* Cubemap: sample with the full 3-component direction vector. */
+            snprintf(rhs, sizeof(rhs), "%s.Sample(rsx_samp[%u], (%s).%s)", tn, tex_unit, a,
+                     ((tex_cube_mask >> tex_unit) & 1u) ? "xyz" : "xy");
+            fp_tex_remap(rhs, sizeof rhs, tex_unit);
             break;
-        case OP_TXP:
+        }
+        case OP_TXP: {
+            char tn[32];
+            fp_tex_name(tn, sizeof tn, tex_cube_mask, tex_unit);
+            if (((rsx_fp_shadow_mask >> tex_unit) & 1u) && !((tex_cube_mask >> tex_unit) & 1u)) {
+                snprintf(rhs, sizeof(rhs), "rsx_shadow(%s, rsx_samp[%u], (%s).xyz / (%s).w, %u)", tn, tex_unit,
+                         a, a, (unsigned)rsx_fp_shadow_func[tex_unit & 15u]);
+                break;
+            }
             if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Projective divide is meaningless for a cube lookup; sample
                  * the direction directly. */
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_cube_mask)
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                         tex_unit, tex_unit, a, a);
+                snprintf(rhs, sizeof(rhs), "%s.Sample(rsx_samp[%u], (%s).xyz)", tn, tex_unit, a);
             else
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                         tex_unit, tex_unit, a, a);
+                snprintf(rhs, sizeof(rhs), "%s.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
+                         tn, tex_unit, a, a);
+            fp_tex_remap(rhs, sizeof rhs, tex_unit);
             break;
+        }
         case OP_TXB: case OP_TXL: {
             /* Biased / explicit-LOD sample; bias or LOD is src1.x (RPCS3
              * TEXTURE_SAMPLE2D_BIAS / _LOD). GH3's fret buttons and fret lines
              * are TXB: unhandled, they sampled nothing and output alpha 0. */
             const int cube = (tex_cube_mask >> tex_unit) & 1u;
             char tn[32];
-            snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            fp_tex_name(tn, sizeof tn, tex_cube_mask, tex_unit);
             snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
                      opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
                      cube ? "xyz" : "xy", b);
+            fp_tex_remap(rhs, sizeof rhs, tex_unit);
             break;
         }
         case OP_KIL:
@@ -839,6 +979,13 @@ static int rsx_fp_decompile_internal(
         half_exports = (ctrl & FP_CTRL_32BIT_EXPORTS) ? 0 : 1;
     }
     const char* export_file = half_exports ? "h" : "r";
+    /* CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT (0xE): the program replaces the
+     * fragment's depth with r1.z (h2.z with 16-bit exports) -- RPCS3
+     * FragmentProgramDecompiler. A Crack in Time resolves its multisampled
+     * scene depth into 0x1380000 with such a pass; ignoring the export left
+     * that buffer at the quad's own depth, and everything that reads scene
+     * depth back (decals, blob shadows, soft particles) went wrong. */
+    const int depth_export = ctrl != RSX_FP_CTRL_AUTO && (ctrl & 0xEu) != 0;
 
     /* How many colour targets the program feeds: one past the highest export
      * register of the selected file it wrote. A program that writes only the
@@ -851,33 +998,63 @@ static int rsx_fp_decompile_internal(
     for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
-    if (targets == 1) {
-        char tail[96];
+    if (targets == 1 && !depth_export) {
+        char tail[512];
+        /* RSX_FP_SHADOW_DEBUG=<s>: a program with a depth compare returns its
+         * last compare's inputs instead -- (x*s+.5, y*s+.5, ref, stored). */
+        static int dbg = -1; if (dbg < 0) dbg = getenv("RSX_FP_SHADOW_DEBUG") ? 1 : 0;
+        /* RSX_FP_SHADOW_OUT=<HLSL float4 expression>: a program with a depth
+         * compare returns that instead (any r[], h[], cc0 of the program),
+         * unguarded -- for reading its intermediate values with a probe. */
+        static const char* oexp = (const char*)-1;
+        if (oexp == (const char*)-1) oexp = getenv("RSX_FP_SHADOW_OUT");
+        if (oexp && *oexp && rsx_fp_shadow_mask) {
+            out_puts(&o, "    return ");
+            out_puts(&o, oexp);
+            out_puts(&o, ";\n}\n");
+        } else {
         snprintf(tail, sizeof(tail),
-                 "    float4 _o = %s[0];\n"
-                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file);
+                 rsx_fp_srgb_out
+                     ? "    float4 _o = rsx_srgb_enc(%s);\n    return (_o == _o) ? _o : (float4)0;\n}\n"
+                     : "    float4 _o = %s;\n    return (_o == _o) ? _o : (float4)0;\n}\n",
+                 (dbg && rsx_fp_shadow_mask) ? "rsx_dbg" : (export_file[0] == 'h' ? "h[0]" : "r[0]"));
         out_puts(&o, tail);
+        }
     } else {
         /* Multiple render targets. The NaN guard is per target: a poisoned
          * G-buffer plane is as fatal as a poisoned colour one, and the planes
          * are computed independently. */
         out_puts(&o, "    PSOutput _out;\n");
         for (u32 t = 0; t < targets; t++) {
-            char line[192];
+            char line[512];
             snprintf(line, sizeof(line),
-                     "    float4 _o%u = %s[%u];\n"
-                     "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
+                     rsx_fp_srgb_out
+                         ? "    float4 _o%u = rsx_srgb_enc(%s[%u]);\n    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n"
+                         : "    float4 _o%u = %s[%u];\n    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
                      t, export_file, fp_export_reg[half_exports][t],
                      t, t, t, t);
             out_puts(&o, line);
         }
+        /* On the console the exported depth lands in a 24-bit buffer, and so
+         * does every later fragment's depth before it is compared. Here both
+         * stay 32-bit floats, so a copy of the scene's depth (A Crack in Time
+         * rebuilds it from 24-bit bytes into 0x01380000 and tests every effect
+         * against it, LEQUAL) sat up to half a step below the surfaces it came
+         * from: an effect lying on one lost about half its pixels, the console
+         * none. Stored one 24-bit step up instead (a float has no room for the
+         * half step near 1.0), every fragment the console puts in that step
+         * passes. The far plane stays 1.0. */
+        if (depth_export)
+            out_puts(&o, half_exports
+                ? "    _out.d = min((round(saturate(h[2].z) * 16777215.0) + 1.0) / 16777215.0, 1.0);\n"
+                : "    _out.d = min((round(saturate(r[1].z) * 16777215.0) + 1.0) / 16777215.0, 1.0);\n");
         out_puts(&o, "    return _out;\n}\n");
     }
 
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    char preamble[8192];
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
@@ -891,8 +1068,10 @@ static int rsx_fp_decompile_internal(
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
      * cube units can be TextureCube while the rest stay Texture2D. */
-    if (tex_cube_mask == 0) {
+    if (tex_cube_mask == 0 || rsx_fp_cube_array_style) {
         out_puts(&p, "Texture2D    rsx_tex[16] : register(t0);\n");
+        if (tex_cube_mask)
+            out_puts(&p, "TextureCube  rsx_texcube[16] : register(t48);\n");
     } else {
         char decl[64];
         for (u32 u = 0; u < 16; u++) {
@@ -904,18 +1083,138 @@ static int rsx_fp_decompile_internal(
     out_puts(&p,
         "SamplerState rsx_samp[16] : register(s0);\n"
     );
+    if (rsx_fp_srgb_out)
+        out_puts(&p,
+            "float4 rsx_srgb_enc(float4 c) {\n"
+            "    float3 v = saturate(c.rgb);\n"
+            "    float3 e = lerp(1.055 * pow(v, 1.0 / 2.4) - 0.055, v * 12.92, step(v, 0.0031308));\n"
+            "    return float4(e, c.a);\n"
+            "}\n");
+    /* sRGB to linear for the channels m selects (rsx_fp_gamma_mask). */
+    if (rsx_fp_gamma_mask)
+        out_puts(&p,
+            "float4 rsx_gamma(float4 c, float4 m) {\n"
+            "    float4 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);\n"
+            "    float4 l = lerp(hi, c / 12.92, step(c, 0.04045));\n"
+            "    return lerp(c, l, m);\n"
+            "}\n");
+    /* Depth compare with the hardware's bilinear PCF: four taps, each
+     * (depth OP ref) -- the RSX puts the stored texel on the left, the
+     * reverse of GL's (ref OP texel); RPCS3 reverses its shadow samplers'
+     * compare direction for the same reason. A Crack in Time's sun shadows
+     * use GEQUAL with 1 = lit: read as (ref >= depth), every receiver in
+     * front of the map came out 0 and each light volume a solid dark slab
+     * under Ratchet. Weighted by the sample position's fraction. */
+    if (rsx_fp_shadow_mask)
+        out_puts(&p,
+            "float rsx_zcmp(float r, float d, int f) {\n"
+            "    return f == 1 ? (float)(d <  r) : f == 2 ? (float)(d == r) : f == 3 ? (float)(d <= r) :\n"
+            "           f == 4 ? (float)(d >  r) : f == 5 ? (float)(d != r) : f == 6 ? (float)(d >= r) :\n"
+            "           f == 7 ? 1.0 : 0.0;\n"
+            "}\n"
+            "static float4 rsx_dbg = (float4)0;\n");
+    if (rsx_fp_shadow_mask) {
+        /* RSX_FP_SHADOW_DEBUG=<mode>: 1 coords/ref/depth, 2 the four gathered
+         * depths, 3 the reference at four scales, 4 a plain sample + size. */
+        static int mode = -1;
+        if (mode < 0) { const char* e = getenv("RSX_FP_SHADOW_DEBUG"); mode = e ? atoi(e) : 0; }
+        char dm[64];
+        snprintf(dm, sizeof dm, "static const int rsx_dbg_mode = %d;\n", mode);
+        out_puts(&p, dm);
+    }
+    /* The reference is clamped to [0,1] before the compare, as for every
+     * fixed-point depth format (GL and D3D do the same). A Crack in Time fits
+     * each character's shadow frustum tightly around the character, so the
+     * ground beside Ratchet lies past its far plane (ref ~1.5): unclamped,
+     * that ground compared as shadowed and his shadow was a solid slab. */
+    /* RSX_SHADOW_FILTER=smooth (the default): a 3x3 PCF of bilinear taps
+     * instead of the RSX's single bilinear PCF -- four gathers over the 4x4
+     * texels around the lookup, weighted (1-f, 1, 1, f)/3 each way. A
+     * magnified shadow map's edge then ramps over ~1.5 texels instead of
+     * stepping texel by texel: the blocky "boxy" edges on the moons and in
+     * the Great Clock, which the console's own filter draws too. =console is
+     * the hardware's filter exactly; so is every RSX_FP_SHADOW_DEBUG mode. */
+    static int s_smooth = -1;
+    if (s_smooth < 0) {
+        const char* e = getenv("RSX_SHADOW_FILTER");
+        s_smooth = (e && !strcmp(e, "console")) || getenv("RSX_FP_SHADOW_DEBUG") ? 0 : 1;
+    }
+    if (rsx_fp_shadow_mask && s_smooth)
+        out_puts(&p,
+            "float4 rsx_zcmp4(float r, float4 d, int f) {\n"
+            "    return float4(rsx_zcmp(r, d.x, f), rsx_zcmp(r, d.y, f), rsx_zcmp(r, d.z, f), rsx_zcmp(r, d.w, f));\n"
+            "}\n"
+            "float4 rsx_shadow(Texture2D t, SamplerState s, float3 c, int f) {\n"
+            "    float2 sz; t.GetDimensions(sz.x, sz.y);\n"
+            "    float2 p = c.xy * sz - 0.5; float2 fr = frac(p); float2 b = floor(p);\n"
+            "    float r = saturate(c.z);\n"
+            "    float4 q00 = rsx_zcmp4(r, t.GatherRed(s, b / sz), f);\n"
+            "    float4 q10 = rsx_zcmp4(r, t.GatherRed(s, (b + float2(2.0, 0.0)) / sz), f);\n"
+            "    float4 q01 = rsx_zcmp4(r, t.GatherRed(s, (b + float2(0.0, 2.0)) / sz), f);\n"
+            "    float4 q11 = rsx_zcmp4(r, t.GatherRed(s, (b + 2.0) / sz), f);\n"
+            "    float4 wx = float4(1.0 - fr.x, 1.0, 1.0, fr.x), wy = float4(1.0 - fr.y, 1.0, 1.0, fr.y);\n"
+            "    float4 rows = float4(dot(wx, float4(q00.w, q00.z, q10.w, q10.z)),\n"
+            "                         dot(wx, float4(q00.x, q00.y, q10.x, q10.y)),\n"
+            "                         dot(wx, float4(q01.w, q01.z, q11.w, q11.z)),\n"
+            "                         dot(wx, float4(q01.x, q01.y, q11.x, q11.y)));\n"
+            "    return (float4)(dot(wy, rows) / 9.0);\n"
+            "}\n");
+    if (rsx_fp_shadow_mask && !s_smooth) {
+        out_puts(&p,
+            "float4 rsx_shadow(Texture2D t, SamplerState s, float3 c, int f) {\n"
+            "    float2 sz; t.GetDimensions(sz.x, sz.y);\n"
+            "    float2 p = c.xy * sz - 0.5; float2 fr = frac(p);\n"
+            "    float4 d = t.GatherRed(s, (floor(p) + 1.0) / sz);\n");
+        if (getenv("RSX_FP_SHADOW_DEBUG"))
+            out_puts(&p,
+            "    rsx_dbg = rsx_dbg_mode == 2 ? d : rsx_dbg_mode == 3 ? float4(c.z, c.z / 4.0, c.z / 16.0, c.z / 64.0) :\n"
+            "              rsx_dbg_mode == 4 ? float4(t.Sample(s, c.xy).r, sz.x / 1024.0, sz.y / 1024.0, 1.0) :\n"
+            "              float4(c.x * 0.015625 + 0.5, c.y * 0.015625 + 0.5, c.z, d.x);\n");
+        out_puts(&p,
+            "    float r = saturate(c.z);\n"
+            "    float a = rsx_zcmp(r, d.w, f), b = rsx_zcmp(r, d.z, f);\n"
+            "    float e = rsx_zcmp(r, d.x, f), g = rsx_zcmp(r, d.y, f);\n");
+        if (getenv("RSX_FP_SHADOW_DEBUG"))
+            out_puts(&p,
+            "    if (rsx_dbg_mode == 5) rsx_dbg = float4(a, b, e, g);\n"
+            "    if (rsx_dbg_mode == 6) rsx_dbg = float4(r, d.x, fr.x, fr.y);\n");
+        out_puts(&p,
+            "    return (float4)lerp(lerp(a, b, fr.x), lerp(e, g, fr.x), fr.y);\n"
+            "}\n");
+    }
     if (buffered) {
-        char constants_decl[192];
+        char constants_decl[256];
         snprintf(
             constants_decl, sizeof(constants_decl),
             "cbuffer PSConstants : register(b1) {\n"
             "    float4 fp_constants[%u];\n"
             "    float4 fp_alpha;\n"
+            "%s"
             "};\n",
-            buffered_constant_count ? buffered_constant_count : 1u);
+            buffered_constant_count ? buffered_constant_count : 1u,
+            s_fp_dyn ? "    float4 fp_texp[16];\n" : "");
         out_puts(&p, constants_decl);
     }
-    if (targets == 1) {
+    if (s_fp_dyn)
+        out_puts(&p,
+            "float4 rsx_texmode(float4 c, uint u) {\n"
+            "    float4 tp = fp_texp[u];\n"
+            "    if (tp.z >= 16.0) {\n"                     /* RGBA8 bytes read as Y16_X16 */
+            "        uint q = (uint)tp.z;\n"
+            "        float4 b = round(saturate(c) * 255.0);\n"
+            "        float k[6] = { (b.a * 256.0 + b.r) / 65535.0, (b.g * 256.0 + b.b) / 65535.0, 0.0, 1.0, 0.0, 1.0 };\n"
+            "        return float4(k[(q >> 8) & 7u], k[(q >> 11) & 7u], k[(q >> 14) & 7u], k[(q >> 5) & 7u]);\n"
+            "    }\n"
+            "    if (tp.z != 0.0) {\n"
+            "        uint g = (uint)tp.z;\n"
+            "        float4 m = float4(g & 1u, (g >> 1) & 1u, (g >> 2) & 1u, (g >> 3) & 1u);\n"
+            "        float4 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);\n"
+            "        c = lerp(c, lerp(hi, c / 12.92, step(c, 0.04045)), m);\n"
+            "    }\n"
+            "    if (tp.w != 0.0) c = c * 2.0 - 1.0;\n"
+            "    return c;\n"
+            "}\n");
+    if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
         out_puts(&p, "struct PSOutput {\n");
@@ -925,6 +1224,7 @@ static int rsx_fp_decompile_internal(
                      "    float4 t%u : SV_TARGET%u;\n", t, t);
             out_puts(&p, member);
         }
+        if (depth_export) out_puts(&p, "    float d : SV_Depth;\n");
         out_puts(&p, "};\n"
                      "PSOutput main(PSInput input) {\n");
     }
@@ -1143,7 +1443,7 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
     }
     { static int dbg = -1;
       if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
-      if (dbg) { static int m = 0; if (m++ < 3) {
+      if (dbg) { static int m = 0; if ((m < 3 && (m++, 1))) {
         fprintf(stderr, "[FPK] %d consts%c", n, 10);
         for (int _q = 0; _q < n; _q++)
             fprintf(stderr, "   k[%2d] = (%g %g %g %g)%c", _q, out[_q*4+0],
@@ -1215,7 +1515,7 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     for (u32 u = 0; u < 16; u++) {
         if (!((unnorm_mask >> u) & 1u)) continue;
         if ((cube_mask >> u) & 1u) continue;
-        const u32 w = dim[u][0], h = dim[u][1];
+        const u32 w = dim ? dim[u][0] : 1u, h = dim ? dim[u][1] : 1u;
         if (!w || !h) continue;
 
         /* Both spellings the emitter produces for a 2D unit. */
@@ -1242,8 +1542,11 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                 if (*p != ')') break;
 
                 char scale[80];
-                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
-                         1.0 / (double)w, 1.0 / (double)h);
+                if (dim)
+                    snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h);
+                else
+                    snprintf(scale, sizeof scale, " * fp_texp[%u].xy", u);
                 const u32 slen = (u32)strlen(scale);
                 const u32 used = (u32)strlen(hlsl);
                 if (used + slen + 1 > hlsl_size) return -1;

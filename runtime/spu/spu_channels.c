@@ -13,6 +13,25 @@
  */
 
 #include "spu_dma.h"
+#if defined(__SSE__) || defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#define SPU_CSR_GET() ((unsigned long long)_mm_getcsr())
+#define SPU_CSR_SET(v) _mm_setcsr((unsigned)(v))
+#define SPU_CSR_SPU(v) ((v) | 0xE040u)                 /* DAZ, FTZ, round toward zero */
+#elif defined(__aarch64__)
+/* FPCR: FZ (24) flushes denormal operands and results, RMode (23:22) = 3
+ * rounds toward zero -- the SPU's single precision, as MXCSR does on x86.
+ * Without it every float op here rounded to nearest where the SPU truncates. */
+static inline unsigned long long spu_fpcr_get(void) { unsigned long long v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+static inline void spu_fpcr_set(unsigned long long v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+#define SPU_CSR_GET() spu_fpcr_get()
+#define SPU_CSR_SET(v) spu_fpcr_set(v)
+#define SPU_CSR_SPU(v) ((v) | (1ull << 24) | (3ull << 22))
+#else
+#define SPU_CSR_GET() 0ull
+#define SPU_CSR_SET(v) ((void)(v))
+#define SPU_CSR_SPU(v) (v)
+#endif
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
@@ -20,9 +39,35 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <setjmp.h>
+#include "../platform/ps3_setjmp.h"   /* setjmp/longjmp that never unwind (Windows) */
+
+/* Byte-range inequality, 8 bytes a step. The toolchain's memcmp (zig's
+ * compiler_rt) compares a byte at a time, and the overlay checks below run it
+ * over whole function bodies on every indirect branch into a relocatable
+ * module: 9% of the WWS job thread. Only equality is ever asked here. */
+static inline int spu_mem_ne(const void* a, const void* b, size_t n)
+{
+    const unsigned char* p = (const unsigned char*)a;
+    const unsigned char* q = (const unsigned char*)b;
+    while (n >= 32) {
+        uint64_t x[4], y[4];
+        memcpy(x, p, 32); memcpy(y, q, 32);
+        if ((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3])) return 1;
+        p += 32; q += 32; n -= 32;
+    }
+    while (n >= 8) {
+        uint64_t x, y; memcpy(&x, p, 8); memcpy(&y, q, 8);
+        if (x != y) return 1;
+        p += 8; q += 8; n -= 8;
+    }
+    while (n) { if (*p++ != *q++) return 1; n--; }
+    return 0;
+}
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
+#ifndef _WIN32
+#include <unistd.h>  /* sysconf */
+#endif
 #endif
 #include <time.h>
 #include "../platform/win32_compat.h"
@@ -134,6 +179,10 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
+/* Every MFC PUT, for cellAudio (libs/audio/cellAudio.c): it learns when the
+ * game has finished writing a block of its audio port. */
+void (*g_audio_put_hook)(uint32_t ea, uint32_t lsa, uint32_t size) = 0;
+
 void spu_halt(spu_context* ctx)
 {
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
@@ -238,12 +287,18 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+    /* DAZ + FTZ + round toward zero while SPU code runs: the SPU's own
+     * denormal handling and truncating single precision, which
+     * spu_helpers.h's float fast paths rely on. The caller's mode comes
+     * back on the way out (a halt's longjmp restores the setjmp-time one). */
+    const unsigned long long spu_csr_saved = SPU_CSR_GET();
     switch (setjmp(s_spu_halt_env)) {
     case 1:
         halted = 1;
         g_spu_trampoline_fn = 0;
         break;
     case 2:
+        SPU_CSR_SET(SPU_CSR_SPU(spu_csr_saved));
         /* A one-way guest stack reset invalidates every lifted host caller.
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
@@ -257,9 +312,11 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * returns; the drain loop re-enters each queued target until the SPU
          * halts (stop -> longjmp) or the trampoline empties. Nested brsl/bisl
          * calls drain inside their own call brackets (see the lifter). */
+        SPU_CSR_SET(SPU_CSR_SPU(spu_csr_saved));
         entry(ctx);
-        { static int _e = 0;
-          if (getenv("SPU_ARGWATCH") && _e < 8) { _e++;
+        { static int _e = 0; static int s_aw = -1;
+          if (s_aw < 0) s_aw = getenv("SPU_ARGWATCH") ? 1 : 0;
+          if (s_aw && _e < 8) { _e++;
               fprintf(stderr, "[argwatch] after entry(): img=%d pc=0x%05X "
                       "r2=0x%08X r3=0x%08X r4=0x%08X\n", ctx->image_id,
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[2]._u32[0],
@@ -267,6 +324,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
               fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
+    SPU_CSR_SET(spu_csr_saved);
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
@@ -381,9 +439,6 @@ extern uint8_t* vm_base;
  * be written over, and the SPU would never learn the line had changed. Same
  * lock, same critical sections, now shared with the PPU store paths. */
 
-/* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
- * the delta across one policy run to find the run that performed a claim. */
-volatile unsigned g_spu_putllc_count = 0;
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
@@ -399,7 +454,232 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* SPU_LINEWATCH=<hex EA>: log every SPU atomic commit (PUTLLC/PUTLLUC) to that
+ * 128-byte line with words 0..3 and 12..15 -- the PPU write watch cannot see
+ * SPU-side stores, so a flag the PPU sets that "vanishes" needs this half. */
+/* racacit: the guest EA a PPU wait is spinning on (0 = none, game/stubs.cpp
+ * sets it). An SPU PUT / PUTLLC / PUTLLUC covering it records which image
+ * wrote it and when -- "who sets this flag" for a spin the PPU write watch
+ * cannot answer. */
+volatile uint32_t g_racacit_watch_ea;
+volatile int g_racacit_watch_img = -1;
+volatile unsigned long long g_racacit_watch_t;
+void racacit_watch_hit(const spu_context* ctx, uint32_t ea, uint32_t size)
+{
+    const uint32_t w = g_racacit_watch_ea;
+    if (!w || w < ea || w - ea >= size) return;
+    extern unsigned long long ps3_qpc_us(void);
+    g_racacit_watch_img = ctx->image_id;
+    g_racacit_watch_t = ps3_qpc_us();
+}
+
+static void spu_linewatch_note(const spu_context* ctx, uint32_t ea, const uint8_t* ls, const char* what)
+{
+    if (g_racacit_watch_ea) racacit_watch_hit(ctx, ea, MFC_ATOMIC_LINE);
+    static int64_t s_lw = -2;
+    if (s_lw == -2) { const char* e = getenv("SPU_LINEWATCH"); s_lw = e ? (int64_t)(strtoul(e, 0, 16) & ~127u) : -1; }
+    if (s_lw < 0 || (ea & ~127u) != (uint32_t)s_lw) return;
+    static int n, nmax = -1; if (nmax < 0) { const char* m = getenv("SPU_LINEWATCH_MAX"); nmax = m ? atoi(m) : 400; }
+    if (n++ >= nmax) return;
+    uint32_t w[16];
+    for (int i = 0; i < 16; i++) { uint32_t t; memcpy(&t, ls + i * 4, 4); w[i] = __builtin_bswap32(t); }
+    fprintf(stderr, "[linewatch] %s img=%d spu=%u pc=0x%05X ea=0x%08X w0-3=%08X %08X %08X %08X w12-15=%08X %08X %08X %08X\n",
+            what, ctx->image_id, (unsigned)(ctx->spu_id & 7u), (unsigned)(ctx->pc & SPU_LS_MASK), ea,
+            w[0], w[1], w[2], w[3], w[12], w[13], w[14], w[15]);
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+/* racacit: idle backoff for SPU lock-line polling. A policy module with no
+ * work (igPm, the WWS job manager) re-reads its queue lines in a tight
+ * GETLLAR loop. On a PS3 that burns a dedicated SPU; here every SPU is a host
+ * thread, and five or six of them polling flat out starved the PPU threads
+ * (Bink decoded at well under 1 fps on two cores). When a thread keeps
+ * reading the same few lines and their contents have not changed, yield and
+ * then sleep briefly -- 20 us growing to 200 us -- and drop straight back to
+ * full speed the moment any line it reads changes. SPU_NO_IDLE_BACKOFF=1
+ * turns it off. */
+static void spu_getllar_idle_backoff(const spu_context* ctx, uint32_t ea, const uint8_t* line)
+{
+    static int s_off = -1;
+    if (s_off < 0) { const char* e = getenv("SPU_NO_IDLE_BACKOFF"); s_off = (e && *e && *e != '0') ? 1 : 0; }
+    if (s_off) return;
+    static SPU_THREAD_LOCAL uint32_t t_ea[4];
+    static SPU_THREAD_LOCAL uint64_t t_h[4];
+    static SPU_THREAD_LOCAL unsigned t_next, t_idle;
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < MFC_ATOMIC_LINE; i += 8) {
+        uint64_t w; memcpy(&w, line + i, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    int same = 0;
+    for (int i = 0; i < 4; i++)
+        if (t_ea[i] == ea) { same = (t_h[i] == h); t_h[i] = h; goto found; }
+    t_ea[t_next & 3] = ea; t_h[t_next & 3] = h; t_next++;
+found:
+    if (!same) { t_idle = 0; return; }
+    /* An SPU that has polled unchanged lines for ~5 s is waiting on something
+     * that is not coming: name the program, the PC and the line once (and
+     * again every ~3 min), so a stalled job is identifiable from the log. */
+    if (t_idle == 30000u || (t_idle > 30000u && (t_idle & 0xFFFFFu) == 0)) {
+        uint32_t w[8];
+        for (int i = 0; i < 8; i++) { uint32_t t; memcpy(&t, line + i * 4, 4); w[i] = __builtin_bswap32(t); }
+        fprintf(stderr, "[spu-idle] img=%d pc=0x%05X lr=0x%05X polling ea=0x%08X (+%u lines) for %u polls; line: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+                t_next > 4 ? 4u : t_next, t_idle, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        /* SPU_IDLE_DUMP=1: also the polling program's registers and the top of
+         * its local store (igPm keeps its queue state at LS 0x3FE00..0x3FFFF). */
+        if (getenv("SPU_IDLE_DUMP")) {
+            fprintf(stderr, "[spu-idle]   regs:");
+            static const int rr[] = { 3,4,5,6,7,8,9,10,11,80,81,83,84,85,86,87,88,89 };
+            for (unsigned i = 0; i < sizeof rr / sizeof rr[0]; i++)
+                fprintf(stderr, " r%d=%08X", rr[i], ctx->gpr[rr[i]]._u32[0]);
+            fprintf(stderr, "\n");
+            for (uint32_t a = 0x3FE00; a < 0x40000; a += 0x40) {
+                fprintf(stderr, "[spu-idle]   LS %05X:", a);
+                for (uint32_t j = 0; j < 0x40; j += 4) {
+                    uint32_t t; memcpy(&t, ctx->ls + a + j, 4);
+                    fprintf(stderr, " %08X", __builtin_bswap32(t));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    /* How long to spin before giving the core away scales with the host:
+     * with cores to spare (8+), a waiting SPU keeps spinning far longer, so
+     * SPU<->SPU and PPU->SPU hand-offs (Bink's two decode lanes meet every
+     * slice) see sub-microsecond latency instead of a 50-100 us timer sleep;
+     * on a small host the waiting thread must step aside for the one it is
+     * waiting on. */
+    static int s_spin = 0, s_yield = 0;
+    if (!s_spin) {
+#ifdef _WIN32
+        SYSTEM_INFO si; GetSystemInfo(&si); long ncpu = (long)si.dwNumberOfProcessors;
+#else
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+        s_spin  = ncpu >= 8 ? 20000 : 256;
+        s_yield = ncpu >= 8 ? 40000 : 1024;
+    }
+    if (++t_idle < (unsigned)s_spin) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#endif
+        return;
+    }
+    if (t_idle < (unsigned)s_yield) {
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+        return;
+    }
+    unsigned over = t_idle - (unsigned)s_yield;
+    unsigned us = 20u << ((over >> 9) > 3 ? 3 : (over >> 9));   /* 20..160 */
+    if (us > 200) us = 200;
+#ifdef _WIN32
+    /* NOT Sleep(1): that is 1-2 ms on Windows, and every PPU->SPU job
+     * hand-off then waited that long once a worker had gone idle -- the game
+     * fell to ~3 fps with the CPU idle the moment its SPU load got light
+     * (first seen at the install movie, then for good). A high-resolution
+     * waitable timer (Windows 10 1803+) sleeps for tens of microseconds;
+     * without one, just yield. */
+    {
+        static SPU_THREAD_LOCAL HANDLE t_hrt;
+        static SPU_THREAD_LOCAL int t_hrt_tried;
+        if (!t_hrt_tried) {
+            t_hrt_tried = 1;
+            t_hrt = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                           TIMER_ALL_ACCESS);
+        }
+        if (t_hrt) {
+            LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(us > 50 ? 50 : us) * 10;   /* 100 ns units */
+            if (SetWaitableTimer(t_hrt, &due, 0, NULL, NULL, FALSE)) {
+                WaitForSingleObject(t_hrt, INFINITE);
+                return;
+            }
+        }
+        SwitchToThread();
+    }
+#else
+    struct timespec d = { 0, (long)us * 1000L };
+    nanosleep(&d, NULL);
+#endif
+}
+
+/* RACACIT_LINE_RING=<hex>[,<hex>]: the last 512 changes to one or two
+ * 128-byte guest lines, from every side that goes through the runtime --
+ * SPU GETLLAR (when the line differs from the last entry), PUTLLC ok/fail,
+ * PUTLLUC, DMA puts into it, PPU stwcx. and coherent stores -- with time,
+ * who, pc/lr and the line's first 64 bytes afterwards. racacit_ring_dump()
+ * prints it (the stall watch calls it): the interleaving behind a lost
+ * update, which no single snapshot can show. */
+static uint32_t s_ring_ea[2]; static int s_ring_on = -1;
+typedef struct { unsigned long long t; uint32_t ea, id, pc; char op; uint8_t line[64]; } ring_ent;
+static ring_ent s_ring[512]; static volatile long s_ring_n;
+static int ring_on(void)
+{
+    if (s_ring_on < 0) {
+        const char* e = getenv("RACACIT_LINE_RING"); s_ring_on = 0;
+        if (e && *e) { char* end = 0; s_ring_ea[0] = (uint32_t)strtoul(e, &end, 16) & ~127u;
+                       s_ring_ea[1] = (end && *end == ',') ? (uint32_t)strtoul(end + 1, 0, 16) & ~127u : s_ring_ea[0];
+                       s_ring_on = 1; }
+    }
+    return s_ring_on;
+}
+void racacit_ring_note(char op, uint32_t id, uint32_t pc, uint32_t ea, int only_if_changed)
+{
+    if (!ring_on()) return;
+    const uint32_t l = ea & ~127u;
+    if (l != s_ring_ea[0] && l != s_ring_ea[1]) return;
+    extern uint8_t* vm_base;
+    if (only_if_changed) {   /* a polling GETLLAR: only when the line moved since the last entry for it */
+        const long n = s_ring_n;
+        for (long k = n - 1; k >= 0 && k >= n - 512; k--) {
+            const ring_ent* r = &s_ring[k & 511];
+            if (r->ea == l) { if (!memcmp(r->line, vm_base + l, 64)) return; break; }
+        }
+    }
+    extern unsigned long long ps3_qpc_us(void);
+    const long i = InterlockedIncrement(&s_ring_n) - 1;
+    ring_ent* r = &s_ring[i & 511];
+    r->t = ps3_qpc_us(); r->ea = l; r->id = id; r->pc = pc; r->op = op;
+    memcpy(r->line, vm_base + l, 64);
+}
+void racacit_ring_dump(void)
+{
+    if (!ring_on()) return;
+    const long n = s_ring_n;
+    fprintf(stderr, "[line-ring] %ld events on %08X / %08X, the last %d:%c", n, s_ring_ea[0], s_ring_ea[1], n < 512 ? (int)n : 512, 10);
+    for (long k = n > 512 ? n - 512 : 0; k < n; k++) {
+        const ring_ent* r = &s_ring[k & 511];
+        char w[16 * 9 + 1]; int p = 0;
+        for (int j = 0; j < 16; j++)
+            p += snprintf(w + p, sizeof w - p, "%02X%02X%02X%02X ", r->line[j*4], r->line[j*4+1], r->line[j*4+2], r->line[j*4+3]);
+        fprintf(stderr, "[line-ring] %llu %c id=%u pc=0x%05X %08X: %s%c", r->t, r->op, r->id, r->pc, r->ea, w, 10);
+    }
+}
+
+/* PUTLLC's commit: the bytes of the 128-byte line where the SPU's new copy
+ * (ls) differs from its reservation snapshot (old), and no others. See the
+ * call site. 16 bytes at a time; an unchanged chunk is skipped, a fully
+ * changed one stored whole, a mixed one byte by byte. */
+static void spu_putllc_commit_changed(uint8_t* mem, const uint8_t* ls, const uint8_t* old)
+{
+    for (uint32_t i = 0; i < MFC_ATOMIC_LINE; i += 16u) {
+        uint64_t n0, n1, o0, o1;
+        memcpy(&n0, ls + i, 8); memcpy(&n1, ls + i + 8, 8);
+        memcpy(&o0, old + i, 8); memcpy(&o1, old + i + 8, 8);
+        const uint64_t d0 = n0 ^ o0, d1 = n1 ^ o1;
+        if (!(d0 | d1)) continue;
+        int all = 1;
+        for (int k = 0; k < 8; k++) if (!((d0 >> (k * 8)) & 0xFFu) || !((d1 >> (k * 8)) & 0xFFu)) { all = 0; break; }
+        if (all) { memcpy(mem + i, ls + i, 16); continue; }
+        for (uint32_t k = 0; k < 16u; k++)
+            if (ls[i + k] != old[i + k]) ((volatile uint8_t*)mem)[i + k] = ls[i + k];
+    }
+}
+
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
@@ -435,7 +715,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
      * see if the task reads MY taskset (0x4005E000) with my READY bit, or elsewhere. */
     { static int s_ct=-1; if(s_ct<0) s_ct=getenv("SPU_ATOMTRACE")?1:0;
       if(s_ct && ctx->image_id==22 && cmd==0xD0 && mfc_ea_range_committed(ea,16)) {
-        static int _c=0; if(_c++<24){
+        static int _c=0; if((_c < 24 && (_c++, 1))){
           uint8_t* m=vm_base+ea;
           #define BW(o) (((uint32_t)m[o]<<24)|((uint32_t)m[o+1]<<16)|((uint32_t)m[o+2]<<8)|m[o+3])
           fprintf(stderr,"[cri-atom] GETLLAR ea=0x%08X line[0..0x30]: %08X %08X %08X %08X | %08X %08X %08X %08X | %08X %08X %08X %08X\n",
@@ -449,7 +729,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     { static int s_td = -1; if (s_td < 0) s_td = (getenv("YDKJ_CRI_CHAIN") && getenv("SPU_ATOMTRACE")) ? 1 : 0;
       if (s_td && ea >= 0x0F000000u && ea < 0x0F001900u) {
         extern uint8_t* vm_base;
-        static int _t=0; if (vm_base && _t++ < 24) {
+        static int _t=0; if (vm_base && (_t < 24 && (_t++, 1))) {
             uint8_t* t = vm_base + 0x0F000000u;
             #define TW(o) (((uint32_t)t[o]<<24)|((uint32_t)t[o+1]<<16)|((uint32_t)t[o+2]<<8)|t[o+3])
             fprintf(stderr, "[tset] %s run=%08X rdy=%08X pnd=%08X ena=%08X sig=%08X wait=%08X | wid=%08X last=%02X\n",
@@ -464,7 +744,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
      * the host. GETLLAR returns a zeroed line (no reservation); PUTLLC fails. */
     if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) {
         static int s_w = 0;
-        if (s_w++ < 16)
+        if ((s_w < 16 && (s_w++, 1)))
             fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X pc=0x%05X img=%d uncommitted -- skipped\n",
                     cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
         if (cmd == MFC_GETLLAR_CMD) {
@@ -487,7 +767,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         s_aea = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_ae = s_aea ? 1 : 0;
         if (s_ae == 1) { extern uint32_t g_barrier_sync_watch;
             g_barrier_sync_watch = s_aea; } /* arm PUTLLC OK/FAIL verdict log */ }
-      if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea) {
+      static int s_po = -1; if (s_po < 0) s_po = getenv("SPU_ATOM_EA_PUTONLY") ? 1 : 0;   /* racacit */
+      if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea && !(s_po && cmd == MFC_GETLLAR_CMD)) {
           static int _n = 0, s_cap = -1;
           /* SPU_ATOM_EA_MAX=<n>: lines to print (default 48, 0 = unlimited). */
           if (s_cap < 0) { const char* m = getenv("SPU_ATOM_EA_MAX"); s_cap = m ? atoi(m) : 48; }
@@ -522,7 +803,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
       uint32_t b = g_barrier_sync_watch;
       if (b && ea >= (b & ~127u) && ea < ((b + 0xC0 + 127) & ~127u)) {
           static int _n = 0;
-          if (_n++ < 64)
+          if ((_n < 64 && (_n++, 1)))
               fprintf(stderr, "[sync-atomic] %s img=%d pc=0x%05X ea=0x%08X\n",
                       cmd == MFC_GETLLAR_CMD ? "GETLLAR" :
                       cmd == MFC_PUTLLC_CMD ? "PUTLLC" : "PUTLLUC",
@@ -576,6 +857,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
+        racacit_ring_note('g', ctx->spu_id, (uint32_t)ctx->pc & SPU_LS_MASK, ea, 1);
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
          * once per line with the line's head, so the stuck word is visible
@@ -590,6 +872,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
         spu_lockline_unlock();
+        spu_getllar_idle_backoff(ctx, ea, ls);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -648,16 +931,29 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
-        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
-            memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+            spu_mem_ne(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
-            memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            /* Commit only the bytes this SPU changed. The bytes it did not
+             * change equal the snapshot (the compare just proved it), so
+             * writing them changes nothing -- except when a PPU store races
+             * in: a PPU store that checked the reservation bitmap just before
+             * this SPU's GETLLAR takes the unlocked path, and if it lands
+             * between the compare above and this commit, a whole-line memcpy
+             * wrote the SPU's stale copy over it. On hardware that PUTLLC
+             * would have failed; here the PPU's write was simply lost -- a job
+             * submission gone, the main thread waiting forever for a record no
+             * SPU would ever see (level 14, 2026-10-19: every lane idle-polling
+             * the job queue 0x00F3CF00 while the main thread spun on its
+             * record). Writing only the changed bytes leaves such a store
+             * intact unless it hit a byte this SPU changed too. */
+            spu_putllc_commit_changed(mem, ls, ctx->resv_line);
+            spu_linewatch_note(ctx, ea, ls, "PUTLLC");
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -720,7 +1016,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           uint32_t b = g_barrier_sync_watch;
           if (b && ea >= (b & ~127u) && ea < ((b + 0xC0 + 127) & ~127u)) {
               static int _n = 0;
-              if (_n++ < 96 && ctx->atomic_stat == 0) {
+              if ((_n < 96 && (_n++, 1)) && ctx->atomic_stat == 0) {
                   uint32_t sn = ((uint32_t)ctx->ls[0x1C8]<<24)|((uint32_t)ctx->ls[0x1C9]<<16)|
                                 ((uint32_t)ctx->ls[0x1CA]<<8)|ctx->ls[0x1CB];
                   extern uint8_t* vm_base;
@@ -741,6 +1037,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+        racacit_ring_note(ctx->atomic_stat ? 'p' : 'P', ctx->spu_id, (uint32_t)ctx->pc & SPU_LS_MASK, ea, 0);
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0 && g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
@@ -752,6 +1049,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        spu_linewatch_note(ctx, ea, ls, "PUTLLUC");
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a
@@ -759,6 +1057,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        racacit_ring_note('U', ctx->spu_id, (uint32_t)ctx->pc & SPU_LS_MASK, ea, 0);
         spu_lockline_unlock();
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
@@ -930,7 +1229,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
 {
     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
     if (!vm_base || ctx->resv_ea == 0) return;
-    if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
+    if (spu_mem_ne(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
         ctx->resv_valid = 0;
         ctx->event_status |= 0x400u;
     }
@@ -992,6 +1291,124 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     ctx->status = SPU_STATUS_RUNNING;
 }
 
+/* `rdch SPU_RdEventStat` with only the lock-line-lost event pending on a
+ * held reservation: the "sleep until someone writes this line" idiom. Without
+ * SPU_CH_BLOCK the read returned at once, so an SPURS job-chain lane with
+ * nothing to do went straight back to GETLLAR -- five lanes doing that
+ * through the one lock-line lock took a third of every lane's time and
+ * slowed the lanes that had work (A Crack in Time's job manager, LS 0x270).
+ *
+ * Wait here instead, bounded: a short spin on the line itself (no lock),
+ * then the channel CV, which every writer that kills a reservation signals
+ * (spu_coh_notify_write*). Returning without the event after the bound is
+ * what the read did before, so the guest's retry loop is unchanged; only its
+ * rate drops. SPU_LR_WAIT_US=<us> (default 2000; 0 = off). */
+/* SPU_LR_WAITLOG=1: total time spent in lock-line waits per (line, image, pc),
+ * the top 10 every 5 s -- which line a slow job sits on. */
+static void spu_lr_waitlog(spu_context* ctx, unsigned long long us)
+{
+    static int on = -1; if (on < 0) on = getenv("SPU_LR_WAITLOG") ? 1 : 0;
+    if (!on) return;
+    typedef struct { uint32_t ea, pc; int img; unsigned long long us, n; uint32_t mask; } ent;
+    static ent e[256]; static int ne; static SRWLOCK lk = SRWLOCK_INIT; static unsigned long long last;
+    extern unsigned long long ps3_qpc_us(void);
+    const uint32_t ea = ctx->resv_ea & ~127u, pc = (uint32_t)(ctx->pc & SPU_LS_MASK);
+    AcquireSRWLockExclusive(&lk);
+    int k = 0;
+    for (; k < ne; k++) if (e[k].ea == ea && e[k].pc == pc && e[k].img == ctx->image_id) break;
+    if (k == ne && ne < 256) { e[ne].ea = ea; e[ne].pc = pc; e[ne].img = ctx->image_id; e[ne].us = e[ne].n = 0; e[ne].mask = ctx->event_mask; ne++; }
+    if (k < ne) { e[k].us += us; e[k].n++; }
+    const unsigned long long now = ps3_qpc_us();
+    if (!last) last = now;
+    if (now - last > 5000000ull) {
+        last = now;
+        fprintf(stderr, "[lr-waitlog] 5 s:%c", 10);
+        for (int t = 0; t < 10; t++) {
+            int b = -1;
+            for (int j = 0; j < ne; j++) if (e[j].n && (b < 0 || e[j].us > e[b].us)) b = j;
+            if (b < 0) break;
+            fprintf(stderr, "   line %08X img %d pc 0x%05X mask 0x%X: %llu waits, %.1f ms total, %.0f us avg%c",
+                    e[b].ea, e[b].img, e[b].pc, e[b].mask, e[b].n, e[b].us / 1e3, (double)e[b].us / (double)e[b].n, 10);
+            e[b].n = 0;
+        }
+        ne = 0;
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+
+/* The lanes' spin before sleeping (us), live from Settings > Graphics > CPU
+ * usage (rsx_host_ui.c): 30 efficient, 200 maximum. */
+volatile int g_racacit_spu_spin_us = 30;
+static void spu_lr_wait(spu_context* ctx)
+{
+    static long s_us = -1;
+    /* 200 us: a SPURS kernel parked here re-polls its workloads at least
+     * that often. A Crack in Time posts job-chain work through stores that
+     * reach the line without a lock-line notify; at the old 2 ms bound the
+     * job sat that long before an SPU picked it up, while the main thread
+     * spun on its completion (Zolar: 86% -> 93% of frames on time). */
+    if (s_us < 0) { const char* e = getenv("SPU_LR_WAIT_US"); s_us = e ? atol(e) : 200; }
+    if (s_us <= 0 || !(ctx->event_mask & 0x400u)) return;
+    if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) return;
+    LARGE_INTEGER f, t0, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    /* SPU_LR_SPIN_US=<us>: how long to spin on the line before sleeping on
+     * the channel CV (woken by any writer that kills the reservation). It was
+     * 200, the whole bound: a parked lane never slept, and the six lanes held
+     * six cores at 100% doing nothing -- the game took ~8 cores standing in
+     * Axiom City, starving the main thread on 4- and 6-core CPUs. At 30 the
+     * hand-offs still land in the spin (fight frame rate and frame waits
+     * unchanged, measured A/B) and Axiom takes 3.6-4.4 cores standing, ~5 in
+     * a fight. 0 sleeps at once and slows fights. */
+    static long s_spin_us = -2;
+    if (s_spin_us == -2) { const char* e = getenv("SPU_LR_SPIN_US"); s_spin_us = e ? atol(e) : -1; }
+    const long spin_us = s_spin_us >= 0 ? s_spin_us : g_racacit_spu_spin_us;   /* Settings > Graphics > CPU usage */
+    const LONGLONG spin = f.QuadPart * spin_us / 1000000;
+    const LONGLONG lim = f.QuadPart * s_us / 1000000;
+    extern void ps3_tl_at(unsigned long long t, char ev, uint32_t a, uint32_t b);
+    extern unsigned long long ps3_qpc_us(void);
+    const unsigned long long tl0 = ps3_qpc_us();
+extern unsigned ps3_tl_tix(void);
+extern _Thread_local unsigned long long t_spu_job_wait_us;   /* spu_drain.c, SPU_JOB_STATS */
+#define SPU_LR_WAIT_DONE() do { const unsigned long long d_ = ps3_qpc_us() - tl0; t_spu_job_wait_us += d_;         if (d_ >= 20) { ps3_tl_at(tl0, 'w', (ctx->resv_ea & ~127u) | (ps3_tl_tix() & 127u), (uint32_t)d_); ps3_tl_at(tl0, 'x', (uint32_t)(ctx->pc & SPU_LS_MASK), (uint32_t)d_); }         spu_lr_waitlog(ctx, d_); } while (0)
+    /* SPU_LR_STATS=1: how the waits end, every 5 s -- in the spin, woken by a
+     * writer's notify, found changed only by polling after a sleep (a writer
+     * that does not notify: up to 1 ms late), or at the bound. */
+    static int s_st = -1; if (s_st < 0) s_st = getenv("SPU_LR_STATS") ? 1 : 0;
+    static volatile long s_n[4]; static unsigned long long s_last;
+    int slept = 0;
+#define SPU_LR_STAT(k) do { if (s_st) { InterlockedIncrement(&s_n[k]); const unsigned long long n_ = ps3_qpc_us();         if (!s_last) s_last = n_; else if (n_ - s_last > 5000000ull) { s_last = n_;         fprintf(stderr, "[lr-wait] spin %ld notified %ld polled-late %ld bound %ld%c", s_n[0], s_n[1], s_n[2], s_n[3], 10);         s_n[0] = s_n[1] = s_n[2] = s_n[3] = 0; } } } while (0)
+    for (;;) {
+        if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) {
+            SPU_LR_STAT(slept ? 1 : 0); SPU_LR_WAIT_DONE(); return; }
+        spu_resv_lost_poll(ctx);
+        if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) {
+            SPU_LR_STAT(slept ? 2 : 0); SPU_LR_WAIT_DONE(); return; }
+        QueryPerformanceCounter(&t);
+        if (t.QuadPart - t0.QuadPart >= lim) {
+            SPU_LR_STAT(3); SPU_LR_WAIT_DONE();
+            /* SPU_LR_STATS: which lines the waits that time out are on. */
+            if (s_st) { static uint32_t ea_[16]; static unsigned long cnt_[16]; static unsigned long tot_;
+                const uint32_t ea = ctx->resv_ea & ~127u; int k = 0;
+                for (; k < 16; k++) if (ea_[k] == ea || !cnt_[k]) break;
+                if (k < 16) { ea_[k] = ea; cnt_[k]++; }
+                if ((++tot_ & 1023u) == 0) {
+                    fprintf(stderr, "[lr-bound] lines:");
+                    for (int j = 0; j < 16 && cnt_[j]; j++) fprintf(stderr, " %08X:%lu", ea_[j], cnt_[j]);
+                    fprintf(stderr, " (img %d pc 0x%05X)%c", ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), 10);
+                } }
+            return; }
+        if (t.QuadPart - t0.QuadPart < spin) { YieldProcessor(); continue; }
+        yz_lockstep_block_begin(ctx);
+        AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+        if (!(ctx->event_status & ctx->event_mask) && ctx->resv_valid)
+            SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                      (SRWLOCK*)&ctx->ch_wait_lock, 1, 0);
+        ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+        yz_lockstep_block_end(ctx);
+        slept = 1;
+    }
+}
+
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
@@ -1010,8 +1427,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
      * park forever. RdInMbox/RdSigNotify park on their PPU producers. */
     if (channel == SPU_RdInMbox || channel == SPU_RdSigNotify1 || channel == SPU_RdSigNotify2)
         spu_ch_wait(ctx, channel, "rdch");
-    else if (channel == SPU_RdEventStat && ctx->event_mask != 0)
-        spu_ch_wait(ctx, channel, "rdch");
+    else if (channel == SPU_RdEventStat && ctx->event_mask != 0) {
+        if (yz_ch_block()) spu_ch_wait(ctx, channel, "rdch");
+        else spu_lr_wait(ctx);
+    }
 
     uint32_t v = 0;
 
@@ -1111,7 +1530,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
           lastlsa[sp] = ctx->mfc_lsa & SPU_LS_MASK;
           lastr90[sp] = ctx->gpr[90]._u32[0];
           lastrd[sp] = (ctx->resv_valid && vm_base && ctx->resv_ea)
-                     ? (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0)
+                     ? (spu_mem_ne(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0)
                      : -1;
           { static int s_ld2 = -2; static uint32_t s_lo2;
             if (s_ld2 == -2) { const char* e5 = getenv("SPU_LSDUMP");
@@ -1267,7 +1686,13 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
      * handler gates on this (rchcnt $ch25; brz IhcExit) -- returning the old
      * default of 1 made it enter on spurious interrupts with an empty stat,
      * running IhcLoop on a zero mask (clz(0) -> bogus tagId/ack). */
-    case MFC_RdListStallStat: return ctx->list_stall_stat ? 1 : 0;
+    case MFC_RdListStallStat:
+        { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+          static int _n = 0;
+          if (s_it && (_n < 64 && (_n++, 1)))
+              fprintf(stderr, "[irq] rchcnt ListStallStat stat=0x%X img=%d pc=0x%05X\n",
+                      ctx->list_stall_stat, ctx->image_id, ctx->pc & 0x3FFFF); }
+        return ctx->list_stall_stat ? 1 : 0;
     default:                 return 1;  /* default: channel ready */
     }
 }
@@ -1281,7 +1706,27 @@ typedef struct {
     uint32_t addr;
     spu_fn   fn;
     int      image_id;   /* which recompiled image this function belongs to */
+    uint32_t sig0, sig1; /* racacit: LS words seen at the first policy-mode dispatch */
+    int      sig_set;
+    int      ovl;        /* racacit: 1 + index into s_ovl for a content-matched overlay */
+    uint32_t len;        /* racacit: overlay entry: bytes to its next entry (capped) */
 } spu_reg_entry;
+
+/* racacit: content-matched overlay images. A SPURS job binary is DMA'd into a
+ * fixed LS slot that many different jobs share (A Crack in Time's igPm puts
+ * every job at LS 0x100), so neither the address nor the context's image id
+ * says which program is resident. Each lifted job image registers its GUID
+ * header (the four `ila $r2,...` words every job starts with) and the code
+ * words at each lifted entry; a lookup serves an overlay function only when
+ * BOTH are what the local store holds right now. */
+/* guid: the 16 bytes at base + anchor that identify the image in local store.
+ * anchor is 0 for a job at its header; a module a job loads above itself has
+ * its header overwritten once it is in place, so it is told by its code. */
+typedef struct { int image_id; uint32_t base; uint32_t anchor; uint8_t guid[16];
+                 const uint8_t* bytes; uint32_t size; int reloc; } spu_ovl_desc;
+#define SPU_OVL_MAX 512
+static spu_ovl_desc s_ovl[SPU_OVL_MAX];
+static int s_ovl_count = 0;
 
 /* One entry per lifted SPU function across EVERY registered image, and a game
  * that lifts its whole SPU workload set has a lot of them: Yakuza: Dead Souls
@@ -1303,6 +1748,14 @@ static uint32_t s_registry_count = 0;
  * Handing the SPU host pointers over lets the map cover both, so the gaps are
  * real entries and the extents mean something. */
 uint32_t spu_registry_size(void) { return s_registry_count; }
+
+/* racacit: which recompiled image registry entry i belongs to (the sampler
+ * keys SPU samples by image + LS address; ids come from spu_begin_image in
+ * game/spu/spu_jobs.c and friends). -1 if out of range. */
+int spu_registry_image(uint32_t i)
+{
+    return i < s_registry_count ? s_registry[i].image_id : -1;
+}
 
 int spu_registry_entry(uint32_t i, void** host, uint32_t* ls_addr)
 {
@@ -1416,6 +1869,7 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
      * any, for back-compat with single-image contexts. */
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         const spu_reg_entry* e = &s_registry[n - 1];
+        if (e->ovl) continue;   /* content-matched overlays: spu_lookup_ctx only */
         if (e->addr == addr &&
             (image_id == 0 || e->image_id == 0 || e->image_id == image_id)) {
             /* One compare on the return path; the report itself is rare. */
@@ -1425,6 +1879,335 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
         }
     }
     return NULL;
+}
+
+/* racacit: content-checked lookup for policy-module contexts. HLE SPURS keeps
+ * one context per (workload, lane) and the PM's jobs are DMA'd over the PM's
+ * own code (A Crack in Time's igPm: job images land at LS 0x100.. and cover the
+ * PM at 0xA00..0xC30). An address-only registry then serves the PM's lifted
+ * function for the job's instructions. Record the code words the first time a
+ * PM-context dispatch hits an entry -- the PM is intact on its own entry path
+ * -- and refuse the lifted function when the local store no longer holds them,
+ * so the interpreter runs what is really there. Signatures are sealed from the
+ * pristine PM image (spu_registry_seal_image); unsealed entries are trusted. */
+/* racacit: SPU_DUMP_JOBS=<dir>. A policy-module context that misses every
+ * lifted image is running code nobody lifted -- typically a job binary that
+ * only exists at run time (Bink's SPU decoder is shipped compressed and
+ * unpacked by the PPU). Write the whole local store once per job GUID (the 16
+ * bytes at LS 0x100, where igPm loads jobs) so it can be lifted offline with
+ * scripts/lift_spu_jobs.py --from-dump. */
+static void spu_dump_unknown_job(const spu_context* ctx, uint32_t addr)
+{
+    static const char* dir = NULL; static int init = 0;
+    static uint8_t seen[64][16]; static int nseen = 0;
+    static volatile int mu = 0;
+    if (!init) { dir = getenv("SPU_DUMP_JOBS"); init = 1; }
+    if (!dir || !*dir) return;
+    const uint8_t* g = ctx->ls + 0x100;
+    while (__sync_lock_test_and_set(&mu, 1)) { }
+    for (int i = 0; i < nseen; i++)
+        if (!memcmp(seen[i], g, 16)) { __sync_lock_release(&mu); return; }
+    if (nseen < 64) memcpy(seen[nseen++], g, 16);
+    else { __sync_lock_release(&mu); return; }
+    char path[1024];
+    snprintf(path, sizeof path, "%s/job_%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x_pc%05X.ls",
+             dir, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15],
+             addr & SPU_LS_MASK);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+    fprintf(stderr, "[spu-dump] unlifted job in img %d at LS 0x%05X -> %s\n", ctx->image_id, addr, f ? path : "(open failed)");
+    __sync_lock_release(&mu);
+}
+
+/* SPU_MISS_DIAG: why an address the interpreter was entered at matched no
+ * lifted function -- every registry entry at that address, and for an
+ * overlay entry whether its anchor GUID and its first two code words are in
+ * local store. "no entry" = the lift never produced that function. */
+void spu_lookup_explain(const spu_context* ctx, uint32_t addr)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_MISS_DIAG") ? 1 : 0;
+    if (!on || !ctx) return;
+    /* SPU_MISS_DUMP=<dir>: also the whole local store at that moment, so the
+     * module behind the entry can be found by a long match offline. */
+    { static const char* dir = (const char*)1; static int n = 0;
+      if (dir == (const char*)1) dir = getenv("SPU_MISS_DUMP");
+      if (dir && *dir && n < 400) {
+          n++;
+          char path[1024];
+          snprintf(path, sizeof path, "%s/miss_%02x%02x%02x%02x_%05X.ls", dir,
+                   ctx->ls[0x100], ctx->ls[0x101], ctx->ls[0x102], ctx->ls[0x103], addr & SPU_LS_MASK);
+          FILE* f = fopen(path, "wb");
+          if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+      } }
+    const uint8_t* q = ctx->ls + (addr & SPU_LS_MASK);
+    const uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+    const uint32_t w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+    fprintf(stderr, "[miss-diag] img=%d LS 0x%05X words %08X %08X:", ctx->image_id, addr, w0, w1);
+    int n = 0;
+    for (uint32_t k = s_hash_head[spu_fn_hash(addr)]; k; k = s_hash_next[k - 1]) {
+        const spu_reg_entry* e = &s_registry[k - 1];
+        if (e->addr != addr) continue;
+        n++;
+        if (e->ovl) {
+            const spu_ovl_desc* o = &s_ovl[e->ovl - 1];
+            fprintf(stderr, " [ovl img %d base 0x%05X guid %s sig %s", o->image_id, o->base,
+                    memcmp(ctx->ls + o->base + o->anchor, o->guid, 16) ? "MISS" : "ok",
+                    (w0 == e->sig0 && w1 == e->sig1) ? "ok" : "MISS");
+            /* ...and, for a matching entry, the first body word that differs
+             * (a patched module stays in the interpreter). */
+            if (w0 == e->sig0 && w1 == e->sig1 && e->len > 8) {
+                const uint8_t* lb = o->bytes + (e->addr - o->base);
+                for (uint32_t b = 0; b + 4 <= e->len; b += 4)
+                    if (memcmp(q + b, lb + b, 4)) {
+                        fprintf(stderr, " body len 0x%X differs at +0x%X: ls %02X%02X%02X%02X lifted %02X%02X%02X%02X",
+                                e->len, b, q[b], q[b+1], q[b+2], q[b+3], lb[b], lb[b+1], lb[b+2], lb[b+3]);
+                        break;
+                    }
+            }
+            fprintf(stderr, "]");
+        } else {
+            fprintf(stderr, " [img %d sig_set %d sig %s]", e->image_id, e->sig_set,
+                    (w0 == e->sig0 && w1 == e->sig1) ? "ok" : "MISS");
+        }
+    }
+    if (!n) fprintf(stderr, " no entry");
+    fprintf(stderr, "%c", 10);
+}
+
+static spu_fn spu_lookup_fixed(const spu_context* ctx, uint32_t addr, int image_id)
+{
+    for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
+        spu_reg_entry* e = &s_registry[n - 1];
+        if (e->addr != addr) continue;
+        if (e->ovl) {
+            /* Overlay entry: matched by content, whatever the context's image. */
+            if (!ctx || addr + 8 > SPU_LS_SIZE) continue;
+            const spu_ovl_desc* o = &s_ovl[e->ovl - 1];
+            if (spu_mem_ne(ctx->ls + o->base + o->anchor, o->guid, 16) != 0) continue;
+            const uint8_t* q = ctx->ls + addr;
+            uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+            uint32_t w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+            if (w0 != e->sig0 || w1 != e->sig1) continue;
+            /* The whole body, not just its first two words: a job may patch
+             * a module after loading it (A Crack in Time's job 4360b202 does,
+             * at 0x29C00), and serving the unpatched lift fed that job garbage
+             * that wiped local store. A patched body runs in the interpreter. */
+            if (e->len > 8 && spu_mem_ne(q, o->bytes + (e->addr - o->base), e->len) != 0) {
+                static int dbg = -1; if (dbg < 0) dbg = getenv("SPU_BODY_DIAG") ? 1 : 0;   /* which word differs */
+                if (dbg) { static uint32_t told[64]; static unsigned nt;
+                    int seen = 0; for (unsigned t = 0; t < nt && t < 64; t++) if (told[t] == addr) seen = 1;
+                    if (!seen && nt < 64) { told[nt++] = addr;
+                        const uint8_t* lb = o->bytes + (e->addr - o->base);
+                        for (uint32_t b = 0; b + 4 <= e->len; b += 4) if (memcmp(q + b, lb + b, 4)) {
+                            fprintf(stderr, "[body-diag] img %d entry 0x%05X len 0x%X first diff +0x%X ls %02X%02X%02X%02X lifted %02X%02X%02X%02X%c",
+                                    o->image_id, addr, e->len, b, q[b], q[b+1], q[b+2], q[b+3], lb[b], lb[b+1], lb[b+2], lb[b+3], 10);
+                            break; } } }
+                continue;
+            }
+            { static unsigned char s_said[SPU_OVL_MAX];
+              if (!s_said[e->ovl - 1]) { s_said[e->ovl - 1] = 1;
+                  fprintf(stderr, "[spu-ovl] lifted overlay image %d resident (first hit LS 0x%05X, ctx img %d)\n",
+                          o->image_id, addr, image_id); } }
+            return e->fn;
+        }
+        if (!(image_id == 0 || e->image_id == 0 || e->image_id == image_id)) continue;
+        if (ctx && ctx->policy_mode && addr + 8 <= SPU_LS_SIZE && e->sig_set) {
+            const uint8_t* q = ctx->ls + addr;
+            uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+            uint32_t w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+            if (w0 != e->sig0 || w1 != e->sig1) {
+                static int _n = 0;
+                if ((_n < 8 && (_n++, 1)))
+                    fprintf(stderr, "[spu] img=%d LS 0x%05X no longer holds its lifted code "
+                            "(job overlay) -- trying overlays / interpreting\n", image_id, addr);
+                continue;      /* an overlay registered later may own it */
+            }
+        }
+        if (e->image_id != image_id)
+            spu_report_cross_image(addr, image_id, e->image_id);
+        return e->fn;
+    }
+    return NULL;
+}
+
+/* ---- relocatable overlays (spu_lifter.py --reloc) -------------------------
+ * A module a job loads at a base of its own choosing matches nothing by
+ * address. Index its functions by their first two code words instead; a
+ * candidate puts the module at base' = addr - (entry - lift base), and is
+ * served when the module's anchor bytes are at base' + anchor and the code
+ * from the entry on is the module's own. The lifted code then runs with
+ * ls_delta = base' - lift base. */
+#define SPU_RL_HASH 8192u
+static uint32_t s_rl_head[SPU_RL_HASH];
+static uint32_t s_rl_next[SPU_FN_REGISTRY_MAX];
+static volatile int s_rl_built = 0, s_rl_any = 0, s_rl_mu = 0;
+
+static inline uint32_t spu_rl_hash(uint32_t a, uint32_t b)
+{
+    return ((a * 2654435761u) ^ (b * 2246822519u)) >> 19;   /* 13 bits */
+}
+
+/* SPU_NO_RELOC=1: serve relocatable images only at their lift base (as
+ * before --reloc), to tell a relocation bug from anything else. */
+void spu_mark_overlay_relocatable(int image_id)
+{
+    if (getenv("SPU_NO_RELOC")) return;
+    for (int i = 0; i < s_ovl_count; i++)
+        if (s_ovl[i].image_id == image_id) { s_ovl[i].reloc = 1; s_rl_any = 1; }
+}
+
+static void spu_rl_build(void)
+{
+    while (__sync_lock_test_and_set(&s_rl_mu, 1)) { }
+    if (!s_rl_built) {
+        for (uint32_t i = 0; i < s_registry_count; i++) {
+            const spu_reg_entry* e = &s_registry[i];
+            if (!e->ovl || !s_ovl[e->ovl - 1].reloc || !e->sig_set) continue;
+            const uint32_t h = spu_rl_hash(e->sig0, e->sig1);
+            s_rl_next[i] = s_rl_head[h];
+            s_rl_head[h] = i + 1;
+        }
+        __sync_synchronize();
+        s_rl_built = 1;
+    }
+    __sync_lock_release(&s_rl_mu);
+}
+
+static spu_fn spu_lookup_reloc(const spu_context* ctx, uint32_t addr, uint32_t* delta)
+{
+    if (!s_rl_built) spu_rl_build();
+    const uint8_t* q = ctx->ls + addr;
+    const uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+    const uint32_t w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+    /* Verified (overlay, base) pairs: the anchor and entry words are checked
+     * on every hit, the longer code compare only once per pair. */
+    static _Thread_local struct { int ovl; uint32_t base; } cache[8];
+    static _Thread_local unsigned cache_i;
+    for (uint32_t n = s_rl_head[spu_rl_hash(w0, w1)]; n; n = s_rl_next[n - 1]) {
+        const spu_reg_entry* e = &s_registry[n - 1];
+        if (e->sig0 != w0 || e->sig1 != w1) continue;
+        const spu_ovl_desc* o = &s_ovl[e->ovl - 1];
+        const uint32_t off = e->addr - o->base;
+        if (addr < off) continue;
+        const uint32_t base = addr - off;
+        if (base + o->size > SPU_LS_SIZE) continue;
+        if (spu_mem_ne(ctx->ls + base + o->anchor, o->guid, 16) != 0) continue;
+        if (e->len > 8 && spu_mem_ne(ctx->ls + addr, o->bytes + off, e->len) != 0) {  /* patched body */
+            static int dbg = -1; if (dbg < 0) dbg = getenv("SPU_BODY_DIAG") ? 1 : 0;
+            if (dbg) { static uint32_t told[64]; static unsigned nt; int seen = 0;
+                for (unsigned t = 0; t < nt && t < 64; t++) if (told[t] == addr) seen = 1;
+                if (!seen && nt < 64) { told[nt++] = addr; unsigned nd = 0; uint32_t first = 0, last = 0;
+                    for (uint32_t b = 0; b + 4 <= e->len; b += 4) if (memcmp(ctx->ls + addr + b, o->bytes + off + b, 4)) { if (!nd) first = b; last = b; nd++; }
+                    fprintf(stderr, "[body-diag] reloc img %d entry 0x%05X len 0x%X: %u word(s) differ, +0x%X..+0x%X%c", o->image_id, addr, e->len, nd, first, last, 10); } }
+            continue;
+        }
+        int known = 0;
+        for (unsigned c = 0; c < 8; c++)
+            if (cache[c].ovl == e->ovl && cache[c].base == base) { known = 1; break; }
+        if (!known) {
+            const uint32_t aspan = o->size - o->anchor < 256u ? o->size - o->anchor : 256u;
+            if (spu_mem_ne(ctx->ls + base + o->anchor, o->bytes + o->anchor, aspan) != 0) continue;
+            const unsigned c = cache_i++ & 7u;
+            cache[c].ovl = e->ovl; cache[c].base = base;
+            static int said[SPU_OVL_MAX];
+            if (said[e->ovl - 1] < 4) { said[e->ovl - 1]++;
+                fprintf(stderr, "[spu-ovl] relocatable image %d at LS 0x%05X (lifted at 0x%05X), entry 0x%05X%c",
+                        o->image_id, base, o->base, addr, 10); }
+        }
+        *delta = base - o->base;
+        return e->fn;
+    }
+    return NULL;
+}
+
+spu_fn spu_lookup_ctx(const spu_context* ctx, uint32_t addr, int image_id)
+{
+    spu_fn fn = spu_lookup_fixed(ctx, addr, image_id);
+    if (fn) {
+        if (ctx) ((spu_context*)ctx)->ls_delta = 0;
+        return fn;
+    }
+    if (ctx && s_rl_any && addr + 8 <= SPU_LS_SIZE) {
+        uint32_t delta = 0;
+        fn = spu_lookup_reloc(ctx, addr, &delta);
+        if (fn) { ((spu_context*)ctx)->ls_delta = delta; return fn; }
+    }
+    if (ctx && ctx->policy_mode && (addr < 0x3F000u || getenv("SPU_DUMP_STUBS")))   /* 0x3Fxxx: PM-generated stubs */
+        spu_dump_unknown_job(ctx, addr);
+    return NULL;
+}
+
+/* racacit: declare image `image_id` (already registered) a content-matched
+ * overlay loaded at LS `base`; `bytes`/`size` is the image as DMA'd there. */
+void spu_register_overlay_image_at(int image_id, uint32_t base, const uint8_t* bytes, uint32_t size, uint32_t anchor);
+void spu_register_overlay_image(int image_id, uint32_t base, const uint8_t* bytes, uint32_t size)
+{
+    spu_register_overlay_image_at(image_id, base, bytes, size, 0);
+}
+
+/* As above, identified by the 16 bytes at `anchor` into the image. */
+void spu_register_overlay_image_at(int image_id, uint32_t base, const uint8_t* bytes, uint32_t size, uint32_t anchor)
+{
+    if (s_ovl_count >= SPU_OVL_MAX || size < anchor + 16 || base + size > SPU_LS_SIZE) return;
+    /* SPU_NO_SUB=1: leave the job sub-modules (images 400+) to the
+     * interpreter -- to tell a lifting problem in them from anything else. */
+    if (image_id >= 400 && getenv("SPU_NO_SUB")) return;
+    /* SPU_NO_JOBS=1: the same for the content-matched jobs (images 200-399). */
+    if (image_id >= 200 && image_id < 400 && getenv("SPU_NO_JOBS")) return;
+    spu_ovl_desc* o = &s_ovl[s_ovl_count];
+    o->image_id = image_id; o->base = base; o->anchor = anchor;
+    memcpy(o->guid, bytes + anchor, 16);
+    o->bytes = bytes; o->size = size; o->reloc = 0;
+    int idx = ++s_ovl_count, n = 0;
+    for (uint32_t i = 0; i < s_registry_count; i++) {
+        spu_reg_entry* e = &s_registry[i];
+        if (e->image_id != image_id || e->addr < base || e->addr + 8 > base + size) continue;
+        const uint8_t* q = bytes + (e->addr - base);
+        e->sig0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+        e->sig1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+        e->sig_set = 1; e->ovl = idx; n++;
+    }
+    /* Body lengths: each entry runs to the next entry of this image (or the
+     * image end), capped -- what the lookup compares before serving it. */
+    { uint32_t cnt = 0;
+      for (uint32_t i = 0; i < s_registry_count; i++) if (s_registry[i].ovl == idx) cnt++;
+      uint32_t* ix = cnt ? (uint32_t*)malloc(cnt * sizeof *ix) : NULL;
+      if (ix) {
+          uint32_t k = 0;
+          for (uint32_t i = 0; i < s_registry_count; i++) if (s_registry[i].ovl == idx) ix[k++] = i;
+          for (uint32_t x = 1; x < cnt; x++) {          /* insertion sort by addr */
+              const uint32_t v = ix[x]; uint32_t y = x;
+              while (y && s_registry[ix[y - 1]].addr > s_registry[v].addr) { ix[y] = ix[y - 1]; y--; }
+              ix[y] = v;
+          }
+          for (uint32_t x = 0; x < cnt; x++) {
+              spu_reg_entry* e = &s_registry[ix[x]];
+              uint32_t end = base + size;
+              for (uint32_t y = x + 1; y < cnt; y++)
+                  if (s_registry[ix[y]].addr > e->addr) { end = s_registry[ix[y]].addr; break; }
+              const uint32_t len = end > e->addr ? end - e->addr : 0;
+              e->len = len > 1024u ? 1024u : len;
+          }
+          free(ix);
+      } }
+    (void)n;
+}
+
+/* racacit: record the code words of every lifted entry of `image_id` inside
+ * [lo, hi) from a local store that is known to hold that image's code (the
+ * policy module right after it is copied in). spu_lookup_ctx compares against
+ * these, so a job image DMA'd over the PM later is never mistaken for it. */
+void spu_registry_seal_image(int image_id, const uint8_t* ls, uint32_t lo, uint32_t hi)
+{
+    for (uint32_t i = 0; i < s_registry_count; i++) {
+        spu_reg_entry* e = &s_registry[i];
+        if (e->image_id != image_id || e->addr < lo || e->addr + 8 > hi) continue;
+        const uint8_t* q = ls + e->addr;
+        e->sig0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+        e->sig1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+        e->sig_set = 1;
+    }
 }
 
 /* Which image registered a function at this LS address, or -1 if none did.
@@ -1456,7 +2239,7 @@ int spu_have_function(uint32_t addr)
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
-    return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+    return (spu_lifted_fn)spu_lookup_ctx(ctx, lsa, ctx ? ctx->image_id : 0);
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
@@ -1631,7 +2414,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
     unsigned os = (o[0] << 8) | o[1], on = (o[2] << 8) | o[3];
     unsigned ns = (n[0] << 8) | n[1], nn = (n[2] << 8) | n[3];
     int bad = !(ns == os || ns == ((os + 1) & 0xFFFF)) || !(nn == on || nn == ((on + 1) & 0xFFFF));
-    if (bad) { static int c; if (c++ < 32)
+    if (bad) { static int c; if ((c < 32 && (c++, 1)))
         fprintf(stderr, "[lockguard] %s img=%d pc=0x%05X ea=0x%08X size=%u: %04X/%04X -> %04X/%04X\n",
                 what, ctx ? ctx->image_id : -1, ctx ? (unsigned)(ctx->pc & SPU_LS_MASK) : 0u,
                 ea, size, os, on, ns, nn); }
@@ -1641,6 +2424,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
+    /* PS3_TIMELINE: a GUID-headed code module (a job or sub-module; its first
+     * word is 0x4.....02) arriving in local store -- 'M' guid word, lsa | lane. */
+    { static int tl = -1; if (tl < 0) tl = getenv("PS3_TIMELINE") ? 1 : 0;
+      if (tl && size >= 256) {
+          const uint32_t w = (uint32_t)ls[0] << 24 | (uint32_t)ls[1] << 16 | (uint32_t)ls[2] << 8 | ls[3];
+          if ((w & 0xF00000FFu) == 0x40000002u) {
+              extern void ps3_tl(char ev, uint32_t a, uint32_t b); extern unsigned ps3_tl_tix(void);
+              ps3_tl('M', w, (lsa & ~15u) | (ps3_tl_tix() & 15u));
+          } } }
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
@@ -1670,7 +2462,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             }
             if (ctx->resident_ovl != o->image_id) {
                 ctx->resident_ovl = o->image_id;
-                { static int _n = 0; if (_n++ < 32)
+                { static int _n = 0; if ((_n < 32 && (_n++, 1)))
                     fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
                             "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
                             ctx->image_id, ea, (uint32_t)(ls - ctx->ls), size,
@@ -1729,7 +2521,7 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
         m[0x30 + 2*s]     = (uint8_t)(bits >> 8);
         m[0x30 + 2*s + 1] = (uint8_t)bits;
     }
-    { static int _n = 0; if (_n++ < 8)
+    { static int _n = 0; if ((_n < 8 && (_n++, 1)))
         fprintf(stderr, "[spu] delivered owed bits=0x%04X to object 0x%08X \n",
                 (unsigned)bits, wobj); }
 }
@@ -1742,7 +2534,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * budget is spent by FMOD's WAIT_SIGNAL loop long before a later task). */
     static int s_si = -2;
     if (s_si == -2) { const char* e = getenv("SPU_SYSCALL_IMG"); s_si = e ? atoi(e) : -1; }
-    { static int _n = 0; if (_n++ < 24 || ctx->image_id == s_si)
+    { static int _n = 0; if ((_n < 24 && (_n++, 1)) || ctx->image_id == s_si)
         fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X wobj@2FDC=0x%02X%02X%02X%02X\n",
                 num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                 ctx->ls[0x2FDC], ctx->ls[0x2FDD], ctx->ls[0x2FDE], ctx->ls[0x2FDF]); }
@@ -1751,7 +2543,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * (see func_00026DE0 / func_000272AC in image 22). Logging r4 shows caller
      * leftovers and hides what the task actually asked for. */
     { static int s_sa = -1; if (s_sa < 0) s_sa = getenv("YDKJ_SYSCALL_ARG") ? 1 : 0;
-      if (s_sa) { static int _n = 0; if (_n++ < 40) {
+      if (s_sa) { static int _n = 0; if ((_n < 40 && (_n++, 1))) {
         const uint8_t* a = &ctx->ls[0x2FD0];
         fprintf(stderr, "[spu] syscall num=%u LS[0x2FD0]=%02X%02X%02X%02X %02X%02X%02X%02X"
                         " %02X%02X%02X%02X %02X%02X%02X%02X img=%d\n",
@@ -1775,7 +2567,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
     static _Thread_local int s_exit_seen = 0;
     if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
-        { static int _n = 0; if (_n++ < 8)
+        { static int _n = 0; if ((_n < 8 && (_n++, 1)))
             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
                     s_exit_seen); }
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
@@ -1834,7 +2626,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
                   extern void spurs_ef_set_from_spu(uint32_t, uint16_t);
                   spurs_ef_set_from_spu(wobj + 0x100u, 1);
                   static int _n = 0;
-                  if (_n++ < 8)
+                  if ((_n < 8 && (_n++, 1)))
                       fprintf(stderr, "[spu] SPU-REPLY: set flag 0x%08X for object "
                                       "0x%08X (cycle complete)\n", wobj + 0x100u, wobj);
               }
@@ -1963,7 +2755,11 @@ static int spu_smc_microstep(spu_context* ctx)
             pc += 4; continue;
         }
         if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
-            uint32_t a = (((w >> 7) & 0xFFFF) << 4) & SPU_LS_MASK & ~15u;
+            /* I16 is a WORD address (LSA >> 2), as for every RI16 form -- it
+             * was shifted by 4, so `lqa $r77,0xA40` in the WWS job manager's
+             * interrupt entry read LS 0x2900 and the save stub it generates
+             * from that word came out as garbage (0x549F6937 at 0x3FEC0). */
+            uint32_t a = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;
             if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[rt]);
             else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
@@ -2012,6 +2808,19 @@ static int spu_smc_microstep(spu_context* ctx)
          * corroboration gets for a decode bug. */
         if (op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) { pc += 4; continue; } /* hbr/hbra/hbrr */
 
+        /* Stepped onto lifted code: run that instead of interpreting it. A
+         * job module is entered at its 16-byte GUID header -- four `ila`
+         * the microstepper runs -- and falls through into its first lifted
+         * function; the interpreter only rejoins lifted code at a BRANCH, so
+         * handed this pc it interpreted the whole module. A Crack in Time's
+         * job 43593402 calls the module it loads at 0x10D00 this way every
+         * frame (its inner loop at 0x10D40). */
+        if (spu_lookup_ctx(ctx, pc, ctx->image_id)) {
+            ctx->pc = pc;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1;
+        }
+
         /* Hand off to the real interpreter rather than giving up.
          *
          * This microstepper knows a dozen opcodes -- enough for the
@@ -2027,7 +2836,7 @@ static int spu_smc_microstep(spu_context* ctx)
          * ordinary instruction the interpreter handles -- and with it the
          * decompression job it was running never completes. */
         { static int _n = 0;
-          if (_n++ < 8)
+          if ((_n < 8 && (_n++, 1)))
               fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
                       " microstep set -- handing to the interpreter (steps=%d)\n",
                       ctx->image_id, pc, w, steps); }
@@ -2035,22 +2844,96 @@ static int spu_smc_microstep(spu_context* ctx)
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+        {
+            uint32_t at = spu_interp_run_until(ctx, pc, ctx->drain_ret_pc);
+            /* The interpreter hands back at the first LIFTED entry it reaches
+             * (rejoin). Nothing dispatches that entry unless a transfer is
+             * queued: the drain saw an empty trampoline and ended the run, so
+             * the RaC WWS job manager's interrupt handler -- microstepped in at
+             * LS 0xA2C, rejoining its own lifted loop at 0xA60 -- was abandoned
+             * on every interrupt and the synth job never left kReadCommands.
+             * Queue the rejoin; the drain's own return point is left to the
+             * call bracket that is waiting for it. */
+            if (at && ctx->status == SPU_STATUS_RUNNING &&
+                (ctx->pc & SPU_LS_MASK) != (ctx->drain_ret_pc & SPU_LS_MASK))
+                g_spu_trampoline_fn = spu_indirect_branch;
+            return at ? 1 : 0;
+        }
     }
-    { static int _n = 0; if (_n++ < 4)
+    { static int _n = 0; if ((_n < 4 && (_n++, 1)))
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
                 ctx->image_id, ctx->pc & SPU_LS_MASK); }
     return 0;
 }
 
+/* SPU_IRQFOLLOW=<img>: after that image takes an interrupt, log the next 300
+ * indirect dispatches (pc, lr, int_enable, depth) -- where a handler goes. */
+volatile int g_spu_irqfollow_n = 0;
+/* A call through a function pointer into local store that holds nothing.
+ * A Crack in Time's CollNarrow job (B8A980, GUID 43593402) calls its
+ * shape-pair handlers through a table at LS 0x14F2C (index at 0x14F76), from
+ * 0x0FCC8 (`bisl $0,$47`); a zero entry means "no handler" and the job skips
+ * the call itself. In the owner's v44 Vorselon fight an entry pointed at
+ * LS 0x18AE4, which held zeros: the empty word decodes as `stop 0`, the lane
+ * halted mid-job, the job's completion never came and the main thread waited
+ * for it forever (the freeze). Treat it the way the game treats a null
+ * handler -- return to the caller -- and say so in the log with the bytes
+ * around the call's argument, so the stale entry can be traced. Only for a
+ * `bisl` whose target register holds this pc, below the stack area, with a
+ * whole empty quadword there; SPU_EMPTY_CALL_HALT=1 restores the halt. */
+static int spu_skip_call_into_empty_ls(spu_context* ctx, uint32_t p0)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_EMPTY_CALL_HALT"); on = !(e && *e == '1'); }
+    if (!on || p0 + 16 > 0x3E000u) return 0;
+    for (uint32_t k = 0; k < 16; k++) if (ctx->ls[p0 + k]) return 0;
+    const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+    if (lr < 4 || lr + 4 > SPU_LS_SIZE || lr - 4 == p0) return 0;
+    const uint8_t* q = ctx->ls + lr - 4;
+    const uint32_t c = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+    if ((c >> 21) != 0x1A9u || (c & 0x7Fu) != 0u) return 0;                    /* bisl $0,$ra */
+    if ((ctx->gpr[(c >> 7) & 0x7Fu]._u32[0] & SPU_LS_MASK) != p0) return 0;
+    static int told = 0;
+    if (told < 16) {
+        told++;
+        fprintf(stderr, "[spu] img=%d: call from LS 0x%05X into empty local store 0x%05X skipped "
+                "(as for a null handler; the lane would have halted and the game frozen) r3=0x%05X%c",
+                ctx->image_id, lr - 4, p0, ctx->gpr[3]._u32[0] & SPU_LS_MASK, 10);
+        const uint32_t a = ((ctx->gpr[3]._u32[0] & SPU_LS_MASK) & ~15u) >= 0x40u ? ((ctx->gpr[3]._u32[0] & SPU_LS_MASK) & ~15u) - 0x40u : 0u;
+        for (uint32_t r = a; r < a + 0x80u && r + 16 <= SPU_LS_SIZE; r += 16) {
+            fprintf(stderr, "      LS[0x%05X]:", r);
+            for (uint32_t o = 0; o < 16; o += 4)
+                fprintf(stderr, " %02X%02X%02X%02X", ctx->ls[r+o], ctx->ls[r+o+1], ctx->ls[r+o+2], ctx->ls[r+o+3]);
+            fprintf(stderr, "%c", 10);
+        }
+        /* where the empty stretch begins and ends: what was meant to be there */
+        uint32_t lo = p0, hi = p0;
+        while (lo >= 16 && !ctx->ls[lo - 1]) lo--;
+        while (hi < SPU_LS_SIZE && !ctx->ls[hi]) hi++;
+        fprintf(stderr, "      empty LS 0x%05X-0x%05X%c", lo, hi, 10);
+        fflush(stderr);
+    }
+    ctx->pc = lr;
+    g_spu_trampoline_fn = 0;
+    return 1;
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
+    { static int s_f = -2; if (s_f == -2) { const char* e = getenv("SPU_IRQFOLLOW"); s_f = e ? atoi(e) : -1; }
+      if (s_f >= 0 && ctx->image_id == s_f && g_spu_irqfollow_n > 0 && g_spu_irqfollow_n < 300) {
+          g_spu_irqfollow_n++;
+          fprintf(stderr, "[irqf] pc=0x%05X lr=0x%05X int=%d depth=%u r1=0x%05X tramp_ret=0x%05X\n",
+                  ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->int_enable,
+                  ctx->host_depth, ctx->gpr[1]._u32[0], ctx->drain_ret_pc); } }
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
      * Without this, any indirect branch through such a value fails the lookup
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    { extern void spu_tr_note(spu_context*, char, uint32_t, uint32_t);
+      spu_tr_note(ctx, 'B', ctx->drain_ret_pc, ctx->drain_ret_sp); }
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
@@ -2059,14 +2942,14 @@ void spu_indirect_branch(spu_context* ctx)
       if (spu_irq_regs_maybe_restore(ctx)) {
           static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
           static int _r = 0;
-          if (s_it && _r++ < 200)
+          if (s_it && (_r < 200 && (_r++, 1)))
               fprintf(stderr, "[irq] IRET restore at srr0=0x%05X\n", ctx->pc & SPU_LS_MASK);
       } }
     /* SPURS kernel services (policy-module runs only): the HLE kernel plants
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
-        extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        extern _Thread_local volatile unsigned g_spurs_pm_polls; extern volatile unsigned g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
@@ -2084,9 +2967,14 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (One virtual SPU per workload here, so nothing ever preempts.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
+            /* Capped per process, not per run: the counter restarts with every
+             * policy run, and the WWS audio module runs ~1900 times a second,
+             * so "the first 4 of each run" was a line per run in the
+             * unbuffered log. */
+            { static int _shown = 0;
+              if (_shown < 8 && n <= 4) { _shown++;
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
+                        n, ctx->gpr[3]._u32[0]); } }
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
@@ -2135,7 +3023,7 @@ void spu_indirect_branch(spu_context* ctx)
             uint32_t ts = g_ydkj_real_taskset_ea ? g_ydkj_real_taskset_ea : 0x0F000000u;
             ctx->ls[0x27B8]=0x00; ctx->ls[0x27B9]=0x00; ctx->ls[0x27BA]=0x00; ctx->ls[0x27BB]=0x00;
             ctx->ls[0x27BC]=(uint8_t)(ts>>24); ctx->ls[0x27BD]=(uint8_t)(ts>>16); ctx->ls[0x27BE]=(uint8_t)(ts>>8); ctx->ls[0x27BF]=(uint8_t)ts;
-            if (ctx->pc == 0xA00u) { static int _n=0; if (_n++ < 4)
+            if (ctx->pc == 0xA00u) { static int _n=0; if ((_n < 4 && (_n++, 1)))
                 fprintf(stderr, "[cri-r4] policy entry pc=0xA00: forced ctxt->taskset LS[0x27B8]=0x0F000000\n"); }
         }
     }
@@ -2168,7 +3056,7 @@ void spu_indirect_branch(spu_context* ctx)
      * wrong branch is taken. Env YDKJ_POLTRACE. */
     if (ctx->pc == 0xA00u) {
         static int64_t pt=-2; if (pt==-2){ const char* e=getenv("YDKJ_POLTRACE"); pt=e?1:0; }
-        if (pt) { static int _p=0; if (_p++ < 8) {
+        if (pt) { static int _p=0; if ((_p < 8 && (_p++, 1))) {
             /* re-lifted policy entry uses r80 (kernel-set context base): r44=LS[r80+0xC0] */
             uint32_t r80=ctx->gpr[80]._u32[0] & SPU_LS_MASK;
             const uint8_t* q = ctx->ls + ((r80+0xC0)&SPU_LS_MASK);
@@ -2219,7 +3107,14 @@ void spu_indirect_branch(spu_context* ctx)
      * is the truth there -- the base image's stale bytes at the same addresses
      * may also be registered (historical junk lifts) and must lose. */
     if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
-    if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    if (!code_owner && !fn) fn = spu_lookup_ctx(ctx, ctx->pc, ctx->image_id);
+    /* Inside a resident task's code region with no lift of its own there: a
+     * module the task loaded into its region (A Crack in Time's job 43593402
+     * loads one at 0x10D00 and runs its inner loop there). Content-matched
+     * overlays verify their bytes against local store, so they are safe to
+     * try; without this every such module ran in the interpreter -- the
+     * biggest single cost of Zolar Forest while Ratchet moved. */
+    if (code_owner && !fn) fn = spu_lookup_ctx(ctx, ctx->pc, ctx->image_id);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -2228,7 +3123,7 @@ void spu_indirect_branch(spu_context* ctx)
      * opcodes. The work is already done by the time it returns. */
     if (!ctx->policy_mode && ctx->pc == SPU_JOB_RETURN_LS) {
         static int _n = 0;
-        if (_n++ < 4)
+        if ((_n < 4 && (_n++, 1)))
             fprintf(stderr, "[spurs-job] img=%d returned to the job manager \n",
                     ctx->image_id);
         spu_halt(ctx);
@@ -2265,11 +3160,13 @@ void spu_indirect_branch(spu_context* ctx)
             uint32_t w = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
                          ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
             if ((w >> 21) == 0u) {                 /* stop / stopd */
+                if (w == 0u && spu_skip_call_into_empty_ls(ctx, p0)) return;
                 ctx->stop_code = w & 0x3FFFu;
                 static int _n = 0;
-                if (_n++ < 8)
+                if ((_n < 8 && (_n++, 1)))
                     fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X\n",
                             ctx->image_id, ctx->stop_code, p0);
+                { extern void spu_tr_dump(spu_context*); spu_tr_dump(ctx); }
                 spu_halt(ctx);
                 return;
             }
@@ -2320,7 +3217,7 @@ void spu_indirect_branch(spu_context* ctx)
           if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
           if (s_iu && w0) {
               static int _n = 0;
-              if (_n++ < 8)
+              if ((_n < 8 && (_n++, 1)))
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
               spu_interp_run(ctx, p);
@@ -2343,7 +3240,7 @@ void spu_indirect_branch(spu_context* ctx)
             if (img) {
                 if (ctx->resident_ovl != img) {
                     ctx->resident_ovl = img;
-                    static int _n = 0; if (_n++ < 32)
+                    static int _n = 0; if ((_n < 32 && (_n++, 1)))
                         fprintf(stderr, "[spu-ovl] WWS job module resident: codeBase=0x%05X "
                                 "pc=0x%05X -> overlay image %d\n", codeBase, ctx->pc & SPU_LS_MASK, img);
                 }
@@ -2380,7 +3277,7 @@ void spu_indirect_branch(spu_context* ctx)
         ((uint32_t)ctx->ls[ctx->pc] | ctx->ls[ctx->pc+1] |
          ctx->ls[ctx->pc+2] | ctx->ls[ctx->pc+3]) == 0) {
         static int _n = 0;
-        if (_n++ < 8) {
+        if ((_n < 8 && (_n++, 1))) {
             /* Ground-truth dump of the WWS code-buffer resolution at dispatch
              * (wwsjob-rosetta offsets). jobEntry = lsaJobCodeBuffer + [buf+0x10];
              * lsaJobCodeBuffer = Gbt_bufferPageNum<<10 from the RunJob command.
@@ -2422,7 +3319,7 @@ void spu_indirect_branch(spu_context* ctx)
          * PM code the job calls back into -- and keep logging thereafter. */
         static int _armed = 0;
         if (p >= 0x4000) _armed = 1;
-        if (_armed && _n++ < 1500) {
+        if (_armed && (_n < 1500 && (_n++, 1))) {
             fprintf(stderr, "[jobtrace] pc=0x%05X lr=0x%05X%s",
                     p, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                     fn ? "" : " (no lift)");
@@ -2473,7 +3370,7 @@ void spu_indirect_branch(spu_context* ctx)
                     /* write nonzero to the completion word in main RAM (BE) */
                     if (vm_base[w]==0 && vm_base[w+1]==0 && vm_base[w+2]==0 && vm_base[w+3]==0) {
                         vm_base[w+3] = 1;
-                        static int _n = 0; if (_n++ < 24)
+                        static int _n = 0; if ((_n < 24 && (_n++, 1)))
                             fprintf(stderr, "[hle-jobdone] wrote completion 0x%08X=1 (job overlay %d)\n",
                                     w, ctx->resident_ovl);
                         wrote++;
@@ -2485,7 +3382,7 @@ void spu_indirect_branch(spu_context* ctx)
     if (fn && ctx->pc >= 0x4000 && ctx->resident_ovl >= 200) {
         static int s_je = -1;
         if (s_je < 0) { const char* e = getenv("SPU_JOBEXEC"); s_je = e ? 1 : 0; }
-        if (s_je) { static int _n = 0; if (_n++ < 24)
+        if (s_je) { static int _n = 0; if ((_n < 24 && (_n++, 1)))
             fprintf(stderr, "[jobexec] DISPATCH job code pc=0x%05X overlay=%d "
                     "runJobNum=0x%02X%02X%02X%02X\n",
                     ctx->pc & SPU_LS_MASK, ctx->resident_ovl,
@@ -2532,7 +3429,7 @@ void spu_indirect_branch(spu_context* ctx)
         (ctx->gpr[0]._u32[0] & SPU_LS_MASK) >= 0xA00 &&
         (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x3700) {
         static int _n = 0;
-        if (_n++ < 8)
+        if ((_n < 8 && (_n++, 1)))
             fprintf(stderr, "[wws-jobret] staged job returned to kernel (LS 0); "
                     "resuming PM at link 0x%05X\n", ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
@@ -2556,7 +3453,7 @@ void spu_indirect_branch(spu_context* ctx)
      * LS 0 in this path is a re-entry. Treat it as job end. */
     if (!ctx->policy_mode && ctx->pc == 0 && ctx->image_id > 0) {
         static int _n = 0;
-        if (_n++ < 8)
+        if ((_n < 8 && (_n++, 1)))
             fprintf(stderr, "[spurs-job] img=%d returned to the job manager "
                     "(branch to LS 0) -- job complete\n", ctx->image_id);
         spu_halt(ctx);
@@ -2602,13 +3499,14 @@ void spu_indirect_branch(spu_context* ctx)
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
      * every other image's misses -- LBP's loading jobs skipped their command
      * handlers for a whole session without a single log line. */
-    { enum { BT0_MAX_IMG = 64, BT0_PER_IMG = 12 };
+    { enum { BT0_MAX_IMG = 1024, BT0_PER_IMG = 12 };   /* image ids run to 543 */
       static int _bt0[BT0_MAX_IMG];
       unsigned img = (ctx->image_id >= 0 && ctx->image_id < BT0_MAX_IMG)
                      ? (unsigned)ctx->image_id : 0;
       if (_bt0[img]++ < BT0_PER_IMG)
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
                 ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+    { extern void spu_tr_dump(spu_context*); spu_tr_dump(ctx); }
     /* One-shot: the FMOD null-handler DSP node carries a PPU descriptor EA at
      * node+0x14 (observed 0x93C3C0). Dump it to identify which plugin/unit
      * type never got its SPU code streamed (env SPU_DSPDESC=<hex ea>). */
@@ -2630,7 +3528,7 @@ void spu_indirect_branch(spu_context* ctx)
         const char* p = getenv("SPU_MISS_DUMP_PCMIN"); s_pcmin = p ? (uint32_t)strtoul(p,0,0) : 0; }
       static int _n=0;
       uint32_t misspc = ctx->pc & SPU_LS_MASK;
-      if ((s_img < 0 || ctx->image_id == s_img) && misspc >= s_pcmin && _n++ < 2) {
+      if ((s_img < 0 || ctx->image_id == s_img) && misspc >= s_pcmin && (_n < 2 && (_n++, 1))) {
         fprintf(stderr, "[SPU] branch-to-0 lr=0x%05X r1=0x%05X\n",
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK);
 #ifdef _WIN32
@@ -2768,4 +3666,43 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
 
 #ifdef __cplusplus
 }
-#endif
+#endif/* racacit: see spu_ls_write128. Names the lifted function (by its LS entry
+ * and image) whose code issued the store, from the caller's host address:
+ * the registry entry with the nearest host start at or below it. */
+__attribute__((noinline)) void spu_ls_fill_guard(spu_context* ctx, uint32_t lsa)
+{
+    static volatile long n = 0;
+    if (n >= 6) return;
+    n++;
+    const uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    uintptr_t best = 0; uint32_t best_ls = 0; int best_img = -1;
+    for (uint32_t i = 0; i < s_registry_count; i++) {
+        const uintptr_t h = (uintptr_t)s_registry[i].fn;
+        if (h <= ra && h > best) { best = h; best_ls = s_registry[i].addr; best_img = s_registry[i].image_id; }
+    }
+    fprintf(stderr, "[ls-fill] img=%d delta=0x%X store 0x8000.. at LS 0x%05X from lifted fn img %d LS 0x%05X (+0x%llX host) r3=%08X r4=%08X r5=%08X r6=%08X%c",
+            ctx->image_id, ctx->ls_delta, lsa, best_img, best_ls, (unsigned long long)(ra - best),
+            ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0], 10);
+    fflush(stderr);
+}
+
+/* racacit: the last 128 DMA transfers of this SPU thread, printed on demand
+ * (spu_dma_ring_dump) -- which transfer was supposed to fill a buffer that a
+ * job then read garbage from. */
+static _Thread_local struct { uint32_t cmd, lsa, ea, size; } s_dring[128];
+static _Thread_local uint32_t s_dring_i;
+void spu_dma_ring_note(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size)
+{
+    const uint32_t k = s_dring_i++ & 127u;
+    s_dring[k].cmd = cmd; s_dring[k].lsa = lsa; s_dring[k].ea = ea; s_dring[k].size = size;
+}
+void spu_dma_ring_dump(const char* why)
+{
+    fprintf(stderr, "[dma-ring] %s: last transfers, oldest first%c", why, 10);
+    for (uint32_t t = 0; t < 128; t++) {
+        const uint32_t k = (s_dring_i + t) & 127u;
+        if (!s_dring[k].size && !s_dring[k].cmd) continue;
+        fprintf(stderr, "[dma-ring]   cmd=0x%02X lsa=0x%05X ea=0x%08X size=%u%c",
+                s_dring[k].cmd, s_dring[k].lsa, s_dring[k].ea, s_dring[k].size, 10);
+    }
+}

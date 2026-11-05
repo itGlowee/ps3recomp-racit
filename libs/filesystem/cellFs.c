@@ -157,8 +157,13 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
         return -1;
 
     const char* remainder = ps3_path + best_len;
-    snprintf(host_buf, buf_size, "%s/%s%s", s_root_path,
-             s_path_mappings[best].host_path, remainder);
+    const char* hp = s_path_mappings[best].host_path;
+    /* An absolute mapping (a port pointing a device at a real directory)
+     * stands on its own; only relative ones live under the root. */
+    if (hp[0] == '/' || hp[0] == '\\' || (hp[0] && hp[1] == ':'))
+        snprintf(host_buf, buf_size, "%s%s", hp, remainder);
+    else
+        snprintf(host_buf, buf_size, "%s/%s%s", s_root_path, hp, remainder);
 
     /* A mapped path with an empty remainder ends in a separator ("…/dev_hdd0/"),
      * and stat() rejects that on Windows -- so the directory a game asks about
@@ -500,7 +505,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     }
 
     { static int _n = 0;
-      if (_n++ < 32)
+      if ((_n < 32 && (_n++, 1)))
           { printf("[cellFs] Read(fd=%d, buf=0x%08X, %llu bytes) -> %llu", fd,
                    (uint32_t)(uintptr_t)buf,
                    (unsigned long long)nbytes, (unsigned long long)bytes_read);

@@ -32,6 +32,17 @@ extern "C" {
  * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
 uint64_t ppu_timebase_now(void);
 
+/* The origin of every guest-visible clock (this timebase,
+ * sys_time_get_system_time, cellAudio port timestamps, GCM timestamps): the
+ * host clock (QPC ticks on Windows, CLOCK_MONOTONIC ns elsewhere) at the
+ * guest's first clock read, less 30 s -- a PS3 counts from power-on. Each of
+ * those clocks subtracts this from its host reading. */
+#ifdef _WIN32
+uint64_t ps3_guest_clock_epoch_qpc(void);
+#else
+uint64_t ps3_guest_clock_epoch_ns(void);
+#endif
+
 #ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,

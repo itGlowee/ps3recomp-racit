@@ -61,16 +61,24 @@ static void sys_initialize_tls(ppu_context* ctx)
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
  * and every frontend animation timed off it crawled. */
+#ifdef _WIN32
+extern "C" uint64_t ps3_guest_clock_epoch_qpc(void);   /* sys_timer.c */
+#else
+extern "C" uint64_t ps3_guest_clock_epoch_ns(void);
+#endif
 static void sys_time_get_system_time(ppu_context* ctx)
 {
 #ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
+    /* Same epoch as the timebase and cellAudio timestamps (QPC from the guest
+     * clock origin, sys_timer.c); split multiply, no overflow. */
+    static LARGE_INTEGER s_freq;
+    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
+    uint64_t q = (uint64_t)s_freq.QuadPart, c = (uint64_t)now.QuadPart - ps3_guest_clock_epoch_qpc();
+    ctx->gpr[3] = (c / q) * 1000000ull + (c % q) * 1000000ull / q;
 #else
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    ctx->gpr[3] = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec - ps3_guest_clock_epoch_ns()) / 1000ull;
 #endif
 }
 
@@ -109,6 +117,10 @@ static void sys_process_is_stack(ppu_context* ctx)
 
 #ifdef _WIN32
 static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
+#else
+struct PosixBSem;
+static PosixBSem* lwm_sem(uint32_t addr);   /* fwd (defined below) */
+static void bsem_release(PosixBSem* b);
 #endif
 static void sys_lwmutex_create(ppu_context* ctx)
 {
@@ -129,6 +141,8 @@ static void sys_lwmutex_create(ppu_context* ctx)
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
     { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
+#else
+    { PosixBSem* b = lwm_sem(lwm); if (b) bsem_release(b); }
 #endif
     ctx->gpr[3] = 0;
 }
@@ -179,6 +193,16 @@ static struct LwmSlot* lwm_find(uint32_t addr){
         if(cur==0) return nullptr; }
     return nullptr;
 }
+/* racacit: sys_lwmutex_destroy used to be a no-op, so every lwmutex address
+ * the game ever created kept a semaphore (+~25 handles/min in play) and a
+ * slot; the 64K table would fill after ~40 h and lwm_sem would then return
+ * null -- locking silently off. Destroy now turns the slot into a tombstone
+ * (skipped by lookups, reused by inserts) and parks the semaphore on a free
+ * list. Semaphores are recycled, never closed while mapped, so a racy guest
+ * destroy cannot leave another thread waiting on a closed handle. */
+#define LWM_TOMB 0xFFFFFFFFu
+static HANDLE g_lwm_free[1024];
+static unsigned g_lwm_nfree = 0;
 static HANDLE lwm_sem(uint32_t addr)
 {
     if (!addr) return nullptr;
@@ -187,25 +211,161 @@ static HANDLE lwm_sem(uint32_t addr)
         uint32_t idx = (h + i) & (LWM_HASH - 1);
         long cur = g_lwm[idx].addr;
         if ((uint32_t)cur == addr) return g_lwm[idx].sem;
-        if (cur == 0) {
-            while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
-            HANDLE r = nullptr;
-            if (g_lwm[idx].addr == 0) {
-                g_lwm[idx].sem = CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
-                g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
-                r = g_lwm[idx].sem;
-            } else if ((uint32_t)g_lwm[idx].addr == addr) {
-                r = g_lwm[idx].sem;
-            }
-            _InterlockedExchange(&g_lwm_tab_lock, 0);
-            if (r) return r;
-            /* someone else claimed this slot for a different addr -> keep probing */
-        }
+        if (cur == 0) break;
     }
-    return nullptr;   /* table full (raise LWM_HASH) */
+    /* Miss: insert under the lock, re-scanning the chain (another thread may
+     * have inserted it, possibly into a tombstone before where we stopped). */
+    while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
+    HANDLE r = nullptr;
+    int64_t slot = -1;
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = (uint32_t)g_lwm[idx].addr;
+        if (cur == addr) { r = g_lwm[idx].sem; break; }
+        if (cur == LWM_TOMB && slot < 0) slot = idx;
+        if (cur == 0) { if (slot < 0) slot = idx; break; }
+    }
+    if (!r && slot >= 0) {
+        HANDLE s = g_lwm_nfree ? g_lwm_free[--g_lwm_nfree]
+                               : CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
+        g_lwm[slot].sem = s;
+        g_lwm[slot].holder = 0;
+        g_lwm[slot].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
+        r = s;
+    }
+    _InterlockedExchange(&g_lwm_tab_lock, 0);
+    return r;   /* null only if the table is full (raise LWM_HASH) */
+}
+/* Retire a destroyed lwmutex's slot. A held mutex keeps its slot (lv2 would
+ * refuse with EBUSY; the guest still gets CELL_OK as before). */
+static void lwm_forget(uint32_t addr)
+{
+    if (!addr) return;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = (uint32_t)g_lwm[idx].addr;
+        if (cur == 0) break;
+        if (cur != addr) continue;
+        HANDLE s = g_lwm[idx].sem;
+        if (WaitForSingleObject(s, 0) == WAIT_OBJECT_0) {   /* free: nobody holds or waits */
+            g_lwm[idx].addr = (long)LWM_TOMB;
+            ReleaseSemaphore(s, 1, NULL);
+            if (g_lwm_nfree < sizeof g_lwm_free / sizeof g_lwm_free[0]) g_lwm_free[g_lwm_nfree++] = s;
+            else CloseHandle(s);   /* unmapped and free: no other thread can reach it */
+        }
+        break;
+    }
+    _InterlockedExchange(&g_lwm_tab_lock, 0);
 }
 #else
-static void* lwm_sem(uint32_t) { return nullptr; }
+/* PORT PATCH (racacit): POSIX lwmutex. Off Windows this used to be a null stub,
+ * so lwmutex lock/unlock were no-ops and guest threads had NO mutual exclusion
+ * on Linux/macOS/Android. Same model as the Windows path: a binary semaphore
+ * per guest lwmutex address (releasable from any thread), recursion tracked in
+ * the guest owner/recur fields. */
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+struct PosixBSem { pthread_mutex_t m; pthread_cond_t c; int count; };
+static int bsem_acquire(PosixBSem* b, uint64_t timeout_us)   /* 0 ok, 1 timeout */
+{
+    pthread_mutex_lock(&b->m);
+    if (timeout_us == 0) {
+        while (b->count == 0) pthread_cond_wait(&b->c, &b->m);
+    } else {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t ns = (uint64_t)ts.tv_nsec + (timeout_us % 1000000ull) * 1000ull;
+        ts.tv_sec += (time_t)(timeout_us / 1000000ull + ns / 1000000000ull);
+        ts.tv_nsec = (long)(ns % 1000000000ull);
+        while (b->count == 0) {
+            if (pthread_cond_timedwait(&b->c, &b->m, &ts) == ETIMEDOUT && b->count == 0) {
+                pthread_mutex_unlock(&b->m); return 1;
+            }
+        }
+    }
+    b->count = 0;
+    pthread_mutex_unlock(&b->m);
+    return 0;
+}
+static int bsem_try(PosixBSem* b)
+{
+    pthread_mutex_lock(&b->m);
+    int ok = b->count != 0; if (ok) b->count = 0;
+    pthread_mutex_unlock(&b->m);
+    return ok;
+}
+static void bsem_release(PosixBSem* b)
+{
+    pthread_mutex_lock(&b->m);
+    b->count = 1;                       /* binary: over-release is harmless */
+    pthread_cond_signal(&b->c);
+    pthread_mutex_unlock(&b->m);
+}
+#define LWM_HASH 65536u
+static struct { uint32_t addr; PosixBSem* sem; } g_lwm_p[LWM_HASH];
+static pthread_mutex_t g_lwm_p_lock = PTHREAD_MUTEX_INITIALIZER;
+/* racacit: tombstones + free list, as in the Windows table above. */
+#define LWM_TOMB 0xFFFFFFFFu
+static PosixBSem* g_lwm_p_free[1024];
+static unsigned g_lwm_p_nfree = 0;
+static PosixBSem* lwm_sem(uint32_t addr)
+{
+    if (!addr) return nullptr;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = __atomic_load_n(&g_lwm_p[idx].addr, __ATOMIC_ACQUIRE);
+        if (cur == addr) return g_lwm_p[idx].sem;
+        if (cur == 0) break;
+    }
+    pthread_mutex_lock(&g_lwm_p_lock);
+    PosixBSem* r = nullptr;
+    int64_t slot = -1;
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = g_lwm_p[idx].addr;
+        if (cur == addr) { r = g_lwm_p[idx].sem; break; }
+        if (cur == LWM_TOMB && slot < 0) slot = idx;
+        if (cur == 0) { if (slot < 0) slot = idx; break; }
+    }
+    if (!r && slot >= 0) {
+        PosixBSem* b;
+        if (g_lwm_p_nfree) b = g_lwm_p_free[--g_lwm_p_nfree];
+        else {
+            b = new PosixBSem;
+            pthread_mutex_init(&b->m, nullptr); pthread_cond_init(&b->c, nullptr);
+        }
+        b->count = 1;
+        g_lwm_p[slot].sem = b;
+        __atomic_store_n(&g_lwm_p[slot].addr, addr, __ATOMIC_RELEASE);
+        r = b;
+    }
+    pthread_mutex_unlock(&g_lwm_p_lock);
+    return r;
+}
+static void lwm_forget(uint32_t addr)
+{
+    if (!addr) return;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    pthread_mutex_lock(&g_lwm_p_lock);
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = g_lwm_p[idx].addr;
+        if (cur == 0) break;
+        if (cur != addr) continue;
+        PosixBSem* b = g_lwm_p[idx].sem;
+        /* Only a free mutex is retired; the object is recycled, never freed. */
+        if (g_lwm_p_nfree < sizeof g_lwm_p_free / sizeof g_lwm_p_free[0] && bsem_try(b)) {
+            __atomic_store_n(&g_lwm_p[idx].addr, LWM_TOMB, __ATOMIC_RELEASE);
+            bsem_release(b);
+            g_lwm_p_free[g_lwm_p_nfree++] = b;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_lwm_p_lock);
+}
 #endif
 /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
@@ -259,6 +419,18 @@ static void sys_lwmutex_lock(ppu_context* ctx)
         }
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+#else
+    if (PosixBSem* b = lwm_sem(lwm)) {
+        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
+            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            ctx->gpr[3] = 0;
+            return;
+        }
+        if (bsem_acquire(b, timeout_us)) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;   /* ETIMEDOUT */
+            return;
+        }
+    }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -279,6 +451,15 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
         if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+#else
+    if (PosixBSem* b = lwm_sem(lwm)) {
+        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
+            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            ctx->gpr[3] = 0;
+            return;
+        }
+        if (!bsem_try(b)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } // EBUSY
+    }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -328,6 +509,8 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
      * hands lwmutex ownership across threads. Over-release (unlock of a free
      * mutex) fails harmlessly at the max count of 1. */
     if (s) ReleaseSemaphore(s, 1, NULL);
+#else
+    if (PosixBSem* b = lwm_sem(lwm)) bsem_release(b);
 #endif
     ctx->gpr[3] = 0;
 }
@@ -342,17 +525,182 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * +0x08 lwcond_queue id. */
 static void sys_lwcond_create(ppu_context* ctx)
 {
+    /* PORT FIX (racacit): sys_lwcond_t is 8 bytes -- +0x00 lwmutex EA (u32 BE),
+     * +0x04 lwcond_queue id (u32 BE) -- as in RPCS3's sys_lwcond_t. This used to
+     * write the EA as a be64 at +0 (leaving the u32 at +0 zero) and the id at
+     * +8, past the end of the struct. Games that sanity-check the lwmutex field
+     * (A Crack in Time: "wait for invalid cond") saw every lwcond as invalid. */
     static uint32_t s_lwcond_id = 0x4C000000u;
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
-    vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
-    vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    vm_write32(lwcond + 0x00, lwmutex);
+    vm_write32(lwcond + 0x04, __atomic_add_fetch(&s_lwcond_id, 1, __ATOMIC_RELAXED));
     ctx->gpr[3] = 0;
 }
-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+#ifndef _WIN32
+/* Real condition semantics off Windows: per-lwcond waiter/pending counts so
+ * signal wakes exactly one waiter and signal_all wakes every current waiter.
+ * A waiter registers while still holding the guest lwmutex, so a signaler
+ * (which must hold that lwmutex) can never slip in between unlock and wait. */
+struct PosixLwcond { pthread_mutex_t m; pthread_cond_t c; uint32_t waiters, pending; };
+static struct { uint32_t addr; PosixLwcond* cv; } g_lwc_p[LWM_HASH];
+static PosixLwcond* g_lwc_p_free[1024];
+static unsigned g_lwc_p_nfree = 0;
+static PosixLwcond* lwc_get(uint32_t addr)
+{
+    if (!addr) return nullptr;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = __atomic_load_n(&g_lwc_p[idx].addr, __ATOMIC_ACQUIRE);
+        if (cur == addr) return g_lwc_p[idx].cv;
+        if (cur == 0) break;
+    }
+    pthread_mutex_lock(&g_lwm_p_lock);
+    PosixLwcond* r = nullptr;
+    int64_t slot = -1;
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = g_lwc_p[idx].addr;
+        if (cur == addr) { r = g_lwc_p[idx].cv; break; }
+        if (cur == LWM_TOMB && slot < 0) slot = idx;
+        if (cur == 0) { if (slot < 0) slot = idx; break; }
+    }
+    if (!r && slot >= 0) {
+        PosixLwcond* v;
+        if (g_lwc_p_nfree) v = g_lwc_p_free[--g_lwc_p_nfree];
+        else {
+            v = new PosixLwcond;
+            pthread_mutex_init(&v->m, nullptr); pthread_cond_init(&v->c, nullptr);
+        }
+        v->waiters = v->pending = 0;
+        g_lwc_p[slot].cv = v;
+        __atomic_store_n(&g_lwc_p[slot].addr, addr, __ATOMIC_RELEASE);
+        r = v;
+    }
+    pthread_mutex_unlock(&g_lwm_p_lock);
+    return r;
+}
+static void lwc_forget(uint32_t addr)
+{
+    if (!addr) return;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    pthread_mutex_lock(&g_lwm_p_lock);
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = g_lwc_p[idx].addr;
+        if (cur == 0) break;
+        if (cur != addr) continue;
+        PosixLwcond* v = g_lwc_p[idx].cv;
+        pthread_mutex_lock(&v->m);
+        int idle = v->waiters == 0;
+        pthread_mutex_unlock(&v->m);
+        if (idle && g_lwc_p_nfree < sizeof g_lwc_p_free / sizeof g_lwc_p_free[0]) {
+            __atomic_store_n(&g_lwc_p[idx].addr, LWM_TOMB, __ATOMIC_RELEASE);
+            g_lwc_p_free[g_lwc_p_nfree++] = v;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_lwm_p_lock);
+}
+static int lwc_trace(void){ static int v=-1; if(v<0) v=getenv("PS3_LWCOND_TRACE")?1:0; return v; }
+static void lwc_signal(uint32_t lwcond, int all)
+{
+    PosixLwcond* v = lwc_get(lwcond);
+    if (lwc_trace()) fprintf(stderr, "[lwcond] signal%s cv=0x%08X waiters=%u pending=%u\n",
+                             all ? "_all" : "", lwcond, v ? v->waiters : 0, v ? v->pending : 0);
+    if (!v) return;
+    pthread_mutex_lock(&v->m);
+    if (all) { v->pending = v->waiters; pthread_cond_broadcast(&v->c); }
+    else if (v->pending < v->waiters) { v->pending++; pthread_cond_broadcast(&v->c); }
+    pthread_mutex_unlock(&v->m);
+}
+#endif
+#ifdef _WIN32
+/* racacit: real condition semantics on Windows too. The Windows path used to
+ * make signal a no-op and wait a release / Sleep(1) / reacquire poll, so every
+ * lwcond hand-off cost 1-2 ms (Sleep's real granularity) and woke nobody early
+ * -- the game ran at ~3 fps with the CPU idle once its job system and the Bink
+ * player leaned on lwconds. Same design as the POSIX version above: per-lwcond
+ * waiter/pending counts under an SRW lock, a CONDITION_VARIABLE to sleep on. */
+struct WinLwcond { SRWLOCK m; CONDITION_VARIABLE c; uint32_t waiters, pending; };
+static struct { uint32_t addr; WinLwcond* cv; } g_lwc_w[LWM_HASH];
+static SRWLOCK g_lwc_w_lock = SRWLOCK_INIT;
+/* racacit: destroyed lwconds leave a tombstone and their object goes on a
+ * free list (recycled, never freed), like the lwmutex table. */
+static WinLwcond* g_lwc_w_free[1024];
+static unsigned g_lwc_w_nfree = 0;
+static WinLwcond* lwc_get(uint32_t addr)
+{
+    if (!addr) return nullptr;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = __atomic_load_n(&g_lwc_w[idx].addr, __ATOMIC_ACQUIRE);
+        if (cur == addr) return g_lwc_w[idx].cv;
+        if (cur == 0) break;
+    }
+    AcquireSRWLockExclusive(&g_lwc_w_lock);
+    WinLwcond* r = nullptr;
+    int64_t slot = -1;
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = g_lwc_w[idx].addr;
+        if (cur == addr) { r = g_lwc_w[idx].cv; break; }
+        if (cur == LWM_TOMB && slot < 0) slot = idx;
+        if (cur == 0) { if (slot < 0) slot = idx; break; }
+    }
+    if (!r && slot >= 0) {
+        WinLwcond* v;
+        if (g_lwc_w_nfree) v = g_lwc_w_free[--g_lwc_w_nfree];
+        else {
+            v = new WinLwcond;
+            InitializeSRWLock(&v->m); InitializeConditionVariable(&v->c);
+        }
+        v->waiters = v->pending = 0;
+        g_lwc_w[slot].cv = v;
+        __atomic_store_n(&g_lwc_w[slot].addr, addr, __ATOMIC_RELEASE);
+        r = v;
+    }
+    ReleaseSRWLockExclusive(&g_lwc_w_lock);
+    return r;
+}
+static void lwc_forget(uint32_t addr)
+{
+    if (!addr) return;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    AcquireSRWLockExclusive(&g_lwc_w_lock);
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        uint32_t idx = (h + i) & (LWM_HASH - 1);
+        uint32_t cur = g_lwc_w[idx].addr;
+        if (cur == 0) break;
+        if (cur != addr) continue;
+        WinLwcond* v = g_lwc_w[idx].cv;
+        AcquireSRWLockExclusive(&v->m);
+        int idle = v->waiters == 0;
+        ReleaseSRWLockExclusive(&v->m);
+        if (idle && g_lwc_w_nfree < sizeof g_lwc_w_free / sizeof g_lwc_w_free[0]) {
+            __atomic_store_n(&g_lwc_w[idx].addr, LWM_TOMB, __ATOMIC_RELEASE);
+            g_lwc_w_free[g_lwc_w_nfree++] = v;
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_lwc_w_lock);
+}
+static void lwc_signal(uint32_t lwcond, int all)
+{
+    WinLwcond* v = lwc_get(lwcond);
+    if (!v) return;
+    AcquireSRWLockExclusive(&v->m);
+    if (all) { v->pending = v->waiters; WakeAllConditionVariable(&v->c); }
+    else if (v->pending < v->waiters) { v->pending++; WakeAllConditionVariable(&v->c); }
+    ReleaseSRWLockExclusive(&v->m);
+}
+#endif
+static void sys_lwcond_destroy(ppu_context* ctx)    { lwc_forget((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }
+static void sys_lwcond_signal(ppu_context* ctx)     { lwc_signal((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_signal((uint32_t)ctx->gpr[3], 1); ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_signal((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
 /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
  * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
@@ -360,22 +708,103 @@ static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
+    uint32_t lwmutex = vm_read32(lwcond + 0x00);
 #ifdef _WIN32
+    uint64_t timeout_us = ctx->gpr[4];
     HANDLE s = lwm_sem(lwmutex);
-    if (s) {
-        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
-        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
-        vm_write32(lwmutex + LWM_RECUR, 0);
-        vm_write32(lwmutex + LWM_OWNER, 0);
-        ReleaseSemaphore(s, 1, NULL);
-        Sleep(1);
-        WaitForSingleObject(s, INFINITE);
-        vm_write32(lwmutex + LWM_OWNER, own);
-        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+    WinLwcond* v = lwc_get(lwcond);
+    if (!s || !v) { ctx->gpr[3] = 0; return; }
+    uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+    uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+    int timed_out = 0, spurious = 0;
+    AcquireSRWLockExclusive(&v->m);
+    v->waiters++;                                  /* registered while still holding the lwmutex */
+    vm_write32(lwmutex + LWM_RECUR, 0);            /* release the guest lwmutex */
+    vm_write32(lwmutex + LWM_OWNER, 0);
+    ReleaseSemaphore(s, 1, NULL);
+    /* Same bounded slices as POSIX (LWCOND_SLICE_US, default 2 ms): a spurious
+     * return is always legal, the guest re-checks its predicate. */
+    static long slice_us = -1;
+    if (slice_us < 0) { const char* e = getenv("LWCOND_SLICE_US"); slice_us = e ? atol(e) : 2000; }
+    const ULONGLONG t0 = GetTickCount64();
+    while (v->pending == 0) {
+        DWORD ms = INFINITE;
+        int use_slice = slice_us > 0;
+        if (use_slice) ms = (DWORD)((slice_us + 999) / 1000);
+        if (timeout_us) {
+            ULONGLONG el = GetTickCount64() - t0, lim = (timeout_us + 999) / 1000;
+            DWORD rem = el >= lim ? 0 : (DWORD)(lim - el);
+            if (!use_slice || rem <= ms) { ms = rem; use_slice = 0; }
+        }
+        if (!SleepConditionVariableSRW(&v->c, &v->m, ms, 0)) {
+            if (GetLastError() == ERROR_TIMEOUT && v->pending == 0) {
+                if (use_slice) spurious = 1; else timed_out = 1;
+                break;
+            }
+        }
     }
+    if (!timed_out && !spurious) v->pending--;
+    v->waiters--;
+    if (v->pending > v->waiters) v->pending = v->waiters;
+    ReleaseSRWLockExclusive(&v->m);
+    WaitForSingleObject(s, INFINITE);              /* reacquire before returning */
+    vm_write32(lwmutex + LWM_OWNER, own);
+    vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+    ctx->gpr[3] = timed_out ? (uint64_t)(int64_t)(int32_t)0x8001000Bu : 0;
+#else
+    uint64_t timeout_us = ctx->gpr[4];
+    PosixBSem* s = lwm_sem(lwmutex);
+    PosixLwcond* v = lwc_get(lwcond);
+    if (!s || !v) { ctx->gpr[3] = 0; return; }
+    uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+    uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+    int timed_out = 0;
+    if (lwc_trace()) fprintf(stderr, "[lwcond] wait cv=0x%08X lwm=0x%08X tid=%u timeout=%llu\n",
+                             lwcond, lwmutex, (unsigned)ctx->thread_id, (unsigned long long)timeout_us);
+    pthread_mutex_lock(&v->m);
+    v->waiters++;
+    vm_write32(lwmutex + LWM_RECUR, 0);           /* release the guest lwmutex */
+    vm_write32(lwmutex + LWM_OWNER, 0);
+    bsem_release(s);
+    struct timespec ts;
+    if (timeout_us) {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t ns = (uint64_t)ts.tv_nsec + (timeout_us % 1000000ull) * 1000ull;
+        ts.tv_sec += (time_t)(timeout_us / 1000000ull + ns / 1000000000ull);
+        ts.tv_nsec = (long)(ns % 1000000000ull);
+    }
+    /* Bounded slices: a wake is never lost for long. The Windows path returns
+     * after every 1 ms (pure polling); guest code re-checks its predicate, so a
+     * spurious return is always legal. LWCOND_SLICE_US tunes it (0 = strict). */
+    static long slice_us = -1;
+    if (slice_us < 0) { const char* e = getenv("LWCOND_SLICE_US"); slice_us = e ? atol(e) : 2000; }
+    int spurious = 0;
+    while (v->pending == 0) {
+        struct timespec sl = ts;
+        int use_slice = slice_us > 0;
+        if (use_slice) {
+            clock_gettime(CLOCK_REALTIME, &sl);
+            uint64_t ns = (uint64_t)sl.tv_nsec + (uint64_t)slice_us * 1000ull;
+            sl.tv_sec += (time_t)(ns / 1000000000ull); sl.tv_nsec = (long)(ns % 1000000000ull);
+            if (timeout_us && (sl.tv_sec > ts.tv_sec || (sl.tv_sec == ts.tv_sec && sl.tv_nsec > ts.tv_nsec)))
+                { sl = ts; use_slice = 0; }
+        }
+        int r = (timeout_us || use_slice) ? pthread_cond_timedwait(&v->c, &v->m, &sl)
+                                          : pthread_cond_wait(&v->c, &v->m);
+        if (r == ETIMEDOUT && v->pending == 0) {
+            if (use_slice) { spurious = 1; break; }
+            timed_out = 1; break;
+        }
+    }
+    if (!timed_out && !spurious) v->pending--;
+    v->waiters--;
+    if (v->pending > v->waiters) v->pending = v->waiters;
+    pthread_mutex_unlock(&v->m);
+    bsem_acquire(s, 0);                            /* reacquire before returning */
+    vm_write32(lwmutex + LWM_OWNER, own);
+    vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+    ctx->gpr[3] = timed_out ? (uint64_t)(int64_t)(int32_t)0x8001000Bu : 0;
 #endif
-    ctx->gpr[3] = 0;
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
@@ -446,6 +875,7 @@ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
       if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
         fprintf(stderr, "[LWM] destroy #%lld lwm=0x%08X r4=0x%08X r5=0x%08X\n", _n,
                 (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
+    lwm_forget((uint32_t)ctx->gpr[3]);
     ctx->gpr[3] = 0;
 }
 
@@ -822,7 +1252,7 @@ static void sys_spinlock_lock(ppu_context* ctx)
             unsigned long owner = spin_owner_of(ea);
             unsigned long me    = GetCurrentThreadId();
             static int reported = 0;
-            if (reported++ < 8)
+            if ((reported < 8 && (reported++, 1)))
                 fprintf(stderr,
                         "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
                         "held by tid %lu, this is tid %lu%s\n",

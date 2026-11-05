@@ -116,7 +116,8 @@ static int spu_step(spu_context* ctx) {
 
     switch (d.op) {
     /* immediates / loads */
-    case SPU_il: case SPU_ilh: DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_il:  DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_ilh: DST = spu_splat_u16((uint16_t)I); break;   /* racacit: halfword splat, not word */
     case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
     case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
     case SPU_iohl: DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF)); break;
@@ -159,6 +160,23 @@ static int spu_step(spu_context* ctx) {
     case SPU_andhi:DST = spu_andhi(A,I); break;
     case SPU_orhi: DST = spu_orhi(A,I); break;
     case SPU_orx:  DST = spu_orx(A); break;
+    /* racacit: ops the decoder knew but the executor halted on */
+    case SPU_orbi:  DST = spu_orbi(A,I); break;
+    case SPU_xorhi: DST = spu_xorhi(A,I); break;
+    case SPU_xorbi: DST = spu_xorbi(A,I); break;
+    case SPU_mpyui: DST = spu_mpyui(A,I); break;
+    case SPU_bgx:   DST = spu_bgx(A,B,DST); break;
+    case SPU_mpyhhau: DST = spu_mpyhhau(A,B,DST); break;
+    case SPU_rothmi: DST = spu_rothmi(A,I); break;
+    case SPU_rotmah: DST = spu_rothma(A,B); break;
+    case SPU_rotmahi: DST = spu_rotmahi(A,I); break;
+    case SPU_dfa: DST = spu_dfa(A,B); break;
+    case SPU_dfs: DST = spu_dfs(A,B); break;
+    case SPU_dfm: DST = spu_dfm(A,B); break;
+    case SPU_dfcgt: DST = spu_dfcgt(A,B); break;
+    case SPU_dfceq: DST = spu_dfceq(A,B); break;
+    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
+    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
     /* compares */
     case SPU_ceq: DST = spu_ceq(A,B); break;
     case SPU_ceqh:DST = spu_ceqh(A,B); break;
@@ -259,7 +277,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_mpys:  DST = spu_mpys(A,B); break;
     case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
     case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
-    case SPU_mpyhha:DSTC = spu_mpyhha(A,B,T); break;  /* RRR */
+    case SPU_mpyhha:DST = spu_mpyhha(A,B,DST); break;  /* racacit: RR form, RT is the accumulator (was written to rc) */
     /* rotate / shift extras */
     case SPU_rothm:    DST = spu_rothm(A,B); break;
     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
@@ -339,7 +357,72 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+/* SPU_INTERP_STARTS=<file>: append every distinct address the interpreter is
+ * entered at, with the job GUID at LS 0x100 -- "<guid> <addr>". These are the
+ * entry points no lift has (indirect-call targets, modules loaded at run
+ * time); scripts/lift_spu_jobs.py takes them as function hints. */
+static void spu_interp_note_start(const spu_context* ctx, uint32_t lsa)
+{
+    static FILE* f = (FILE*)1;
+    static uint8_t seen[1u << 17];           /* 2^20 bits */
+    static volatile int mu = 0;
+    if (f == (FILE*)1) { const char* e = getenv("SPU_INTERP_STARTS"); f = (e && *e) ? fopen(e, "a") : NULL; }
+    if (!f) return;
+    const uint8_t* g = ctx->ls + 0x100;
+    uint32_t h = (lsa >> 2) * 2654435761u ^ (((uint32_t)g[0] << 24 | (uint32_t)g[1] << 16 | (uint32_t)g[2] << 8 | g[3]) * 40503u)
+               ^ (((uint32_t)g[12] << 24 | (uint32_t)g[13] << 16 | (uint32_t)g[14] << 8 | g[15]) * 2246822519u)
+               /* ...and the code there: a job loads different modules at the
+                * same address, and each needs finding (miss_bases.py). */
+               ^ (((uint32_t)ctx->ls[lsa & 0x3FFFC] << 24 | (uint32_t)ctx->ls[(lsa & 0x3FFFC) + 1] << 16 |
+                   (uint32_t)ctx->ls[(lsa & 0x3FFFC) + 2] << 8 | ctx->ls[(lsa & 0x3FFFC) + 3]) * 3266489917u)
+               ^ (((uint32_t)ctx->ls[(lsa & 0x3FFFC) + 4] << 24 | (uint32_t)ctx->ls[(lsa & 0x3FFFC) + 5] << 16 |
+                   (uint32_t)ctx->ls[(lsa & 0x3FFFC) + 6] << 8 | ctx->ls[(lsa & 0x3FFFC) + 7]) * 668265263u);
+    h &= (1u << 20) - 1;
+    if (seen[h >> 3] & (1u << (h & 7))) return;
+    while (__sync_lock_test_and_set(&mu, 1)) { }
+    if (!(seen[h >> 3] & (1u << (h & 7)))) {
+        seen[h >> 3] |= (uint8_t)(1u << (h & 7));
+        for (int i = 0; i < 16; i++) fprintf(f, "%02x", g[i]);
+        fprintf(f, " %05X%c", lsa & 0x3FFFC, 10);
+        fflush(f);
+        { extern void spu_lookup_explain(const spu_context*, uint32_t); spu_lookup_explain(ctx, lsa & 0x3FFFC); }
+    }
+    __sync_lock_release(&mu);
+}
+
+/* SPU_INTERP_TIME=1: share of wall time spent interpreting, all SPU threads
+ * summed (100% = one core), every 5 s. Outermost entries only. */
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_INTERP_TIME") ? 1 : 0;
+    if (!on) return spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    static _Thread_local int depth;
+    static volatile long long s_cyc, s_t0; static volatile long s_entries;
+    if (depth++) { uint32_t r = spu_interp_run_until_body(ctx, start_lsa, stop_lsa); depth--; return r; }
+#if defined(__x86_64__) || defined(_M_X64)
+    const unsigned long long t0 = __builtin_ia32_rdtsc();
+    uint32_t r = spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    const unsigned long long t1 = __builtin_ia32_rdtsc();
+#else   /* arm64: the generic timer, scaled to ~3 GHz ticks for the report */
+    unsigned long long t0, t1, fq;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t0)); __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(fq));
+    uint32_t r = spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t1));
+    if (fq) { t0 = t0 * (3000000000ull / fq); t1 = t1 * (3000000000ull / fq); }
+#endif
+    depth--;
+    __sync_fetch_and_add(&s_cyc, (long long)(t1 - t0)); __sync_fetch_and_add(&s_entries, 1);
+    if (!s_t0) s_t0 = (long long)t1;
+    else if ((long long)t1 - s_t0 > 15000000000LL) {   /* ~5 s at 3 GHz TSC */
+        const long long span = (long long)t1 - s_t0; s_t0 = (long long)t1;
+        fprintf(stderr, "[interp-time] %.1f%% of one core, %ld entries%c", 100.0 * (double)s_cyc / (double)span, s_entries, 10);
+        s_cyc = 0; s_entries = 0;
+    }
+    return r;
+}
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    spu_interp_note_start(ctx, start_lsa);
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
@@ -356,6 +439,53 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
+        /* SPU_INTERP_REPORT=1: every 2^20 interpreted instructions, say where --
+         * the job GUID at LS 0x100 and the pc -- so a hot unlifted job is named. */
+        { static int on = -1; if (on < 0) on = getenv("SPU_INTERP_REPORT") ? 1 : 0;
+          static _Thread_local unsigned long n;
+          if (on && ((++n) & 0xFFFFF) == 0) {
+              const uint8_t* g = ctx->ls + 0x100;
+              fprintf(stderr, "[interp-hot] img=%d pc=0x%05X start=0x%05X guid=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                      ctx->image_id, ctx->pc & 0x3FFFF, start_lsa & 0x3FFFF, g[0],g[1],g[2],g[3],g[4],g[5],g[6],g[7],g[8],g[9],g[10],g[11],g[12],g[13],g[14],g[15]);
+          } }
+        /* RACACIT debug: SPU_INTERP_PCLOG=<file>[,<img>]: append every taken
+         * control transfer (pc != previous pc + 4) as "from->to", capped. */
+        { static FILE* pf = (FILE*)1; static int pimg = -1; static _Thread_local uint32_t prev = 0xFFFFFFFFu; static long pn = 0; static uint32_t s_plo = 0, s_phi = 0; { static int i_ = 0; if (!i_) { i_ = 1; const char* e = getenv("SPU_INTERP_PCLOG_SKIP"); if (e) { char* d; s_plo = strtoul(e, &d, 16); if (*d == '-') s_phi = strtoul(d + 1, 0, 16); } } }
+          if (pf == (FILE*)1) { const char* e = getenv("SPU_INTERP_PCLOG"); pf = 0;
+              if (e) { char b[400]; snprintf(b, sizeof b, "%s", e); char* c = strchr(b, ',');
+                       if (c) { *c = 0; pimg = atoi(c + 1); } pf = fopen(b, "w"); } }
+          if (pf && (pimg < 0 || ctx->image_id == pimg)) {
+              static uint8_t s_edge[1 << 16]; uint32_t eh = ((prev * 2654435761u) ^ (ctx->pc * 40503u)) >> 16;
+              if (ctx->pc != prev + 4 && s_edge[eh] < 40 && ++s_edge[eh] && pn < 4000000 && !(ctx->pc >= 0x3F580u && (prev & 0x3FFFF) >= 0x3F580u) && !(s_plo < s_phi && ctx->pc >= s_plo && ctx->pc < s_phi)) { fprintf(pf, "%05X>%05X\n", prev & 0x3FFFF, ctx->pc); pn++;
+                  if (pn < 200000 || (pn & 1023) == 0) fflush(pf); }
+              prev = ctx->pc; } }
+        /* RACACIT debug: SPU_INTERP_WATCHPC=<hex>[:<hex>...][,<img>] dumps the
+         * GPRs listed in SPU_INTERP_WATCHREGS (default 0-8) and LS at r5+0x60..0x80
+         * each time the interpreter reaches one of the pcs (first 8 hits each). */
+        { static int wn_pc = -1; static uint32_t wpcs[16]; static int whits[16]; static int wimg = -1;
+          static int wregs[64]; static int nwregs = 0; static int wmax = -1;
+          if (wmax < 0) { const char* m = getenv("SPU_INTERP_WATCH_MAX"); wmax = m ? atoi(m) : 8; }
+          if (wn_pc < 0) { wn_pc = 0; const char* e = getenv("SPU_INTERP_WATCHPC");
+              if (e) { const char* q = e; while (*q && *q != ',' && wn_pc < 16) {
+                  wpcs[wn_pc++] = (uint32_t)strtoul(q, (char**)&q, 16); if (*q == ':') q++; }
+                  if (*q == ',') wimg = atoi(q + 1); }
+              const char* r = getenv("SPU_INTERP_WATCHREGS");
+              if (r) { while (*r && nwregs < 64) { wregs[nwregs++] = (int)strtol(r, (char**)&r, 10); if (*r == ',') r++; else break; } }
+              else for (int i = 0; i <= 8; i++) wregs[nwregs++] = i; }
+          for (int wi = 0; wi < wn_pc; wi++) if (ctx->pc == wpcs[wi] && (wimg < 0 || ctx->image_id == wimg) && whits[wi]++ < wmax) {
+              fprintf(stderr, "[watchpc] img=%d pc=0x%05X", ctx->image_id, ctx->pc);
+              for (int k = 0; k < nwregs; k++) { int r = wregs[k] & 127;
+                  fprintf(stderr, " r%d=%08X.%08X.%08X.%08X", r, ctx->gpr[r]._u32[0], ctx->gpr[r]._u32[1], ctx->gpr[r]._u32[2], ctx->gpr[r]._u32[3]); }
+              uint32_t b = ctx->gpr[5]._u32[0] & 0x3FFF0;
+              for (uint32_t o = 0x60; o <= 0x80; o += 16) {
+                  fprintf(stderr, "\n   LS[r5+0x%02X=%05X]:", o, (b + o) & 0x3FFF0);
+                  for (int k = 0; k < 16; k += 4) {
+                      const uint8_t* q = ctx->ls + ((b + o + k) & 0x3FFFF);
+                      fprintf(stderr, " %02X%02X%02X%02X", q[0], q[1], q[2], q[3]); } }
+              fprintf(stderr, "\n"); fflush(stderr);
+              { const char* dp = getenv("SPU_INTERP_WATCH_LSDUMP");   /* full 256 KB LS snapshot */
+                if (dp) { char fn[512]; snprintf(fn, sizeof fn, "%s.%05X.%d", dp, ctx->pc, whits[wi]);
+                          FILE* f = fopen(fn, "wb"); if (f) { fwrite(ctx->ls, 1, 0x40000, f); fclose(f); } } } } }
         /* Match the lifted path: only synthetic HLE tasks may bypass the
          * resident policy. Real tasksets also store 0xA70 in their API table.
          * Preserve the legacy CRI return convention while invoking the HLE. */
@@ -376,7 +506,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa && (!ctx->drain_ret_sp || ctx->gpr[1]._u32[0] == ctx->drain_ret_sp)) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
@@ -394,6 +524,12 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
+        /* racacit: SPU_INTERP_HEARTBEAT=<log2 steps>: periodic pc report per context */
+        { static int hb = -1; if (hb < 0) { const char* e = getenv("SPU_INTERP_HEARTBEAT"); hb = e ? atoi(e) : 0; }
+          if (hb > 0 && (steps & ((1ull << hb) - 1)) == 0)
+              fprintf(stderr, "[spu-hb] ctx=%p img=%d pc=0x%05X lr=0x%05X r1=0x%05X r3=%08X steps=%llu\n", (void*)ctx,
+                      ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0], ctx->gpr[1]._u32[0], ctx->gpr[3]._u32[0],
+                      (unsigned long long)steps); }
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {

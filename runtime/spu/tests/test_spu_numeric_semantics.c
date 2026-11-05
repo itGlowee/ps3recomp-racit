@@ -36,6 +36,19 @@ int main(void)
     r=spu_fi(a,spu_frsqest(a));
     r=spu_fma(spu_fnms(spu_fm(a,r),r,one),spu_fm(r,half),r);
     for(int i=0;i<4;++i) CHECK(fabsf(r._f32[i]*sqrtf(a._f32[i])-1.0f)<2e-6f);
+    /* Extended range (no NaN/Inf): 1/0 is the largest number and stays a
+     * number -- times zero is zero, compares as large, saturates on overflow;
+     * results truncate and tiny ones flush to zero. */
+    u128 z=spu_zero();
+    r=spu_fi(z,spu_frest(z));
+    CHECK(((r._u32[0]>>23)&0xFF)==0xFF && !(r._u32[0]&0x80000000u));
+    u128 p=spu_fm(r,z); CHECK(p._u32[0]==0);
+    p=spu_fma(r,z,one); CHECK(p._f32[0]==1.0f);
+    p=spu_fcgt(r,one); CHECK(p._u32[0]==0xFFFFFFFFu);
+    p=spu_fa(r,r); CHECK(p._u32[0]==0x7FFFFFFFu);
+    a=spu_splat_u32(0x7FFFFC00u); p=spu_fm(a,one); CHECK(p._u32[0]==0x7FFFFC00u);
+    a=spu_splat_u32(0x00800000u); p=spu_fm(a,half); CHECK(p._u32[0]==0);   /* 2^-126 * 0.5 */
+    p=spu_csflt(spu_splat_u32(0x7FFFFFFF),155); CHECK(p._u32[0]==0x4EFFFFFFu);   /* truncated, not 2^31 */
     printf("SPU numeric semantics: %d passed, %d failed\n",passed,failed);
     return failed?1:0;
 }

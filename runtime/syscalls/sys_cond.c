@@ -121,10 +121,19 @@ int64_t sys_cond_destroy(ppu_context* ctx)
 int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
-    /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
-    const char* peek = getenv("PS3_COND_PEEK");
-    if (peek) {
-        uint32_t ea = (uint32_t)strtoul(peek, NULL, 16);
+    /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite.
+     * Read once: this runs on every wait. */
+    static int s_env_read;
+    static const char* s_peek;
+    static long s_probe_ms;
+    if (!s_env_read) {
+        const char* spurious = getenv("PS3_COND_SPURIOUS_MS");
+        s_peek = getenv("PS3_COND_PEEK");
+        s_probe_ms = spurious ? atol(spurious) : 0;
+        s_env_read = 1;
+    }
+    if (s_peek) {
+        uint32_t ea = (uint32_t)strtoul(s_peek, NULL, 16);
         if (ea) {
             const uint8_t* p = vm_to_host(ea);
             uint32_t value = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -134,9 +143,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     }
 #ifdef _WIN32
-    const char* spurious = getenv("PS3_COND_SPURIOUS_MS");
-    long probe_ms = spurious ? atol(spurious) : 0;
-    if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
+    if (s_probe_ms > 0 && !timeout) timeout = (uint64_t)s_probe_ms * 1000;
 #endif
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));

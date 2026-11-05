@@ -285,6 +285,19 @@ int64_t sys_fs_open(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
+    /* racacit: RACACIT_SKIP_MOVIES=1 -- every pre-rendered (Bink) movie is
+     * skipped: report the .bik as absent and the title plays on exactly as it
+     * does when a movie file is missing from the disc. Movies open through
+     * this raw sys_fs path (Bink's IO thread). */
+    { static int skip = -1;
+      if (skip < 0) { const char* e = getenv("RACACIT_SKIP_MOVIES"); skip = (e && *e && *e != '0') ? 1 : 0; }
+      size_t n = ps3_path ? strlen(ps3_path) : 0;
+      if (skip && n > 4 && ps3_path[n-4] == '.' &&
+          (ps3_path[n-3] | 32) == 'b' && (ps3_path[n-2] | 32) == 'i' && (ps3_path[n-1] | 32) == 'k') {
+          fprintf(stderr, "[movies] skipping %s (RACACIT_SKIP_MOVIES)\n", ps3_path);
+          return (int64_t)(int32_t)CELL_ENOENT;
+      } }
+
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
         fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",

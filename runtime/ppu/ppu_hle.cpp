@@ -121,62 +121,6 @@ extern "C" void flow_spurs_kernel_spawn_postinit(void) __attribute__((weak));
 extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 
-/* An unresolved NID is a firmware import we never registered. Returning
- * CELL_OK "so the game keeps going" is the single biggest source of
- * days-long debugging in this project: the title reads back untouched
- * out-params and proceeds on fabricated state, then deadlocks or crashes
- * far from the actual gap. The unregistered mouse (a phantom device polled
- * forever) and six whole modules whose names never matched a source file
- * all reached the game this way.
- *
- * So: report every DISTINCT unresolved NID exactly once (not a global
- * first-40 cap that hides everything after the 40th unique import), count
- * how often each is hit, and make the fabricated return an explicit CHOICE
- * rather than the silent default.
- *
- * The default stays CELL_OK, because faking is currently LOAD-BEARING: LBP
- * calls cellFsSdataOpen (0xB1840B53, its encrypted data file) and cellHttpsInit
- * (0x522180BC) during early boot and shuts down cleanly if either fails, so
- * PS3_HLE_UNRESOLVED=fail dies at 144 log lines vs ~148,000. The days-long
- * debugging was never caused by the fake per se -- it was caused by the fake
- * being SILENT (a global first-40-line cap hid every import past the 40th). So
- * the fix is visibility: report each DISTINCT unresolved NID once, with a hit
- * count, always. `fail` remains available to A/B which missing import is
- * load-bearing -- run it and read the two or three NIDs it reports.
- *
- *   PS3_HLE_UNRESOLVED = ok   (default): r3 = CELL_OK, reported once per NID.
- *                        = fail: r3 = CELL_ERROR_ERROR, to find load-bearing
- *                                imports (expect an early, clean shutdown).
- */
-static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
-{
-    enum { CELL_ERROR_ERROR = (int)0x8001003Fu };  /* generic CELL failure */
-    static int s_fake = -1;
-    if (s_fake < 0) {
-        const char* m = getenv("PS3_HLE_UNRESOLVED");
-        s_fake = (m && (m[0]=='f' || m[0]=='F')) ? 0 : 1;   /* "fail" -> error, else fake */
-    }
-    /* First-seen set: report each NID once, then count silently. Linear scan
-     * over a small array -- the count of DISTINCT unresolved NIDs a title hits
-     * is tens, not thousands (the log-flooders are all the SAME NID). */
-    static uint32_t seen[512];
-    static uint32_t hits[512];
-    static uint32_t n_seen = 0;
-    uint32_t i = 0;
-    for (; i < n_seen; i++) if (seen[i] == nid) break;
-    if (i == n_seen && n_seen < 512) { seen[n_seen] = nid; hits[n_seen] = 0; n_seen++; }
-    uint32_t count = (i < 512) ? ++hits[i] : 0;
-    (void)count;
-    if (count == 1)
-        fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> faking %s "
-                        "(unregistered import%s)\n",
-                nid, s_fake ? "CELL_OK" : "CELL_ERROR_ERROR",
-                s_fake ? "; PS3_HLE_UNRESOLVED=fail to find load-bearing ones"
-                       : "");
-
-    ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
-}
-
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
@@ -235,7 +179,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
     if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-        static int _tn = 0; if (_tn++ < 3)
+        static int _tn = 0; if ((_tn < 3 && (_tn++, 1)))
             fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
         return;
     }
@@ -276,7 +220,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                       s_ha = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_ha && nid == (uint32_t)s_ha) {
         static int _n = 0;
-        if (_n++ < 6)
+        if ((_n < 6 && (_n++, 1)))
           fprintf(stderr, "[hle-args] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
                           "r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X lr=0x%08X\n",
                   nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
@@ -355,20 +299,20 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         if (nid == 0x5EF96465u) {
                             const char* ce = getenv("YDKJ_CRI_EVFLAG");
                             uint32_t crif = ce ? (uint32_t)strtoul(ce, 0, 16) : 0x006B4600u;
-                            static int _cd=0; if(getenv("SPURS_TRACE") && _cd++<4) fprintf(stderr,
+                            static int _cd=0; if(getenv("SPURS_TRACE") && (_cd < 4 && (_cd++, 1))) fprintf(stderr,
                                 "[EVFLAG] 0x5EF96465 r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
                                 (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]);
                             /* the eventFlag EA can be r3/r4/r5 depending on the (public vs _internal)
                              * variant behind this NID; the cri flag is a unique address so match any. */
                             if ((uint32_t)ctx->gpr[3] == crif || (uint32_t)ctx->gpr[4] == crif ||
                                 (uint32_t)ctx->gpr[5] == crif) {
-                                static int _c=0; if(_c++<2) fprintf(stderr,
+                                static int _c=0; if((_c < 2 && (_c++, 1))) fprintf(stderr,
                                     "[FORCE-HLE] cri eventflag 0x%08X -> REAL libsre (stamps +0xC=0xFF)\n", crif);
                                 break;   /* keep opd (libsre); do NOT force HLE */
                             }
                         }
                         static int _n = 0;
-                        if (_n++ < 8)
+                        if ((_n < 8 && (_n++, 1)))
                             fprintf(stderr, "[FORCE-HLE] nid=0x%08X: bypassing libsre, using HLE\n", nid);
                         opd = 0;   /* fall through to the HLE handler below */
                         break;
@@ -433,7 +377,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if (nid==0x87630976u && getenv("YDKJ_FORCEATTR")) {
                 extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
                 if (vm_base[s3+0xC]!=0xFF) { vm_base[s3+0xC]=0xFF;
-                    static int _f=0; if(_f++<4) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
+                    static int _f=0; if((_f < 4 && (_f++, 1))) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
             }
             /* YDKJ_GUESTINIT: the create-task (0x87630976) runs BEFORE the game's own
              * init of its task descriptor (r3), so descriptor+0xC != 0xFF -> STAT. Eagerly
@@ -461,7 +405,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if (nid==0x1D46FEDFu && getenv("SPURS_TRACE")) {
                 extern uint8_t* vm_base; uint32_t a5=(uint32_t)ctx->gpr[5], a4=(uint32_t)ctx->gpr[4];
                 #define _RD(b,o) ((vm_base[(b)+(o)]<<24)|(vm_base[(b)+(o)+1]<<16)|(vm_base[(b)+(o)+2]<<8)|vm_base[(b)+(o)+3])
-                static int _a=0; if(_a++<2) fprintf(stderr,
+                static int _a=0; if((_a < 2 && (_a++, 1))) fprintf(stderr,
                     "[CRI_ATTR] task-add r3(taskset)=0x%08X r4=0x%08X r5(attr)=0x%08X r6(elf)=0x%08X\n"
                     "           attr[0..0x1C]= %08X %08X %08X %08X %08X %08X %08X %08X  (attr[0] must be 1)\n",
                     (uint32_t)ctx->gpr[3],a4,a5,(uint32_t)ctx->gpr[6],
@@ -545,7 +489,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     if (_ed && dir != 1 && dir != 3) {
                         vm_base[ef + 0xE] = (uint8_t)((_ed[0] == (char)49) ? 1 : 3);
                         static int _es = 0;
-                        if (_es++ < 4) {
+                        if ((_es < 4 && (_es++, 1))) {
                             fprintf(stderr, "[EVFLAG] stamped +0E=%u on 0x%08X\n",
                                     vm_base[ef+0xE], ef);
                             fflush(stderr); }
@@ -590,7 +534,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               if (nid==0x87630976u && _cap_ts==0x40131000u && (uint32_t)ctx->gpr[3]==0x8041090Fu
                   && getenv("YDKJ_CRI_CREATE_OK")) {
                   ctx->gpr[3]=0; static int _co=0;
-                  if(_co++<2) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
+                  if((_co < 2 && (_co++, 1))) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
               }
               extern uint64_t vm_read64(uint64_t a);
               if (st && nid==0x87630976u && _cap_ts) {
@@ -654,7 +598,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * -> the SPURS task workload never attaches -> no movie decode. Return not-loaded. */
         if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
             ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-            static int _tn = 0; if (_tn++ < 3)
+            static int _tn = 0; if ((_tn < 3 && (_tn++, 1)))
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
@@ -669,7 +613,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor
          * its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
         if (nid==0xCDC6AEFDu) { static int _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
-          if(_sdi){ static int _once=0; if(_once++<2){
+          if(_sdi){ static int _once=0; if((_once < 2 && (_once++, 1))){
             uint32_t statCb=(uint32_t)ctx->gpr[8];               /* statCallback OPD */
             uint32_t SC=0x02000000u, SG=0x02000100u, SS=0x02000900u; /* scratch structs */
             for(uint32_t a=0x02000000u;a<0x02001000u;a+=4) vm_write32(a,0);
@@ -685,7 +629,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             ctx->gpr[3]=0; /* CELL_SAVEDATA_RET_OK */
             return;
           } } }
-        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(_sd++<3){
+        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if((_sd < 3 && (_sd++, 1))){
             extern uint32_t vm_read32(uint64_t);
             uint32_t r7=(uint32_t)ctx->gpr[7], r8=(uint32_t)ctx->gpr[8];
             uint32_t r7c=r7?vm_read32(r7):0, r8c=r8?vm_read32(r8):0;
@@ -714,7 +658,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
-        static int _g=0; if (_g++ < 8)
+        static int _g=0; if ((_g < 8 && (_g++, 1)))
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",
                     e->name, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
@@ -732,7 +676,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static int _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
       if(_pl){ uint32_t rv=(uint32_t)r;
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
-          static int _n=0; if(_n++<40) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
+          static int _n=0; if((_n < 40 && (_n++, 1))) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
             nid, e->name?e->name:"?", rv); } } }
 }
 

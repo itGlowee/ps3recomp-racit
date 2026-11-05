@@ -48,6 +48,9 @@ extern "C" {
 #define RSX_TEX_FMT_DXT45           0x88
 #define RSX_TEX_FMT_G8B8            0x8B
 #define RSX_TEX_FMT_DEPTH24_D8      0x90
+#define RSX_TEX_FMT_DEPTH24_D8_F    0x91
+#define RSX_TEX_FMT_DEPTH16        0x92
+#define RSX_TEX_FMT_DEPTH16_F      0x93
 #define RSX_TEX_FMT_LINEAR          0x20         /* modifier: no swizzle     */
 #define RSX_TEX_FMT_UNNORM          0x40         /* modifier: texel coords   */
 #define RSX_TEX_FMT_BASE_MASK       0x9F         /* format sans modifiers    */
@@ -112,7 +115,18 @@ typedef struct rsx_dispatch_sink {
 struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
+    u32 vp_gen;                       /* bumped on every vp[] write: lets a  */
+                                      /* consumer cache what it derives     */
     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
+    /* Slots written since a consumer last took them ([lo, hi), lo == hi =
+     * none): a draw then copies only what changed, not all 8 KB. */
+    u32 const_dirty_lo, const_dirty_hi;
+    /* Per fragment texture unit: bumped when one of its registers takes a
+     * new value (the 8-word block at 0x1A00 + 0x20u, CONTROL3 at 0x1840 + 4u).
+     * A consumer that resolved the unit can tell it is still the same. */
+    u32 tex_gen[RSX_DSP_NUM_TEXTURES];
+    u32 tex_gen_all;                  /* bumped with any tex_gen[]          */
+    u32 vtex_gen;                     /* any vertex-texture register changed */
 
     rsx_dispatch_sink sink;
 
@@ -121,6 +135,8 @@ struct rsx_dispatch {
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */
+    u32 imm_vertices;                 /* immediate-mode vertices this prim  */
+    u32 imm_attr_mask;                /* attributes each one carries        */
 
     /* coverage accounting */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
@@ -150,6 +166,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+void rsx_dispatch_const_words(rsx_dispatch* rsx, u32 first, const u8* be, u32 n);
 
 /* ---- decoded state getters -------------------------------------------- */
 

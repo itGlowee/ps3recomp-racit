@@ -135,7 +135,7 @@ const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
  * flight. As plain globals these were clobbered between a job finishing and its
  * own completion being pushed, so a query could be answered with an unrelated
  * job's mailbox. Per-thread keeps each job paired with its own answer. */
-#ifdef _WIN32
+#ifdef _MSC_VER   /* clang/mingw ignores __declspec(thread) */
 #  define SPURS_JOB_TLS __declspec(thread)
 #else
 #  define SPURS_JOB_TLS __thread
@@ -255,7 +255,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);
 
     { static int _n = 0;
-      if (_n++ < 4)
+      if ((_n < 4 && (_n++, 1)))
           fprintf(stderr,
               "[spurs-job] job 0x%08X: bin 0x%08X+%u -> LS 0 | io=0x%05X(%u, %u dma, %u used)"
               " out=0x%05X(%u) scratch=0x%05X(%u) stack_top=0x%05X(%u) cache=%u"
@@ -268,7 +268,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
     { static int _d = 0;
-      if (getenv("SPURS_JOB_DESCDUMP") && _d++ < 4) {
+      if (getenv("SPURS_JOB_DESCDUMP") && (_d < 4 && (_d++, 1))) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
@@ -346,7 +346,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
     { static int _n = 0;
-      if (_n++ < 4)
+      if ((_n < 4 && (_n++, 1)))
           fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
                   ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
                   image_id); }

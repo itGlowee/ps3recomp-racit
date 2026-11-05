@@ -66,6 +66,7 @@ typedef struct rsx_be_sampler_desc {
     u8  min_linear, mag_linear, mip_linear, mip_present;
     u8  wrap_s, wrap_t, wrap_r;
     float min_lod, max_lod;
+    u32 border;          /* SET_TEXTURE_BORDER_COLOR, A8R8G8B8 */
 } rsx_be_sampler_desc;
 
 /* The NV4097 render state a pipeline is built from: rsx_live_draw.c's
@@ -83,6 +84,11 @@ typedef struct rsx_be_render_state {
     u32 stencil_enable, stencil_two_sided;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
+    /* Polygon offset (NV4097 0x0A68 fill enable, 0x0A78 slope factor, 0x0A7C
+     * units): only the enable is pipeline identity; the two values reach the
+     * backend per draw through set_depth_bias. */
+    u32 poly_offset_fill;
+    float poly_scale, poly_bias;
 } rsx_be_render_state;
 
 /* submit_and_wait reasons, for a backend that wants to log or count them. */
@@ -102,7 +108,11 @@ typedef struct rsx_be_render_state {
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
  * where the boundary is rather than assuming a number. */
-#define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+#define RSX_DRAW_ENGINE_TEXTURE_CACHE 16384  /* Zolar Forest filled 1024 and churned; Krell Canyon's
+                                                * caves filled 4096 (3584 by count) at 80 MB: textures
+                                                * still in use were evicted and uploaded again, up to
+                                                * 1900 a frame (owner, v66). The byte budget
+                                                * (RSX_ENG_TEX_MB) is the limit that matters. */
 
 /* ---- the backend interface ---------------------------------------------- */
 
@@ -147,6 +157,15 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* Copy a colour target into a sampleable texture and return it; 0 when
+     * the backend cannot. For a draw that samples the target it writes. */
+    u32  (*color_snapshot)(void* user, u32 color, u32 w, u32 h);
+    /* Scaled point-sampled copy between two targets of the same kind (colour
+     * to colour of one format, or depth to depth), recorded in stream order:
+     * the RSX's NV3089 scaled-image blit when both ends live on the GPU.
+     * Returns 0 when the backend cannot. */
+    int  (*blit)(void* user, u32 src, u32 sx, u32 sy, u32 sw, u32 sh,
+                 u32 dst, u32 dx, u32 dy, u32 dw, u32 dh);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
@@ -203,14 +222,66 @@ typedef struct rsx_draw_backend {
      * come back in the format the target was created with, so R,G,B,A for an
      * ordinary colour surface. */
     void (*present)(void* user, u32 surface);
-    void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-                     void* out, u32 out_pitch);
+    /* 0 = `out` holds the pixels; nonzero = nothing was written (no such
+     * target, region out of range, no memory, device lost) -- callers that
+     * copy `out` into guest memory must not. */
+    int (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                    void* out, u32 out_pitch);
+
+    /* Optional: depth_snapshot into a tex_w x tex_h texture, the w x h
+     * rendered area at its origin and the rest at the far plane -- a depth
+     * buffer read back at another size than the pass drew it: a swizzled
+     * 512x256 shadow map is the top half of the 512x512 texture over it. */
+    u32  (*depth_snapshot_sized)(void* user, u32 depth, u32 w, u32 h, u32 tex_w, u32 tex_h);
+
+    /* Optional: geometry the engine has cached, kept on the GPU side so a
+     * draw of it copies nothing. geom_upload returns a handle (0 = no room:
+     * draw as before); geom_release frees it once the GPU is done with it;
+     * draw_cached draws it like draw() with the bound state. */
+    u32  (*geom_upload)(void* user, const void* vertices, u32 vbytes, const u32* indices, u32 ibytes);
+    void (*geom_release)(void* user, u32 geom);
+    void (*draw_cached)(void* user, rsx_topology topology, u32 geom, u32 vertex_count,
+                        u32 stride, u32 index_count);
+
+    /* Optional: bind_vs_constants when only bytes [lo, hi) of `data` differ
+     * from the block bound last (the same block, the same size). For a
+     * backend that copies the block per bind, as a command queue does. */
+    void (*bind_vs_constants_delta)(void* user, const void* data, u32 bytes, u32 lo, u32 hi);
+
+    /* Optional: draw_cached of a block that holds vertices only (geom_upload
+     * without indices), with this draw's own indices into it; vertex i of the
+     * block is index i - vertex_offset (a host draw's base vertex). */
+    void (*draw_cached_vi)(void* user, rsx_topology topology, u32 geom, u32 vertex_count,
+                           u32 stride, const u32* indices, u32 index_count, int vertex_offset);
+
+    /* Optional: the polygon offset of the draws that follow (GL glPolygonOffset
+     * units and factor), applied when the pipeline has poly_offset_fill. */
+    void (*set_depth_bias)(void* user, float units, float factor);
+
+    /* Optional: SET_BLEND_COLOR as RGBA, for the draws that follow whose blend
+     * factors use a constant. */
+    void (*set_blend_color)(void* user, const float* rgba);
+
+    /* Optional: nonzero when `texture` (a handle texture_create returned) has
+     * no image behind it after all -- a backend that creates them later (the
+     * proxy's worker thread) hands the handle out first, and the create can
+     * still fail (out of video memory). The engine then makes it again. */
+    int  (*texture_failed)(void* user, u32 texture);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
 
 /* Register the backend the engine drives. Passing NULL unregisters it. */
 void rsx_draw_engine_set_backend(const rsx_draw_backend* backend);
+
+/* A scaled-image blit with its row pitches: a source that starts inside a
+ * colour target (not at its base) is found by its pitch. */
+int rsx_draw_engine_blit_pitched(u32 src_loc, u32 src_off, u32 src_pitch, u32 sx, u32 sy, u32 sw, u32 sh,
+                                 u32 dst_loc, u32 dst_off, u32 dst_pitch, u32 dx, u32 dy, u32 dw, u32 dh);
+
+/* Unless RSX_BACKEND_THREAD=0: `real` driven from a worker thread through a command
+ * queue (rsx_be_proxy.c); otherwise `real` itself. */
+const rsx_draw_backend* rsx_be_proxy_wrap(const rsx_draw_backend* real);
 
 /* Is the engine the path this run takes? True when PS3RECOMP_RSX_ENGINE names
  * "dispatch" (or the backend asked for it by default) and a backend has been
@@ -233,6 +304,9 @@ void rsx_draw_engine_shutdown(void);
  * SPU-built command lists bind NV4097 to another subchannel would otherwise
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
+/* A whole subchannel-0 packet, its `count` data words big-endian at `be`:
+ * rsx_draw_engine_method for each (incrementing or not). */
+void rsx_draw_engine_methods(u32 method, const u8* be, u32 count, int incrementing);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */
@@ -248,6 +322,20 @@ void rsx_draw_engine_flush(void);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
+/* An NV3089 scaled-image blit whose ends may be GPU targets (locations are
+ * RSX_LOCATION_*; rectangles in pixels). Copies depth to depth when the
+ * source is a tracked depth buffer, else colour to colour when both ends are
+ * colour targets. Returns 1 when it copied on the GPU. */
+int rsx_draw_engine_sync_region(u32 loc, u32 off, u32 pitch, u32 x, u32 y, u32 w, u32 h);
+int rsx_draw_engine_sync_range(u32 loc, u32 off, u32 bytes);
+/* Parked-VRAM watch (RSX_PARK_WATCH): an NV0039 copy about to run, and the
+ * park being watched (0 = none). */
+void rsx_draw_engine_park_note(u32 src_loc, u32 src_off, u32 dst_loc, u32 dst_off, u32 bytes);
+u32 rsx_draw_engine_park_id(void);
+void rsx_draw_engine_frame_mark(unsigned long long frame_us);
+extern unsigned long long g_rt_drain_total_us, g_rt_present_total_us;
+int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 sx, u32 sy, u32 sw, u32 sh,
+                         u32 dst_loc, u32 dst_off, u32 dx, u32 dy, u32 dw, u32 dh);
 
 /* --- test hooks ---------------------------------------------------------- */
 

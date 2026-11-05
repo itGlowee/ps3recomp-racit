@@ -44,6 +44,8 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    u64* direct;            /* (generation << 32) | unique, by vertex_id - min */
+    u32 direct_capacity;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {
@@ -115,6 +117,12 @@ void rsx_vertex_fetch_plan_prepare(
  * invalid enabled ATTR0 remains fatal. */
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+
+/* rsx_vertex_fetch_one for refs[0..count) into consecutive vertices of
+ * plan->layout.stride bytes: the same values, a loop per attribute. */
+int rsx_vertex_fetch_many(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map

@@ -6,7 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
-#include <setjmp.h>
+#include "../platform/ps3_setjmp.h"   /* setjmp/longjmp that never unwind (Windows) */
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -20,6 +20,45 @@ typedef struct spu_irq_frame {
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
 SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+
+/* SPU_TRACE_RING=1: per SPU thread, the last 64 control transfers the runtime
+ * sees (drain start / return / resume-at-entry / restart, indirect branches),
+ * printed by spu_tr_dump when the lane dies on an unresolved branch. For the
+ * A Crack in Time level-14 freeze: CollNarrow's handler ran with the
+ * dispatcher's frame already popped -- a continuation run twice? */
+#include <stdio.h>
+#include <stdlib.h>
+typedef struct { char k; uint32_t pc, ret, r0, r1, sp0, depth; int img; } spu_tr_ev;
+static SPU_THREAD_LOCAL spu_tr_ev s_tr[64];
+static SPU_THREAD_LOCAL unsigned s_tr_n;
+static int spu_tr_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_TRACE_RING"); on = (e && *e == '1') ? 1 : 0; }
+    return on;
+}
+void spu_tr_note(spu_context* ctx, char k, uint32_t ret, uint32_t sp0)
+{
+    if (!spu_tr_on()) return;
+    spu_tr_ev* e = &s_tr[s_tr_n++ & 63u];
+    e->k = k; e->pc = (uint32_t)ctx->pc & SPU_LS_MASK; e->ret = ret & SPU_LS_MASK;
+    e->r0 = ctx->gpr[0]._u32[0] & SPU_LS_MASK; e->r1 = ctx->gpr[1]._u32[0];
+    e->sp0 = sp0; e->depth = ctx->host_depth; e->img = ctx->image_id;
+}
+void spu_tr_dump(spu_context* ctx)
+{
+    if (!spu_tr_on()) return;
+    fprintf(stderr, "[spu-trace] lane %u img=%d, last transfers (oldest first; D=drain start, R=drain return, "
+                    "E=drain resume at lifted entry, X=restart, B=indirect branch):\n",
+            (unsigned)ctx->spu_id, ctx->image_id);
+    const unsigned n = s_tr_n < 64u ? s_tr_n : 64u;
+    for (unsigned i = s_tr_n - n; i != s_tr_n; i++) {
+        const spu_tr_ev* e = &s_tr[i & 63u];
+        fprintf(stderr, "   %c pc=%05X ret=%05X r0=%05X r1=%05X sp0=%05X depth=%u img=%d\n",
+                e->k, e->pc, e->ret, e->r0, e->r1, e->sp0, e->depth, e->img);
+    }
+    fflush(stderr);
+}
 
 /* yz_lockstep_tick now has its real body in spu_lockstep.c (milestone 2). */
 
@@ -36,6 +75,8 @@ void* volatile    g_pm_flow_ctx = 0;
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+#include <math.h>
 
 /* Sync-model ring-drain: the wwsjob PM's job ring drains only when jobs mark
  * their record's "done" bit (0x8000 in the record's first halfword @LS 0xDF0).
@@ -57,11 +98,138 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
+/* SPU_JOB_STATS=1: igPm job run times per GUID, every 5 s. A job runs from
+ * the first step at LS 0x100-0x13F (its entry after the GUID header) until
+ * the lane is back in igPm's runtime (LS 0x3F000 and up). */
+extern unsigned ps3_tl_tix(void);
+/* PS3_SAMPLE_JOB=<guid hex>: the job each sampled lane is running (0 =
+ * none), by the lane's sampler slot (PS3_SAMPLE_SPURS=all registration;
+ * t_samp_slot = -1 for threads the sampler does not take). The sampler keeps
+ * only samples taken inside that job -- runtime helpers, channel waits and
+ * float slow paths included, which the code-address map cannot attribute. */
+volatile uint32_t g_samp_lane_job[8];
+_Thread_local int t_samp_slot = -1;
+/* Lock-line wait time inside the job this lane is running (spu_lr_wait adds
+ * to it): SPU_JOB_STATS reports it next to the run time -- how much of a
+ * job's time is waiting on another lane rather than its own code. */
+_Thread_local unsigned long long t_spu_job_wait_us;
+static void spu_job_stats(spu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = (getenv("SPU_JOB_STATS") ? 1 : 0) | (getenv("PS3_TIMELINE") ? 2 : 0) |
+                     (getenv("PS3_SAMPLE_JOB") ? 4 : 0);
+    if (!on) return;
+    static _Thread_local int active; static _Thread_local unsigned long long t0;
+    static _Thread_local uint8_t guid[4];
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    extern unsigned long long ps3_qpc_us(void);
+    if (!active) {
+        if (pc < 0x100u || pc >= 0x140u) return;
+        active = 1; t0 = ps3_qpc_us(); memcpy(guid, ctx->ls + 0x100, 4); t_spu_job_wait_us = 0;
+        if (t_samp_slot >= 0 && t_samp_slot < 8)
+            g_samp_lane_job[t_samp_slot] = (uint32_t)guid[0] << 24 | (uint32_t)guid[1] << 16 | (uint32_t)guid[2] << 8 | guid[3];
+        if (on & 2) { extern void ps3_tl_at(unsigned long long, char, uint32_t, uint32_t);
+            ps3_tl_at(t0, 'J', (uint32_t)guid[0] << 24 | (uint32_t)guid[1] << 16 | (uint32_t)guid[2] << 8 | guid[3],
+                      ps3_tl_tix()); }
+        return;
+    }
+    if (pc < 0x3F000u) return;
+    active = 0;
+    if (t_samp_slot >= 0 && t_samp_slot < 8) g_samp_lane_job[t_samp_slot] = 0;
+    const unsigned long long d = ps3_qpc_us() - t0;
+    typedef struct { uint32_t g; unsigned long long n, us, max, wus; } ent;
+    static ent e[128]; static int ne; static volatile long mu; static unsigned long long last;
+    const uint32_t g = (uint32_t)guid[0] << 24 | (uint32_t)guid[1] << 16 | (uint32_t)guid[2] << 8 | guid[3];
+    if (on & 2) { extern void ps3_tl_at(unsigned long long, char, uint32_t, uint32_t); ps3_tl_at(t0 + d, 'j', g, (uint32_t)d); }
+    if (!(on & 1)) return;
+    while (__sync_lock_test_and_set(&mu, 1)) { }
+    int k = 0;
+    for (; k < ne; k++) if (e[k].g == g) break;
+    if (k == ne && ne < 128) { e[ne].g = g; e[ne].n = e[ne].us = e[ne].max = e[ne].wus = 0; ne++; }
+    if (k < ne) { e[k].n++; e[k].us += d; e[k].wus += t_spu_job_wait_us; if (d > e[k].max) e[k].max = d; }
+    const unsigned long long now = ps3_qpc_us();
+    if (!last) last = now;
+    if (now - last > 5000000ull) {
+        last = now;
+        fprintf(stderr, "[job-stats] 5 s, by total run time:%c", 10);
+        for (int t = 0; t < 14; t++) {
+            int b = -1;
+            for (int j = 0; j < ne; j++) if (e[j].n && (b < 0 || e[j].us > e[b].us)) b = j;
+            if (b < 0) break;
+            fprintf(stderr, "   %08x: %llu runs, %.1f ms total, %.0f us avg, %.2f ms max, %.1f ms in lock-line waits%c", e[b].g, e[b].n,
+                    e[b].us / 1e3, (double)e[b].us / (double)e[b].n, e[b].max / 1e3, e[b].wus / 1e3, 10);
+            e[b].n = 0;
+        }
+        ne = 0;
+    }
+    __sync_lock_release(&mu);
+}
+
+volatile long g_spu_xf_exact[8];
+int g_spu_xf_stats_on = -1;
+/* SPU_XF_STATS=1: calls into the exact (extended-range) float paths per
+ * second -- arithmetic, fma family, fi, float-to-int -- every 5 s. */
+static void spu_xf_stats(void)
+{
+    if (g_spu_xf_stats_on < 0) g_spu_xf_stats_on = getenv("SPU_XF_STATS") ? 1 : 0;
+    if (!g_spu_xf_stats_on) return;
+    extern unsigned long long ps3_qpc_us(void);
+    static unsigned long long last; const unsigned long long now = ps3_qpc_us();
+    if (!last) { last = now; return; }
+    if (now - last < 5000000ull) return;
+    last = now;
+    fprintf(stderr, "[xf-exact] per s: scalar arith %ld fma %ld fi %ld cflt %ld; vector arith %ld fma %ld fi %ld%c",
+            g_spu_xf_exact[0] / 5, g_spu_xf_exact[1] / 5, g_spu_xf_exact[3] / 5, g_spu_xf_exact[4] / 5,
+            g_spu_xf_exact[5] / 5, g_spu_xf_exact[6] / 5, g_spu_xf_exact[7] / 5, 10);
+    for (int i = 0; i < 8; i++) g_spu_xf_exact[i] = 0;
+}
+
+static void spu_task_launch_check_diag(spu_context* ctx, void* fn);
+
+/* Every trampoline step lands here. The diagnostics below are each env-gated,
+ * but a dozen separate gates were as costly as the job code they wrapped
+ * while a fight's batch ran (spu_task_launch_check 3.8% next to the jobs'
+ * own ~10%), so they are decided once: with none of them set, only the two
+ * checks that change behaviour run. */
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    static int s_diag = -1;
+    if (__builtin_expect(s_diag < 0, 0)) {
+        static const char* const k_env[] = {
+            "SPU_JOB_STATS", "PS3_TIMELINE", "PS3_SAMPLE_JOB", "SPU_XF_STATS", "SPU_RECENT_PCS",
+            "SPU_NO_LS0_END", "SPU_EXITTRACE", "SPU_STEPTRACE", "SPURS_PM_FLOW", "SPU_JOBDRAIN" };
+        int d = 0;
+        for (unsigned i = 0; i < sizeof k_env / sizeof k_env[0]; i++) if (getenv(k_env[i])) d = 1;
+        s_diag = d;
+    }
+    if (__builtin_expect(s_diag, 0)) { spu_task_launch_check_diag(ctx, fn); return; }
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
-    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (ctx->host_depth && !ctx->policy_mode)
+        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    /* A job branching to LS 0 is finished (see the diagnostic version). */
+    if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 && !ctx->policy_mode && ctx->image_id > 0) {
+        static int _n = 0;
+        if ((_n < 8 && (_n++, 1)))
+            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n", ctx->image_id);
+        spu_halt(ctx);
+        return;
+    }
+    if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
+        g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
+}
+
+static void spu_task_launch_check_diag(spu_context* ctx, void* fn)
+{
+    spu_job_stats(ctx);
+    spu_xf_stats();
+    /* Every trampoline step lands here, so the diagnostics stay off the path
+     * unless asked for: SPU_RECENT_PCS=1 keeps the post-mortem ring. */
+    static int s_recent = -1;
+    if (s_recent < 0) s_recent = getenv("SPU_RECENT_PCS") ? 1 : 0;
+    if (s_recent) t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    if (ctx->host_depth && !ctx->policy_mode)   /* its own first test, without the call */
+        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
      * resident job manager, and with the job loaded at 0 that lands on its own
      * entry. Planting a return address in r0 catches the jobs that get there
@@ -84,7 +252,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
         static int _n = 0;
-        if (_n++ < 8)
+        if ((_n < 8 && (_n++, 1)))
             fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
                     ctx->image_id);
         if (s_et >= 0 && ctx->image_id == s_et) {
@@ -145,7 +313,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
         marked++;
     }
     static int _n = 0;
-    if (marked && _n++ < 12)
+    if (marked && (_n < 12 && (_n++, 1)))
         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
 }
 
@@ -255,7 +423,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                 if (f && ctx->host_depth > f->depth) {
                     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
-                      if (s_it && _n++ < 200)
+                      if (s_it && (_n < 200 && (_n++, 1)))
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
                     longjmp(f->env, 1);
@@ -266,7 +434,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                      * srr0 with the host stack empty, which is that frame. */
                     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
-                      if (s_it && _n++ < 200)
+                      if (s_it && (_n < 200 && (_n++, 1)))
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
                                   ctx->host_depth, ctx->pc & SPU_LS_MASK); }
                     extern void spu_restart_dispatch(spu_context*);
@@ -299,7 +467,7 @@ void (*spu_take_interrupt(spu_context* ctx,
         target = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK;
     } else {
         static int _w = 0;
-        if (_w++ < 4)
+        if ((_w < 4 && (_w++, 1)))
             fprintf(stderr, "[spu-int] pending (st=0x%X mask=0x%X) but LS0 word "
                     "0x%08X is no branch -- not taken\n",
                     ctx->event_status, ctx->event_mask, w);
@@ -309,13 +477,14 @@ void (*spu_take_interrupt(spu_context* ctx,
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
-      if (s_it) { static int _n = 0; if (_n++ < 200)
+      if (s_it) { static int _n = 0; if ((_n < 200 && (_n++, 1)))
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
                 ctx->srr0 & SPU_LS_MASK, ctx->host_depth,
                 ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0]); } }
     ctx->pc = target & SPU_LS_MASK;
+    { extern volatile int g_spu_irqfollow_n; if (g_spu_irqfollow_n == 0) g_spu_irqfollow_n = 1; }
     { static int _n = 0;
-      if (_n++ < 16) {
+      if ((_n < 16 && (_n++, 1))) {
           /* WWS Load->Run diagnosis: the job-manager interrupt handler advances
            * g_WwsJob_loadJobState kReadCommands(1)->kExecuteCommands(2) only if
            * (a) the ch25 stall mask has tag 0 (kLoadJob_readCommands) AND
@@ -343,10 +512,11 @@ void spu_depth_guard(spu_context* ctx)
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
-     * a ring names the loop. */
+     * a ring names the loop. Per thread: one shared ring was a cache line
+     * every SPU thread wrote on every lifted call. */
     enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
+    static _Thread_local uint32_t s_ring[RING];
+    static _Thread_local uint32_t s_n;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 
@@ -398,24 +568,40 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
     spu_depth_guard(ctx);
+    /* racacit: a callee really returns with the caller's r1 restored. Code
+     * merely passing through return_pc's LS address (a job image loaded over
+     * the caller -- A Crack in Time's igPm jobs overwrite the policy module at
+     * LS 0xA00..0xC30) must not be taken for the return. */
+    const uint32_t sp0 = ctx->gpr[1]._u32[0];
+    /* ...but the callee may not have finished when we get here: a lifted
+     * function that ends in a trampoline (0x1750 -> 0x17A0 -> 0x17E0, A Crack
+     * in Time's DMA helper) returns to us with ITS frame still on r1, so sp0 is
+     * the callee's stack pointer and the real return -- r1 restored ABOVE it --
+     * never matched. The drain then fell off into spu_restart_dispatch and the
+     * whole policy module ended mid-job; igPm re-ran the job forever and Great
+     * Clock's level load never finished. A return is the return pc reached at
+     * or above the entry frame; code passing through deeper is not. */
+#define SPU_DRAIN_AT_RETURN() (((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) && ctx->gpr[1]._u32[0] >= sp0)
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
+    spu_tr_note(ctx, 'D', return_pc, sp0);
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; ctx->drain_ret_sp = 0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
-            if (g_spu_trampoline_fn == spu_indirect_branch &&
-                (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+            if (g_spu_trampoline_fn == spu_indirect_branch && SPU_DRAIN_AT_RETURN()) {
                 g_spu_trampoline_fn = 0;
                 SPU_DRAIN_POP_IRQ();
+                spu_tr_note(ctx, 'R', return_pc, sp0);
                 return;
             }
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+            ctx->drain_ret_sp = sp0;
             yz_lockstep_tick(ctx);
             spu_task_launch_check(ctx, (void*)fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
@@ -443,19 +629,29 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             }
             fn(ctx);
         }
-        if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+        if (SPU_DRAIN_AT_RETURN()) {
             SPU_DRAIN_POP_IRQ();
+            spu_tr_note(ctx, 'R', return_pc, sp0);
             return;
         }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;
             spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            if (!fn) { extern spu_drain_fn spu_lookup_ctx(const spu_context*, uint32_t, int);
+                       fn = spu_lookup_ctx(ctx, pc, ctx->image_id); }
             if (fn) {
-                { static int _n = 0; if (_n++ < 8)
-                    fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
+                /* Capped per image: the WWS lanes (img 100) used up a global cap
+                 * of 8 at boot, hiding every later image's resumes. Ids run to
+                 * 543 (game/spu/spu_jobs.c): at 64 slots img 100 and 101 still
+                 * shared bucket 0. */
+                { enum { DR_MAX_IMG = 1024, DR_PER_IMG = 8 };
+                  static int _n[DR_MAX_IMG];
+                  const unsigned im = (ctx->image_id >= 0 && ctx->image_id < DR_MAX_IMG) ? (unsigned)ctx->image_id : 0;
+                  if (_n[im] < DR_PER_IMG && (_n[im]++, 1))
+                    fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d r0=0x%05X r1=0x%05X sp0=0x%05X\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
-                            (int)ctx->resident_ovl); }
+                            (int)ctx->resident_ovl, ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0], sp0); }
+                spu_tr_note(ctx, 'E', return_pc, sp0);
                 g_spu_trampoline_fn = spu_indirect_branch;
                 continue;
             }
@@ -463,9 +659,11 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         {
             extern void spu_restart_dispatch(spu_context*);
             SPU_DRAIN_POP_IRQ();
+            spu_tr_note(ctx, 'X', return_pc, sp0);
             spu_restart_dispatch(ctx);
             return;
         }
     }
 #undef SPU_DRAIN_POP_IRQ
+#undef SPU_DRAIN_AT_RETURN
 }

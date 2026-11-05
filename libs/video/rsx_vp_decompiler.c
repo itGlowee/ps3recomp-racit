@@ -31,6 +31,7 @@
 #include "rsx_vp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ---- little-endian word read (RPCS3-capture native order) --------------- */
 static u32 rd_le(const u8* p)
@@ -132,9 +133,36 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
 }
 
 /* ---- flow control -------------------------------------------------------- */
-#define RSX_VP_MAX_INSTR 512
+/* The RSX takes longer programs than 512 instructions (544 slots); at 512 a
+ * 532-instruction program in A Crack in Time lost its block openers past the
+ * limit while the terminators were still emitted: unbalanced braces, "function
+ * does not return a value: @main", and every draw using it dropped. */
+#define RSX_VP_MAX_INSTR 1024
 
 static u32 s_vp_branch_base = 0;   /* VP slot the program being decompiled starts at */
+/* NV4097_SET_TRANSFORM_BRANCH_BITS (0x1FF8) for the draw being translated:
+ * BRB/CLB test one of its bits, so a program that has them is translated
+ * per value (the engine keys on it -- rsx_vp_uses_branch_bits). */
+u32 rsx_vp_branch_bits = 0;
+
+int rsx_vp_uses_branch_bits(const void* ucode, u32 bytes)
+{
+    /* The words as the decompiler reads them (rd_le: the dispatcher keeps the
+     * program in host order). Reading them big-endian looked at byte-swapped
+     * words, so most programs with BRB were called branch-free and translated
+     * with every bit 0 -- A Crack in Time's particle program then skipped the
+     * corner expansion and every particle (fire, shots, sparks) collapsed
+     * to a point. */
+    const u8* p = (const u8*)ucode;
+    for (u32 o = 0; o + 16u <= bytes; o += 16u) {
+        const u32 d1 = rd_le(p + o + 4);
+        const u32 d3 = rd_le(p + o + 12);
+        const u32 op = (d1 >> 27) & 0x1F;
+        if (op == 0x11 || op == 0x12) return 1;
+        if (d3 & 1u) break;
+    }
+    return 0;
+}
 void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
 
 /* BRA BRI CAL CLI RET BRB CLB (scalar opcodes). */
@@ -501,9 +529,22 @@ static int rsx_vp_decompile_impl(
                          "        if (%s) { if (_csp > 0) { _csp--; _pc = _cs[_csp]; } else _pc = -1; } else _pc = %d;\n",
                          c, next);
             else {                                         /* BRB/CLB: boolean-register branches */
-                n_flow_skipped++;
-                snprintf(flow_term, sizeof flow_term,
-                         "        _pc = %d; /* TODO: %s not modelled */\n", next, rsx_vp_sca_name(sca_op));
+                /* D3 [27:23] picks a bit of TRANSFORM_BRANCH_BITS, D3 [28] is
+                 * the value that takes the branch; the CC condition applies
+                 * on top. Known when the program is translated. Galacton's
+                 * particle program skips a MOV of a debug colour this way
+                 * (its hull was magenta while the MOV always ran). */
+                const u32 bi = (d3 >> 23) & 31u, want = (d3 >> 28) & 1u;
+                const int bit_ok = ((rsx_vp_branch_bits >> bi) & 1u) == want;
+                char bc[64];
+                snprintf(bc, sizeof bc, "%s", bit_ok ? c : "false");
+                if (sca_op == 0x11)                        /* BRB */
+                    snprintf(flow_term, sizeof flow_term, "        _pc = %s ? %u : %d; /* BRB b%u==%u */\n",
+                             bc, tgt, next, bi, want);
+                else                                       /* CLB */
+                    snprintf(flow_term, sizeof flow_term,
+                             "        if (%s) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d; /* CLB b%u==%u */\n",
+                             bc, next, tgt, next, bi, want);
             }
         }
         /* ---- scalar ALU (reads SRC2) ---- */
@@ -659,7 +700,11 @@ static int rsx_vp_decompile_impl(
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"
-        "    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n"
+        "    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n");
+    /* RSX_VP_Z_DEBUG=1: every vertex at mid depth -- separates "the geometry
+     * is off the target" from "its depth is out of range" (a diagnostic). */
+    if (getenv("RSX_VP_Z_DEBUG")) emit(&o, "    Out.pos.z = Out.pos.w * 0.5;\n");
+    emit(&o,
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
         "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"

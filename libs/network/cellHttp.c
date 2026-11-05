@@ -204,10 +204,7 @@ static int http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
 {
     u32 hdr_len = (u32)(hdr_end - t->hdr_buf);
 
-    /* Null-terminate the header section for string ops (we have room) */
-    char saved = *hdr_end;
-    /* We can't write past hdr_buf if hdr_end points there, but hdr_end is
-     * within hdr_buf or at the boundary. We'll work with the length instead. */
+    /* hdr_end is within hdr_buf or at its boundary: work with the length. */
 
     /* Parse status line: "HTTP/1.x SSS reason\r\n" */
     int major = 0, minor = 0, status = 0;

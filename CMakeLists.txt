@@ -50,8 +50,8 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN: use the Metal backend on Apple")
     endif()
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
@@ -132,15 +132,35 @@ target_include_directories(ps3recomp_runtime PRIVATE
 if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32      # Winsock for network modules
-        xinput      # XInput for gamepad
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # racacit: a Windows build that shares Android's SDL2 input/audio/window
+    # layer (touch overlay, controller mapping, one Vulkan surface path).
+    option(PS3RECOMP_WIN_USE_SDL2 "Windows: SDL2 for pad, audio and the Vulkan window" OFF)
+    if(NOT PS3RECOMP_WIN_USE_SDL2)
+        target_link_libraries(ps3recomp_runtime PRIVATE xinput)   # XInput pad backend
+    endif()
+    if(PS3RECOMP_WIN_USE_SDL2)
+        if(NOT TARGET SDL2::SDL2)
+            find_package(SDL2 REQUIRED CONFIG)
+        endif()
+        target_link_libraries(ps3recomp_runtime PUBLIC SDL2::SDL2)
+        target_compile_definitions(ps3recomp_runtime PUBLIC
+            PS3RECOMP_PAD_USE_SDL2 PS3RECOMP_AUDIO_USE_SDL2)
+        message(STATUS "  SDL2:         Windows pad/audio/window via SDL2")
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
     # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
-    find_package(SDL2 QUIET)
+    # A parent project (the Android build) may already have added SDL2 from
+    # source; its target is then the SDL2 to use, and there is no package.
+    if(TARGET SDL2::SDL2)
+        set(SDL2_FOUND TRUE)
+    else()
+        find_package(SDL2 QUIET)
+    endif()
     if(SDL2_FOUND)
         if(TARGET SDL2::SDL2)
             target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
@@ -161,6 +181,9 @@ else()
 
     find_package(Threads REQUIRED)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
+    if(ANDROID)
+        target_link_libraries(ps3recomp_runtime PRIVATE log android dl)
+    endif()
 endif()
 
 if(APPLE)
@@ -203,7 +226,13 @@ endif()
 #           without it)
 set(PS3RECOMP_MSL_TRANSLATION OFF)
 if(UNIX)
-    find_package(glslang CONFIG QUIET)
+    # Likewise glslang: a parent that builds it from source (Android) provides
+    # the targets; only look for an installed package otherwise.
+    if(TARGET glslang::glslang AND TARGET glslang::SPIRV)
+        set(glslang_FOUND TRUE)
+    else()
+        find_package(glslang CONFIG QUIET)
+    endif()
 
     # spirv-cross's C API. Debian ships it as a shared library and Homebrew as
     # a static one, under different pkg-config names -- and pkg-config itself
@@ -272,6 +301,11 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
+    # A parent that built glslang from source (Android, Windows) provides the
+    # targets directly; the UNIX block above only runs on POSIX hosts.
+    if(NOT glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
+        set(glslang_FOUND TRUE)
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
@@ -301,12 +335,22 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # the base ISA and Clang fuses by default there. A PPC fmadd is
         # spelt as one where the lifter means one.
         -ffp-contract=off
+        # clang outside MSVC mode IGNORES __declspec(thread) (just a warning)
+        # and the variable becomes one process-wide global -- per-thread jump
+        # buffers and contexts silently shared. Never let that build again.
+        $<$<BOOL:${WIN32}>:-Werror=unknown-attributes>
         # Explicit, because the per-config defaults cannot be trusted: this
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
-        # was unoptimised without a word. Duplicating a default -O2 is harmless.
-        $<$<CONFIG:Release,RelWithDebInfo>:-O2>
+        # was unoptimised without a word. -O3 as the lifted code: the render thread's
+        # per-draw path and the SPU helpers are as hot as anything in it.
+        $<$<CONFIG:Release,RelWithDebInfo>:-O3>
     )
+    # zig's memcmp, memset and sqrt are baseline, byte-at-a-time or software: see the file.
+    if(WIN32)
+        target_sources(ps3recomp_runtime PRIVATE runtime/platform/fast_libc_win64.c)
+        set_source_files_properties(runtime/platform/fast_libc_win64.c PROPERTIES COMPILE_OPTIONS "-fno-builtin")
+    endif()
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
     # hottest SPU op in lifted audio code. Probed rather than assumed: recent
     # Apple clang rejects the flag outright for arm64 ("unsupported option
@@ -315,6 +359,13 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
     if(PS3RECOMP_HAS_MSSE41)
         target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
+    endif()
+    # PS3RECOMP_AVX2=ON (a game that builds its own lifted code for AVX2 + FMA
+    # and checks the CPU at start): the runtime too -- the draw engine's
+    # vertex and hash loops, the SPU helpers. Off by default.
+    option(PS3RECOMP_AVX2 "Build the runtime for AVX2 + FMA (x86-64-v3)" OFF)
+    if(PS3RECOMP_AVX2 AND PS3RECOMP_HAS_MSSE41)
+        target_compile_options(ps3recomp_runtime PRIVATE -mavx2 -mfma -mbmi2)
     endif()
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
@@ -378,7 +429,7 @@ endif()
 # run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
 # headless software path everywhere else, so Linux -- which has no real backend
 # yet -- can still run the whole guest command stream end to end in CI.
-if(UNIX)
+if(UNIX AND NOT ANDROID)
     add_executable(ps3recomp_host
         runtime/host/host_posix.c
         runtime/host/host_stubs.c
@@ -432,7 +483,7 @@ endif()
 #
 # The HLE NID table is generated exactly as a port generates it, so the smoke
 # title's firmware imports resolve through the same bridge a game's do.
-if(UNIX)
+if(UNIX AND NOT ANDROID)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(NOT Python3_Interpreter_FOUND)
         message(STATUS "  Boot smoke:   no python3; ps3recomp_boot_smoke not built")

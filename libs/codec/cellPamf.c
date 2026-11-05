@@ -66,12 +66,6 @@ static u32 be32(const void* p)
     return ((u32)b[0] << 24) | ((u32)b[1] << 16) | ((u32)b[2] << 8) | b[3];
 }
 
-static u64 be64(const void* p)
-{
-    const u8* b = (const u8*)p;
-    return ((u64)be32(b) << 32) | be32(b + 4);
-}
-
 static u16 be16(const void* p)
 {
     const u8* b = (const u8*)p;

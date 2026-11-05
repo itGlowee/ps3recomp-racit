@@ -84,6 +84,23 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  * unnorm_mask selects the units; dim[u] gives that unit's {width, height};
  * cube units are skipped. Returns the number of Sample sites patched, or -1 if
  * the buffer would overflow. A no-op when unnorm_mask is 0. */
+/* Depth-compare ("shadow") units for the next decompile: bit N set => unit N
+ * holds a depth texture whose TEX_ADDRESS ZFUNC is not NEVER, so a TEX/TXP
+ * on it returns (ref OP depth) -- ref being the coordinate's z -- filtered
+ * like the hardware's bilinear PCF, in every channel. func[N] is the ZFUNC
+ * (1 LESS, 2 EQUAL, 3 LEQUAL, 4 GREATER, 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS). */
+extern u32 rsx_fp_shadow_mask;
+extern u8  rsx_fp_shadow_func[16];
+extern int rsx_fp_srgb_out;       /* colour outputs linear -> sRGB on write */
+extern u64 rsx_fp_gamma_mask;    /* 4 bits a unit (R,G,B,A): sRGB -> linear on read (TEXTURE_ADDRESS gamma) */
+extern u32 rsx_fp_biased_mask;   /* units returning 2x-1 (TEXTURE_ADDRESS unsigned remap BIASED) */
+/* Buffered programs only: every fetch goes through rsx_texmode(value, unit),
+ * which applies that unit's gamma channels and bias from fp_texp[unit] in the
+ * PSConstants block (x,y: coordinate scale, z: gamma bits, w: biased), so the
+ * texture state is constants rather than part of the program -- one pipeline
+ * where there were hundreds. rsx_fp_gamma_mask / rsx_fp_biased_mask are
+ * ignored then; rsx_fp_apply_unnorm_scale with dim NULL scales by fp_texp. */
+extern int rsx_fp_dynamic_tex;
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                               const u32 dim[][2], u32 cube_mask);
 
@@ -125,6 +142,10 @@ int rsx_fp_collect_constants(
  * order are hashed; inline CONST payload bytes are skipped. Returns zero for
  * malformed input. */
 u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed);
+
+/* The texture units the program samples (TEX, TXP, TXD, TXB, TXL), bit u for
+ * unit u. 0xFFFF when the program does not parse to its end. */
+u32 rsx_fp_texture_mask(const u8* ucode, u32 max_bytes);
 
 /* Hash the exact legacy HLSL literal spellings (%g) for a program while also
  * retaining structural identity. This is intended for aggregate diagnostics;

@@ -32,9 +32,29 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (single writer per run; reads are diagnostic). */
-volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
+_Thread_local volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run (per lane thread) */
 volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+
+enum { SPURS_PM_MAX_WKL = 16 };
+static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];   /* per (workload, lane) */
+
+/* racacit: SPU thread-group local-store window. On hardware every SPU thread
+ * of a group sees its peers' local store at EA 0xF0000000 + n*0x100000 (the
+ * problem-state area follows at +0x40000). A Crack in Time's collision jobs
+ * rely on it: the broad-phase job publishes candidate records in its own LS
+ * (EA 0xF0007700) and the narrow-phase job, on another SPU, DMAs them out.
+ * Map such an EA onto the LS of the sibling PM lane (same workload). */
+uint8_t* spurs_lane_ls_window(spu_context* self, uint32_t ea)
+{
+    uint32_t off = ea - 0xF0000000u, n = off >> 20, lso = off & 0xFFFFFu;
+    if (ea < 0xF0000000u || n >= 6 || lso >= 0x40000u) return NULL;
+    for (uint32_t w = 0; w < SPURS_PM_MAX_WKL; w++)
+        for (uint32_t k = 0; k < 6; k++)
+            if (s_pm_ctx[w][k] == self)
+                return s_pm_ctx[w][n] ? s_pm_ctx[w][n]->ls + lso : NULL;
+    return NULL;
+}
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
@@ -57,7 +77,6 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
     enum { SPURS_PM_MAX_WKL = 16 };
-    static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     spu_context* ctx = s_pm_ctx[wid][spu_num];
     int first = 0;
@@ -100,7 +119,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
         if (!s_fresh) {
             static int _n = 0;
-            if (_n++ < 8)
+            if ((_n < 8 && (_n++, 1)))
                 fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
                         "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num,
                         (unsigned long long)s_pm_data[wid][spu_num],
@@ -115,8 +134,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->policy_mode = 1;
 
     /* PM image at its load base (first entry only -- LS persists). */
-    if (first)
+    if (first) {
         memcpy(ctx->ls + 0xA00, pm_host, pm_size);
+        extern void spu_registry_seal_image(int, const uint8_t*, uint32_t, uint32_t);
+        spu_registry_seal_image(image_id, ctx->ls, 0xA00, 0xA00 + pm_size);
+    }
 
     /* SpursKernelContext at LS 0x100 (fields big-endian, like all guest data). */
     uint8_t* ls = ctx->ls;
@@ -167,6 +189,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[4]._u32[3] = (uint32_t)(wkl_data >> 32);
     ctx->gpr[5]._u32[0] = 0;                           /* poll status */
 
+    /* racacit: deliver the SNR values the title wrote to this virtual SPU's
+     * thread (see cellSpursGetInfo / spurs_hle_write_snr). */
+    { extern int spurs_hle_get_snr(uint32_t, uint32_t, uint32_t, uint32_t*);
+      for (uint32_t k = 0; k < 2; k++) { uint32_t v;
+          if (ctx->ch_sig_notify[k].count != 0) continue;
+          /* Not written (yet): the titles seen so far write SPU i's SNR1 with
+           * i, so the lane index is the faithful default. */
+          if (!spurs_hle_get_snr(spurs_ea, spu_num, k, &v)) { if (k) continue; v = spu_num; }
+          spu_channel_write(&ctx->ch_sig_notify[k], v); } }
+
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
 
@@ -192,13 +224,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * concurrent lanes would interleave the buffer). */
     extern uint32_t g_pm_flow_buf[]; extern volatile unsigned g_pm_flow_n;
     extern void* volatile g_pm_flow_ctx;
-    extern volatile unsigned g_spu_putllc_count;
     extern volatile unsigned g_spu_putllc_sync_hit;
     extern uint32_t g_barrier_sync_watch;
     static int s_flow = -1;
     if (s_flow < 0) s_flow = getenv("SPURS_PM_FLOW") ? 1 : 0;
     unsigned putllc_before = g_spu_putllc_sync_hit;
-    (void)g_spu_putllc_count;
     /* Trace ONLY the stalled queue's own runs: wkl_data == the sync EA the PPU
      * barrier/ticket probes armed (ticket-pub arms it at first publish, before
      * the PM's first work pass). Idle re-runs of this wid matter as much as the
@@ -216,12 +246,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                    (s_flow_all ||
                     (g_barrier_sync_watch &&
                      (uint32_t)wkl_data == g_barrier_sync_watch)));
-    static volatile unsigned long long s_flow_arm_ms;
-    extern unsigned long long ps3_ms_now(void);
     if (tracing) {
         g_pm_flow_n = 0; g_pm_flow_ctx = ctx;
-        s_flow_arm_ms = ps3_ms_now();
-        { static int _a = 0; if (_a++ < 8) {
+        { static int _a = 0; if ((_a < 8 && (_a++, 1))) {
             fprintf(stderr, "[pm-flow] ARM wid=%u spu=%u (watch=0x%08X)\n",
                     wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
         /* Watchdog: the traced run has been observed to HANG the jobmanager
@@ -283,7 +310,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         unsigned stages = g_wws_batch_gets - batch_before;
         if (claims || stages) {
             static unsigned s_cl = 0;
-            if (s_cl++ < 64) {
+            if ((s_cl < 64 && (s_cl++, 1))) {
                 const uint8_t* L = ctx->ls;
                 #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
                 fprintf(stderr, "[pm-claim] wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "

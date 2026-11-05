@@ -1368,6 +1368,7 @@ static void decode_render_state(render_state_t* rs)
     memset(rs, 0, sizeof(*rs));
     rs->alpha_test_enable = rsx_dsp_reg(&g.rsx, M_ALPHA_TEST_ENABLE) & 1;
     rs->alpha_func = rsx_dsp_reg(&g.rsx, M_ALPHA_FUNC);
+    if (rs->alpha_func < 8u) rs->alpha_func |= 0x0200u;   /* 0..7 = 0x200..0x207 (rsx_draw_engine.c) */
     rs->alpha_ref_raw = rsx_dsp_reg(&g.rsx, M_ALPHA_REF);
     rsx_dsp_surface alpha_surface;
     rsx_dsp_get_surface(&g.rsx, &alpha_surface);
@@ -6324,138 +6325,6 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
         }
     }
     fflush(stderr);
-}
-
-typedef enum {
-    LD_COMPACT_EXPAND_OK = 1,
-    LD_COMPACT_EXPAND_DEGENERATE = 0,
-    LD_COMPACT_EXPAND_ALLOC = -1,
-    LD_COMPACT_EXPAND_PRIMITIVE = -2
-} ld_compact_expand_result;
-
-static void compact_vertex_copy(
-    u8* destination, u32 destination_vertex, u32 source_vertex)
-{
-    if (!dc.layout.stride)
-        return;
-    memcpy(
-        destination + (u64)destination_vertex * dc.layout.stride,
-        dc.compact_verts + (u64)source_vertex * dc.layout.stride,
-        dc.layout.stride);
-}
-
-static ld_compact_expand_result expand_compact_topology(
-    u32 prim, u8** expanded, u32* expanded_vertices, int* owned)
-{
-    *expanded = dc.compact_verts;
-    *expanded_vertices = 0;
-    *owned = 0;
-    const u32 segment_count = dc.n_cuts + 1;
-    switch (prim) {
-    case PRIM_TRIANGLES:
-        *expanded_vertices = dc.n_verts - dc.n_verts % 3;
-        break;
-    case PRIM_TRIANGLE_STRIP: {
-        if (dc.n_verts < 3)
-            return LD_COMPACT_EXPAND_DEGENERATE;
-        u32 total = 0;
-        for (u32 segment = 0; segment < segment_count; segment++) {
-            u32 begin, count;
-            rsx_restart_segment_bounds(
-                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
-            if (count >= 3) total += (count - 2) * 3;
-        }
-        if (!total)
-            return LD_COMPACT_EXPAND_DEGENERATE;
-        *expanded_vertices = total;
-        if (!dc.layout.stride)
-            break;
-        *expanded = (u8*)malloc((size_t)total * dc.layout.stride);
-        if (!*expanded)
-            return LD_COMPACT_EXPAND_ALLOC;
-        *owned = 1;
-        u32 write = 0;
-        for (u32 segment = 0; segment < segment_count; segment++) {
-            u32 begin, count;
-            rsx_restart_segment_bounds(
-                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
-            if (count < 3) continue;
-            for (u32 i = 0; i + 2 < count; i++) {
-                if (i & 1) {
-                    compact_vertex_copy(*expanded, write++, begin + i + 1);
-                    compact_vertex_copy(*expanded, write++, begin + i);
-                    compact_vertex_copy(*expanded, write++, begin + i + 2);
-                } else {
-                    compact_vertex_copy(*expanded, write++, begin + i);
-                    compact_vertex_copy(*expanded, write++, begin + i + 1);
-                    compact_vertex_copy(*expanded, write++, begin + i + 2);
-                }
-            }
-        }
-        break;
-    }
-    case PRIM_TRIANGLE_FAN: {
-        if (dc.n_verts < 3)
-            return LD_COMPACT_EXPAND_DEGENERATE;
-        u32 total = 0;
-        for (u32 segment = 0; segment < segment_count; segment++) {
-            u32 begin, count;
-            rsx_restart_segment_bounds(
-                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
-            if (count >= 3) total += (count - 2) * 3;
-        }
-        if (!total)
-            return LD_COMPACT_EXPAND_DEGENERATE;
-        *expanded_vertices = total;
-        if (!dc.layout.stride)
-            break;
-        *expanded = (u8*)malloc((size_t)total * dc.layout.stride);
-        if (!*expanded)
-            return LD_COMPACT_EXPAND_ALLOC;
-        *owned = 1;
-        u32 write = 0;
-        for (u32 segment = 0; segment < segment_count; segment++) {
-            u32 begin, count;
-            rsx_restart_segment_bounds(
-                dc.cuts, dc.n_cuts, dc.n_verts, segment, &begin, &count);
-            if (count < 3) continue;
-            for (u32 i = 1; i + 1 < count; i++) {
-                compact_vertex_copy(*expanded, write++, begin);
-                compact_vertex_copy(*expanded, write++, begin + i);
-                compact_vertex_copy(*expanded, write++, begin + i + 1);
-            }
-        }
-        break;
-    }
-    case PRIM_QUADS: {
-        const u32 quads = dc.n_verts / 4;
-        if (!quads)
-            return LD_COMPACT_EXPAND_DEGENERATE;
-        *expanded_vertices = quads * 6;
-        if (!dc.layout.stride)
-            break;
-        *expanded = (u8*)malloc(
-            (size_t)*expanded_vertices * dc.layout.stride);
-        if (!*expanded)
-            return LD_COMPACT_EXPAND_ALLOC;
-        *owned = 1;
-        u32 write = 0;
-        for (u32 quad = 0; quad < quads; quad++) {
-            const u32 base = quad * 4;
-            compact_vertex_copy(*expanded, write++, base);
-            compact_vertex_copy(*expanded, write++, base + 1);
-            compact_vertex_copy(*expanded, write++, base + 2);
-            compact_vertex_copy(*expanded, write++, base + 2);
-            compact_vertex_copy(*expanded, write++, base + 3);
-            compact_vertex_copy(*expanded, write++, base);
-        }
-        break;
-    }
-    default:
-        return LD_COMPACT_EXPAND_PRIMITIVE;
-    }
-    return *expanded_vertices
-        ? LD_COMPACT_EXPAND_OK : LD_COMPACT_EXPAND_DEGENERATE;
 }
 
 static u32 topology_index_count(u32 prim)
