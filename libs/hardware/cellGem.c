@@ -129,3 +129,14 @@ s32 cellGemEnableCameraPitchAngleCorrection(s32 enable)
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
     return CELL_OK;
 }
+
+/* cellGemGetMemorySize(s32 max_connect): the memory cellGemInit wants for that
+ * many controllers (RPCS3 cellGem.cpp: 0x120000 for up to two, 0x140000
+ * beyond; more than CELL_GEM_MAX_NUM is an error). inFAMOUS 2 asks before
+ * cellGemInit; unanswered, the import fell through to the unresolved stub. */
+s32 cellGemGetMemorySize(s32 max_connect)
+{
+    if (max_connect <= 0 || max_connect > CELL_GEM_MAX_NUM)
+        return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
+    return max_connect <= 2 ? 0x120000 : 0x140000;
+}

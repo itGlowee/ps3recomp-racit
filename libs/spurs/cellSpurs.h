@@ -30,18 +30,18 @@ extern "C" {
 #define CELL_SPURS_CORE_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x11)
 #define CELL_SPURS_CORE_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x09)
 
-#define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS | 0x21)
-#define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS | 0x22)
-#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS | 0x23)
-#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS | 0x24)
-#define CELL_SPURS_TASK_ERROR_SRCH              (CELL_ERROR_BASE_SPURS | 0x25)
-#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_ERROR_BASE_SPURS | 0x26)
-#define CELL_SPURS_TASK_ERROR_BUSY              (CELL_ERROR_BASE_SPURS | 0x2A)
-#define CELL_SPURS_TASK_ERROR_STAT              (CELL_ERROR_BASE_SPURS | 0x2F)
-#define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS | 0x30)
-#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x31)
-#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS | 0x32)
-#define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x29)
+#define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS_TASK | 0x01)
+#define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS_TASK | 0x02)
+#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS_TASK | 0x03)
+#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS_TASK | 0x04)
+#define CELL_SPURS_TASK_ERROR_SRCH              (CELL_ERROR_BASE_SPURS_TASK | 0x05)
+#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_ERROR_BASE_SPURS_TASK | 0x06)
+#define CELL_SPURS_TASK_ERROR_BUSY              (CELL_ERROR_BASE_SPURS_TASK | 0x0A)
+#define CELL_SPURS_TASK_ERROR_STAT              (CELL_ERROR_BASE_SPURS_TASK | 0x0F)
+#define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS_TASK | 0x10)
+#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS_TASK | 0x11)
+#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS_TASK | 0x0D)
+#define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS_TASK | 0x09)
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -85,6 +85,7 @@ typedef struct CellSpursTaskset CellSpursTaskset;
 typedef struct CellSpursTasksetAttribute CellSpursTasksetAttribute;
 typedef struct CellSpursTask CellSpursTask;
 typedef struct CellSpursTaskAttribute CellSpursTaskAttribute;
+typedef struct CellSpursTaskExitCode CellSpursTaskExitCode;
 typedef struct CellSpursEventFlag CellSpursEventFlag;
 typedef struct CellSpursWorkloadAttribute CellSpursWorkloadAttribute;
 
@@ -127,7 +128,8 @@ struct CellSpursTasksetAttribute {
     u32  flags;
     u64  args;
     u8   priority[CELL_SPURS_MAX_SPU];
-    u8   _padding[64];
+    u32  tasksetSize; /* host-layout attribute; retained through creation */
+    u8   _padding[60];
 };
 
 /* Task -- represents a unit of SPU work */
@@ -155,6 +157,18 @@ struct CellSpursTaskAttribute {
     u32  lsPattern_ea;
     u32  argument_ea;
     u8   _padding[48];
+};
+
+/* Guest-owned exit container: unlike the legacy host records above, both its
+ * 128-byte size and its guest address alignment are part of the API. */
+struct CellSpursTaskExitCode {
+#if defined(_MSC_VER)
+    __declspec(align(128)) u8 reserved[128];
+#elif defined(__cplusplus)
+    alignas(128) u8 reserved[128];
+#else
+    _Alignas(128) u8 reserved[128];
+#endif
 };
 
 /* Event flag -- SPURS-level event synchronization */
@@ -239,6 +253,7 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
+s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode);
 
 /* ---------------------------------------------------------------------------
  * Workload functions
@@ -284,8 +299,11 @@ s32 cellSpursEventFlagAttachLv2EventQueue(CellSpursEventFlag* eventFlag);
  * EAs, so they are taken as u64 and translated inside. */
 s32 cellSpursTaskGetReadOnlyAreaPattern(u64 pattern_ea, u64 elf_ea);
 s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea);
+s32 cellSpursBarrierInitialize(u64 taskset_ea, u64 barrier_ea, u32 total);
+s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea);
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size);
 s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
+s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);

@@ -29,7 +29,14 @@ extern "C" {
 /* Process / thread management */
 #define SYS_PROCESS_GETPID              1
 #define SYS_PROCESS_WAIT_FOR_CHILD      2
-#define SYS_PROCESS_EXIT                3
+#define SYS_PROCESS_EXIT3               3   /* sys_process_exit3: the number
+                                               * bare-metal/newlib images issue */
+#define SYS_PROCESS_EXIT                22  /* real lv2's _sys_process_exit,
+                                               * the exit every game issues
+                                               * (the kernel symbol carries a
+                                               * leading underscore; do not read
+                                               * this as "exit 2" -- 26 is a
+                                               * different call, _sys_process_exit2) */
 #define SYS_PROCESS_GET_STATUS          4
 #define SYS_PROCESS_DETACH_CHILD        5
 #define SYS_PROCESS_GET_NUMBER_OF_OBJECT 12
@@ -139,6 +146,7 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_TIMER_SLEEP                 142
 
 /* Time */
+#define SYS_TIME_GET_TIMEZONE           144
 #define SYS_TIME_GET_CURRENT_TIME       145
 #define SYS_TIME_GET_TIMEBASE_FREQUENCY 147
 

@@ -46,6 +46,7 @@
     #define host_poll           poll
 #endif
 
+#include "host_socket_send.h"
 #include "sysNet.h"
 #include "../../runtime/ppu/ppu_context.h"
 #include "../../runtime/ppu/ppu_memory.h"
@@ -131,6 +132,7 @@ static int32_t host_fail(void)
         case EBADF:         return fail(SYS_NET_EBADF);
         case ENOMEM:        return fail(SYS_NET_ENOMEM);
         case EINVAL:        return fail(SYS_NET_EINVAL);
+        case EPIPE:         return fail(SYS_NET_EPIPE);
         case EAGAIN:        return fail(SYS_NET_EWOULDBLOCK);
         case EINPROGRESS:   return fail(SYS_NET_EINPROGRESS);
         case EALREADY:      return fail(SYS_NET_EALREADY);
@@ -365,7 +367,7 @@ static int p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t
     a.sin_family = AF_INET;
     memcpy(&a.sin_addr, ip, 4);
     a.sin_port = htons(port);
-    return (int)sendto(s_sockets[s_p2p_dgram].host_fd, (const char*)buf, (int)len, 0,
+    return (int)sendto(s_sockets[s_p2p_dgram].host_fd, (const char*)buf, (int)len, PS3_NET_HOST_SEND_FLAGS,
                        (struct sockaddr*)&a, sizeof(a));
 }
 
@@ -604,7 +606,7 @@ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flag
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
-    int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0);
+    int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS);
     if (net_trace()) trace("send", s, n, NULL);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
@@ -621,7 +623,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
-    int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0,
+    int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS,
                    (struct sockaddr*)&a, sizeof(a));
     if (net_trace()) trace("sendto", s, n, &a);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
@@ -932,6 +934,29 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
  * Addresses and DNS
  * -----------------------------------------------------------------------*/
 
+int32_t sys_net_bnet_inet_pton(int32_t family, const char* src, void* dst)
+{
+    /* PS3's current host-socket backend supports AF_INET. Do not pass guest
+     * family numbers directly to the host: unsupported families are explicit.
+     * Unlike socket errors, inet_pton's failure return is -1, with errno. */
+    if (family != SYS_NET_AF_INET) {
+        (void)fail(SYS_NET_EAFNOSUPPORT);
+        return -1;
+    }
+    const char* text = GUEST_PTR(EA(src), const char*);
+    uint8_t* output = GUEST_PTR(EA(dst), uint8_t*);
+    if (!text || !output) {
+        (void)fail(SYS_NET_EFAULT);
+        return -1;
+    }
+    struct in_addr address;
+    int result = inet_pton(AF_INET, text, &address);
+    /* Parse into a temporary so invalid text never changes guest output.
+     * Copy bytes verbatim: the guest needs network order, not host integers. */
+    if (result == 1) memcpy(output, &address, sizeof(address));
+    return result;
+}
+
 int32_t sys_net_bnet_inet_aton(const char* cp, uint32_t* inp)
 {
     struct in_addr a;
@@ -1023,6 +1048,7 @@ static void h_getsockname(ppu_context* ctx) { RET_S(sys_net_bnet_getsockname(S32
 static void h_getpeername(ppu_context* ctx) { RET_S(sys_net_bnet_getpeername(S32(3), PTR(4), PTR(5))); }
 static void h_poll(ppu_context* ctx)        { RET_S(sys_net_bnet_poll(PTR(3), R32(4), S32(5))); }
 static void h_select(ppu_context* ctx)      { RET_S(sys_net_bnet_select(S32(3), PTR(4), PTR(5), PTR(6), PTR(7))); }
+static void h_inet_pton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_pton(S32(3), PTR(4), PTR(5))); }
 static void h_inet_aton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_aton(PTR(3), PTR(4))); }
 static void h_inet_addr(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_addr(PTR(3))); }
 static void h_inet_ntoa(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntoa(R32(3))); }
@@ -1046,6 +1072,7 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
         { "getpeername", h_getpeername }, { "socketpoll", h_poll },
         { "socketselect", h_select },     { "inet_aton", h_inet_aton },
         { "inet_addr", h_inet_addr },     { "inet_ntoa", h_inet_ntoa },
+        { "inet_pton", h_inet_pton },
         { "gethostbyname", h_gethostbyname },
         { "_sys_net_errno_loc", h_errno_loc },
         { "_sys_net_h_errno_loc", h_h_errno_loc },

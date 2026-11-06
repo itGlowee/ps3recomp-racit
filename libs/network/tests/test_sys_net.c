@@ -179,6 +179,30 @@ int main(void)
     assert((uint32_t)call("inet_addr", STR, 0, 0, 0, 0, 0) == 0x01020304u);
     uint32_t s = (uint32_t)call("inet_ntoa", LOOP, 0, 0, 0, 0, 0);
     assert(strcmp((const char*)vm_base + s, "127.0.0.1") == 0);
+    /* Real retail NID8AF3825E: AF_INET, source string, raw network bytes.
+     * Guard bytes catch host-endian stores and output-length mistakes. */
+    assert(ps3_compute_nid("inet_pton") == 0x8AF3825Eu);
+    const char* addresses[] = {"127.0.0.1", "1.2.3.4", "0.0.0.0", "255.255.255.255"};
+    const uint8_t expected[][4] = {{127,0,0,1},{1,2,3,4},{0,0,0,0},{255,255,255,255}};
+    for (unsigned i=0;i<4;i++) {
+        strcpy((char*)vm_base + STR, addresses[i]);
+        memset(vm_base + BUF, 0xA5, 8);
+        assert(C3("inet_pton", SYS_NET_AF_INET, STR, BUF+1) == 1);
+        assert(memcmp(vm_base + BUF+1, expected[i], 4) == 0);
+        assert(vm_base[BUF] == 0xA5 && vm_base[BUF+5] == 0xA5);
+    }
+    const char* invalid[] = {"", "1.2.3", "256.2.3.4", "127.1", "1.2.3.4 ", "::1", "host.example"};
+    for (unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+        strcpy((char*)vm_base + STR, invalid[i]);
+        memset(vm_base + BUF, 0xA5, 8);
+        assert(C3("inet_pton", SYS_NET_AF_INET, STR, BUF+1) == 0);
+        for (unsigned j=0;j<8;j++) assert(vm_base[BUF+j] == 0xA5);
+    }
+    /* Unknown families and invalid pointers fail; no fake valid address. */
+    assert(C3("inet_pton", 99, STR, BUF+1) == -1 && errno_cell() == 47);
+    assert(C3("inet_pton", SYS_NET_AF_INET, 0, BUF+1) == -1 && errno_cell() == 14);
+    assert(C3("inet_pton", SYS_NET_AF_INET, STR, 0) == -1 && errno_cell() == 14);
+    for (unsigned j=0;j<8;j++) assert(vm_base[BUF+j] == 0xA5);
     strcpy((char*)vm_base + STR, "localhost");
     uint32_t h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
     assert(h && vm_read32(h + 12) == 4);
@@ -225,22 +249,32 @@ int main(void)
     /* P2P streams: an instance's listener and the socket it connects out
      * with share its P2P port, so the peer accepts a connection whose source
      * port is the P2P port signaling reported -- titles check it. */
+    /* Each run needs fresh TCP endpoints: macOS keeps the previous fixed
+     * source/destination pair in TIME_WAIT when this fixture runs twice. */
+    s_p2p_port = 0;
     int32_t l1 = C3("socket", SYS_NET_AF_INET, 10 /* SOCK_STREAM_P2P */, 0);
     put_sockaddr(ADDR_A, LOOP, 4099);
     assert(C3("bind", l1, ADDR_A, 16) == 0 && C1("listen", l1) == 0);
-    s_p2p_port = 36659;
+    vm_write32(LEN, 16);
+    assert(C3("getsockname", l1, ADDR_B, LEN) == 0);
+    uint16_t port_l1 = vm_read16(ADDR_B + 2);
+    assert(port_l1 != 0);
     int32_t l2 = C3("socket", SYS_NET_AF_INET, 10, 0);
     int32_t out = C3("socket", SYS_NET_AF_INET, 10, 0);
     assert(C3("bind", l2, ADDR_A, 16) == 0 && C1("listen", l2) == 0);
+    vm_write32(LEN, 16);
+    assert(C3("getsockname", l2, ADDR_B, LEN) == 0);
+    s_p2p_port = vm_read16(ADDR_B + 2);
+    assert(s_p2p_port != 0 && s_p2p_port != port_l1);
     assert(C3("bind", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
-    assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == 36659);
-    vm_write16(ADDR_A + 8, 36658);               /* vport = the peer's P2P port */
+    assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == s_p2p_port);
+    vm_write16(ADDR_A + 8, port_l1);            /* vport = the peer's P2P port */
     assert(C3("connect", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
     int32_t in = C3("accept", l1, ADDR_B, LEN);
-    assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659 && vm_read16(ADDR_B + 8) == 36659);
-    s_p2p_port = 36658;
+    assert(in >= 0 && vm_read16(ADDR_B + 2) == s_p2p_port && vm_read16(ADDR_B + 8) == s_p2p_port);
+    s_p2p_port = port_l1;
 
     /* A stream a peer opened through psnr's relay arrives as a connected host
      * socket: the P2P listener turns readable, and accept hands it out as the

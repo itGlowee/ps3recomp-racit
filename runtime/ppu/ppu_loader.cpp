@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
+#include <atomic>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -31,11 +33,15 @@
 #endif
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
+#define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
+#include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
 #ifndef _WIN32
 #include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
 #include <signal.h>
@@ -345,6 +351,7 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ps3emu/log_first.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
@@ -669,6 +676,8 @@ static void samp_report(void)
 static DWORD s_samp_boot_tid;
 static int   s_samp_main = -1;
 static int   s_samp_stack = 0;
+static int   s_samp_drain = -1;
+extern "C" volatile unsigned long g_gcm_drain_tid;
 
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
@@ -709,6 +718,41 @@ extern "C" volatile uint32_t g_samp_lane_job[8];
  * sets its call-site key, 0 = none). PS3_SAMPLE_INWAIT=<hex> keeps only
  * samples taken while it is that one: what the lanes do while it waits. */
 extern "C" { volatile uint32_t g_racacit_main_wait_lr = 0; }
+/* PS3_SAMPLE_RVAS=<file>: every sample's address as an RVA of the executable,
+ * one hex word per line, appended at each report. 0 marks a sample outside the
+ * executable (a wait in ntdll, a DLL). The extent map above credits any host
+ * code that sits between two lifted functions to the first of them; naming
+ * these RVAs from the linker map (scripts/gow1hd.py symbolize does the
+ * parsing) attributes guest and runtime code exactly. */
+static FILE*     s_samp_rva_file;
+static uint32_t* s_samp_rvas;
+static uint32_t  s_samp_rva_n, s_samp_rva_cap;
+static void samp_rva_record(uintptr_t rip)
+{
+    if (!s_samp_rva_file) return;
+    static uintptr_t base, end;
+    if (!base) {
+        base = (uintptr_t)GetModuleHandleA(NULL);
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+        end = base + nt->OptionalHeader.SizeOfImage;
+    }
+    if (s_samp_rva_n == s_samp_rva_cap) {
+        uint32_t cap = s_samp_rva_cap ? s_samp_rva_cap * 2 : 65536;
+        uint32_t* n = (uint32_t*)realloc(s_samp_rvas, cap * sizeof *n);
+        if (!n) return;
+        s_samp_rvas = n; s_samp_rva_cap = cap;
+    }
+    s_samp_rvas[s_samp_rva_n++] = (rip >= base && rip < end) ? (uint32_t)(rip - base) : 0u;
+}
+static void samp_rva_flush(void)
+{
+    if (!s_samp_rva_file) return;
+    fprintf(s_samp_rva_file, "# %llu ms\n", (unsigned long long)GetTickCount64());  /* block end */
+    for (uint32_t i = 0; i < s_samp_rva_n; i++) fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    fflush(s_samp_rva_file);
+    s_samp_rva_n = 0;
+}
+
 static DWORD WINAPI samp_thread(LPVOID p)
 {
     unsigned period = (unsigned)(uintptr_t)p;
@@ -722,6 +766,14 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned ei = 0;
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
+    if (const char* f = getenv("PS3_SAMPLE_RVAS")) s_samp_rva_file = fopen(f, "w");
+    /* PS3_SAMPLE_MAIN and PS3_SAMPLE_DRAIN sample one thread: open it once
+     * rather than walk a snapshot of every thread in the process each period,
+     * which held the rate to about 17 samples a second. The drain's thread is
+     * known once it has walked the FIFO, and reopened if that changes. */
+    HANDLE main_h = (s_samp_main > 0)
+        ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, s_samp_boot_tid) : NULL;
+    DWORD one_tid = s_samp_main > 0 ? s_samp_boot_tid : 0;
     /* One thread (PS3_SAMPLE_RSX): no thread snapshot per sample, and a
      * ~4 kHz rate from a QPC spin instead of Sleep's 15.6 ms timer tick.
      * The host names the thread once it starts, after this one. */
@@ -817,6 +869,38 @@ static DWORD WINAPI samp_thread(LPVOID p)
         }
     }
     for (;;) {
+        if (s_samp_drain > 0 && g_gcm_drain_tid && g_gcm_drain_tid != one_tid) {
+            if (main_h) CloseHandle(main_h);
+            one_tid = (DWORD)g_gcm_drain_tid;
+            main_h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, one_tid);
+        }
+        if (main_h) {
+            if (SuspendThread(main_h) != (DWORD)-1) {
+                CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(main_h, &c)) {
+                    s_samp_total++;
+                    samp_rva_record((uintptr_t)c.Rip);
+                    uint32_t g = samp_lookup((uintptr_t)c.Rip);
+                    if (!g && s_samp_main > 0) g = samp_stack_guest(main_h, &c);
+                    if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(one_tid);
+                             samp_tid2(one_tid, 1, 0, g); }
+                    else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                           if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+                           samp_tid2(one_tid, 0, nt, 0); }
+                }
+                ResumeThread(main_h);
+            }
+            Sleep(period);
+            if (GetTickCount64() >= next_report) {
+                fprintf(stderr, "[samp] --- report at t=%llums ---\n",
+                        (unsigned long long)(GetTickCount64() - t0));
+                samp_report();
+                samp_rva_flush();
+                if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
+                else next_report = GetTickCount64() + 10000;
+            }
+            continue;
+        }
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
             THREADENTRY32 te; te.dwSize = sizeof te;
@@ -824,6 +908,11 @@ static DWORD WINAPI samp_thread(LPVOID p)
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
                 if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
                 if (g_samp_only_tid && te.th32ThreadID != g_samp_only_tid) continue;
+                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
+                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
+                 * histogram is the drain's own cost, not the spin loops of
+                 * every SPU thread. */
+                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -831,6 +920,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
                     if (GetThreadContext(h, &c)) {
                         s_samp_total++;
+                        samp_rva_record((uintptr_t)c.Rip);
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
                         if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
@@ -851,6 +941,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             fprintf(stderr, "[samp] --- report at t=%llums ---\n",
                     (unsigned long long)(GetTickCount64() - t0));
             samp_report();
+            samp_rva_flush();
             if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
             else next_report = GetTickCount64() + 10000;
         }
@@ -910,6 +1001,7 @@ void ps3_sampler_start(void)
     { char _hb[96]; snprintf(_hb, sizeof _hb, "[hosttid] %lu PPU main thread%c", (unsigned long)GetCurrentThreadId(), 10); fputs(_hb, stderr); }
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
     s_samp_stack = getenv("PS3_SAMPLE_STACK") ? 1 : 0;
+    s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
@@ -940,8 +1032,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. spu_coh_is_reserved reads a global that stays zero until an
- * SPU reserves its first line, so an ordinary store pays one branch. */
+ * work was posted. The stores test the bitmap inline (spu_coh_line_reserved):
+ * a pointer that stays NULL until an SPU reserves its first line, so an
+ * ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" unsigned char spu_coh_bitmap_g[];
 extern "C" volatile int spu_coh_armed_g;
@@ -1227,6 +1320,25 @@ extern "C" void ppu_resv_break_store(uint64_t ea)
             c->reserve_addr = PPU_RESV_INVALID;
     }
 }
+/* Break every PPU reservation in ea's 128-byte line, except the calling
+ * thread's own. The Cell reservation granule is the LINE, not the word: an SPU
+ * PUTLLC that rewrites other words of a line must fail a PPU lwarx/stwcx. on
+ * it, and the per-word value-CAS cannot see that. Havok keeps its job queue in
+ * lines both sides update; letting the PPU commit over an SPU update corrupted
+ * the queue into a cycle that an SPU task then walked forever.
+ * Called (via spu_coh_notify_write) for every write to an SPU-reserved line. */
+extern "C" void ppu_resv_break_line(uint32_t ea)
+{
+    const uint32_t line = ea & ~127u;
+    ppu_context* self = g_active_ctx;
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (c && c != self && c->reserve_addr < PPU_RESV_INVALID &&
+            ((uint32_t)c->reserve_addr & ~127u) == line)
+            c->reserve_addr = PPU_RESV_INVALID;
+    }
+}
 static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
 static inline void resv_lock(volatile LONG* L)
 {
@@ -1305,6 +1417,12 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
     if (coh) { spu_lockline_lock(); g_ppu_coh_stores++; }
+    /* Re-check under the lock-line lock: an SPU commit to this line between
+     * the check above and here has broken the reservation (SPU commits call
+     * ppu_resv_break_line with this lock held). */
+    if (coh && self && self->reserve_addr != (uint32_t)ea) {
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
@@ -1321,7 +1439,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
       if (s_cw == -2) { const char* e = getenv("PPU_CASWATCH"); s_cw = e ? (int64_t)(strtoul(e, 0, 16) & ~127u) : -1; }
       if (ok && s_cw >= 0 && ((uint32_t)ea & ~127u) == (uint32_t)s_cw) {
           static int n, nmax = -1; if (nmax < 0) { const char* m = getenv("PPU_CASWATCH_MAX"); nmax = m ? atoi(m) : 200; }
-          if (n++ < nmax)
+          if (PS3_LOG_FIRST(n, nmax))
               fprintf(stderr, "[caswatch] 0x%08X %08X -> %08X lr=0x%08X tid=%u\n", (uint32_t)ea, expected, val,
                       self ? (uint32_t)self->lr : 0u, self ? (unsigned)self->thread_id : 0u); } }
     /* PPU_CAS_FAIL=1: histogram the EAs whose store-conditional keeps FAILING.
@@ -1378,6 +1496,9 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
     if (coh) { spu_lockline_lock(); g_ppu_coh_stores++; }
+    if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
@@ -1441,7 +1562,7 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
              * misses precisely the writer we are hunting. */
             if ((guest & ~31u) == (s_guard_ea & ~31u)) {
                 static int _cs = 0;
-                if ((_cs < 6 && (_cs++, 1))) {
+                if (PS3_LOG_FIRST(_cs, 6)) {
                     /* The writer's own arguments, live. The guard fires INSIDE
                      * the writing routine, so for a memset/memcpy/arena-init
                      * these are (dst, value/src, length) in r3/r4/r5 -- i.e. the
@@ -1490,7 +1611,7 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
         { uint32_t nowv = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
           if (s_guard_pre && !nowv) {
               static int _z = 0;
-              if ((_z < 3 && (_z++, 1))) {
+              if (PS3_LOG_FIRST(_z, 3)) {
                   fprintf(stderr, "[GUARD] CLEARED 0x%08X: 0x%08X -> 0\n",
                           s_guard_ea, s_guard_pre);
                   /* The guard fires INSIDE the clearing routine, so the live guest
@@ -1551,7 +1672,7 @@ extern "C" uint32_t ppu_vm_size = 0;
  * the free window just below the mmapper region (0x11000000) and above any
  * game's high data segments, so it doesn't collide with the static image. */
 static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
-#define PPU_TLS_IMG   0x10F00000u
+#define PPU_TLS_IMG   VM_PPU_TLS_BASE
 #define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
 
 #ifdef _WIN32
@@ -1649,7 +1770,7 @@ static int vm_oob_report(uint32_t a, uint32_t n)
 #ifdef _WIN32
             /* one-shot backtrace on the first OOB so the lifted caller is known */
             static int bt = 0;
-            if ((bt < 3 && (bt++, 1))) {
+            if (PS3_LOG_FIRST(bt, 3)) {
                 void* fr[20]; USHORT m = RtlCaptureStackBackTrace(0, 20, fr, NULL);
                 HMODULE self = NULL;
                 GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1867,12 +1988,24 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
  * write hook can name the virtual method that is running when it writes a value. */
 static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
 static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
+/* Nesting depth of ps3_indirect_call on this host thread (the recursion guard
+ * in ps3_indirect_call_impl). A host coroutine that runs guest code and ends by
+ * switching away from inside an indirect call never unwinds its frames, so one
+ * count per thread only grows: every such coroutine leaks its depth, and once
+ * the sum passes the cap the guard skips every indirect call on that thread.
+ * A coroutine layer keeps one count per coroutine by saving *slot when it
+ * switches away and restoring it when it switches back; threads that never
+ * switch keep using their thread-local count. The vcall stack pointer leaks
+ * the same way. */
+static PPU_THREAD_LOCAL int      g_dispatch_depth = 0;
+extern "C" int* ps3_ppu_dispatch_depth_slot(void) { return &g_dispatch_depth; }
+extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 
 /* Every guest store commits through this: on a line no SPU has reserved (all of
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (vm_coh_reserved((uint32_t)(a))) {                                 \
+        if (spu_coh_line_reserved((uint32_t)(a))) {                           \
             spu_lockline_lock();                                              \
             g_ppu_coh_stores++;                                               \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
@@ -1885,9 +2018,18 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 
 extern "C" {
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
+/* -2 until PPU_RWATCH is read, -1 when unset. File scope so the gate below is
+ * one load inlined into every vm_read*, not a call. */
+static int64_t s_rwatch_lo = -2;
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra);
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
 {
-    static int64_t s_lo = -2; static uint32_t s_len = 0x10;
+    if (__builtin_expect(s_rwatch_lo == -1, 1)) return;
+    ppu_rwatch_hit_slow(a, width, ra);
+}
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra)
+{
+    int64_t& s_lo = s_rwatch_lo; static uint32_t s_len = 0x10;
     if (s_lo == -2) {
         const char* e = getenv("PPU_RWATCH");
         s_lo = e ? (int64_t)strtoul(e, 0, 16) : -1;
@@ -1948,15 +2090,47 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     if (s_on < 0) { const char* e = getenv("PS3_NULL_READ"); s_on = (e && *e == '0') ? 0 : 1; }
     if (!s_on) return;
     static long s_n = 0;
-    if (s_n++ >= 16) return;
+    if (!PS3_LOG_FIRST(s_n, 16)) return;
+    const uint32_t fn = ppu_prof_resolve_host(ra);
     fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
-            width * 8, a, a, ppu_prof_resolve_host(ra),
-            s_n == 16 ? "  [further NULL reads not reported]" : "");
+            width * 8, a, a, fn, s_n == 16 ? "  [further NULL reads not reported]" : "");
+    /* PS3_NULL_READ_STACK=1: guest-fn is the nearest host symbol, which can
+     * name a neighbour; the guest call chain names the reader. Once for each
+     * of the first four distinct guest-fn values. */
+    { static int s_stk = -1;
+      static uint32_t s_done[4]; static int s_nd = 0;
+      if (s_stk < 0) { const char* e = getenv("PS3_NULL_READ_STACK"); s_stk = (e && *e && *e != '0') ? 1 : 0; }
+      int seen = 0;
+      for (int i = 0; i < s_nd; i++) seen |= (s_done[i] == fn);
+      if (s_stk && !seen && s_nd < 4 && g_active_ctx) {
+          s_done[s_nd++] = fn;
+          ppu_dump_guest_stack(g_active_ctx, "null-read");
+      } }
     fflush(stderr);
     { static long trap_at = -2;   /* PS3_NULL_TRAP=<hex addr>: trap on that NULL read */
       if (trap_at == -2) { const char* e = getenv("PS3_NULL_TRAP"); trap_at = e ? (long)strtoul(e, 0, 16) : -1; }
       if (trap_at >= 0 && (uint32_t)trap_at == a) __builtin_trap(); }
 }
+
+/* ppu_recomp.h's inline loads (vm_read*_inl) skip the out-of-line accessors'
+ * probes, so they run only while no read diagnostic is armed; its inline
+ * stores (vm_write*_inl) likewise for the store diagnostics. */
+extern "C" int vm_inline_ok = 0;
+extern "C" int vm_inline_st_ok = 0;
+static struct VmInlineInit {
+    VmInlineInit() {
+        static const char* const vars[] = {
+            "PPU_RWATCH", "PPU_FORCE_READ_ADDR", "YDKJ_RWATCH", "PPU_RVAL", "PPU_RVAL64",
+            "PPU_HOTMAP", "PPU_HOTREAD", "PPU_SPINBT", 0 };
+        int d = 0;
+        for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
+        vm_inline_ok = !d;
+        static const char* const svars[] = { "PPU_WVAL", "PPU_WWATCH", "PT", 0 };
+        int sd = 0;
+        for (int i = 0; svars[i]; i++) if (getenv(svars[i])) sd = 1;
+        vm_inline_st_ok = !sd;
+    }
+} s_vm_inline_init;
 
 static __attribute__((noinline, cold)) uint8_t  vm_read8_slow (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
@@ -2051,7 +2225,7 @@ static __attribute__((noinline, cold)) uint32_t vm_read32_slow(uint64_t a) { if 
      * consumption; print the ORIGINAL truncating writer we recorded. */
     if (g_pt_val>=0 && g_last_rd_val==(uint32_t)g_pt_val) {
         for (int i=0;i<g_pt_n;i++) if (g_pt_live[i] && g_pt_addr[i]==(uint32_t)a) {
-            static int _rn=0; if ((_rn < 6 && (_rn++, 1))) { char rb[300]; pt_bt(rb,300);
+            static int _rn=0; if (PS3_LOG_FIRST(_rn, 6)) { char rb[300]; pt_bt(rb,300);
                 fprintf(stderr,"[PT-HIT] persistent trunc [0x%08X]=0x%08X\n  TRUNCATED-BY:%s\n  READ-BACK-BY:%s\n",
                         (uint32_t)a,(uint32_t)g_pt_val, g_pt_bt[i], rb); }
             g_pt_live[i]=0; break; } }
@@ -2071,8 +2245,8 @@ static __attribute__((noinline, cold)) uint32_t vm_read32_slow(uint64_t a) { if 
     /* PPU_RVAL=<hex>: catch where a value is READ FROM memory (its source loc) —
      * the complement to PPU_WVAL, to find the origin of the 0xC708C708 poison. */
     { static int64_t rv=-2; if (rv==-2){ const char* e=getenv("PPU_RVAL"); rv=e?(int64_t)strtoul(e,0,16):-1; }
-      if (rv>=0 && __builtin_bswap32(v)==(uint32_t)rv) { static int _n=0; if((_n < 8 && (_n++, 1))){
-        void* bt[20]; unsigned short fr=RtlCaptureStackBackTrace(0,20,bt,0);
+      if (rv>=0 && __builtin_bswap32(v)==(uint32_t)rv) { static int _n=0; if(PS3_LOG_FIRST(_n, 8)){
+        char* mb=(char*)GetModuleHandleA(0); void* bt[20]; unsigned short fr=RtlCaptureStackBackTrace(0,20,bt,0);
         char ln[820]; int p=snprintf(ln,sizeof ln,"[RVAL] read 0x%08X = 0x%08X guest:",(uint32_t)a,(uint32_t)rv);
         for(int i=0;i<fr && i<10;i++){ uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
           for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
@@ -2151,7 +2325,7 @@ static __attribute__((noinline, cold)) uint64_t vm_read64_slow(uint64_t a) { if 
 #ifdef _WIN32
     { static int64_t r6=-2; if(r6==-2){const char*e=getenv("PPU_RVAL64"); r6=e?(int64_t)strtoul(e,0,16):-1;}
       if(r6>=0){ uint64_t vb=__builtin_bswap64(v);
-        if((uint32_t)(vb>>32)==(uint32_t)r6 || (uint32_t)vb==(uint32_t)r6){ static int _n=0; if((_n < 12 && (_n++, 1))){
+        if((uint32_t)(vb>>32)==(uint32_t)r6 || (uint32_t)vb==(uint32_t)r6){ static int _n=0; if(PS3_LOG_FIRST(_n, 12)){
           void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
           char ln[820]; int p=snprintf(ln,sizeof ln,"[RVAL64] read64 0x%08X = 0x%016llX guest:",(uint32_t)a,(unsigned long long)vb);
           for(int i=0;i<fr && i<10;i++){ uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
@@ -2174,7 +2348,7 @@ extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
 extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
     static int n = 0;
-    if (n++ >= 64) return;
+    if (!PS3_LOG_FIRST(n, 64)) return;
     fprintf(stderr, "[ww-hle] 0x%08X <- 0x%llX (w%d) from an HLE (libs/)\n",
             addr, (unsigned long long)val, width);
     fflush(stderr);
@@ -2193,8 +2367,18 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
+/* -1 until read; 0 when neither PPU_WVAL nor PPU_WWATCH is set, which with no
+ * sync-line probe armed leaves every guest store one load and one compare. */
+static int s_store_watch = -1;
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra);
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    if (__builtin_expect(s_store_watch == 0, 1) && !g_barrier_sync_watch) return;
+    barrier_watch_hit_slow(a, v, width, ra);
+}
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ? 1 : 0;
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.
@@ -2221,7 +2405,7 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
       if (s_wv && v == s_wv && a >= s_wvlo && a < s_wvhi &&
           (!s_wvg || GetFileAttributesA(s_wvg) != INVALID_FILE_ATTRIBUTES)) {
           static int _n = 0;
-          if (_n++ < 24) {
+          if (PS3_LOG_FIRST(_n, 24)) {
               fprintf(stderr, "[wv] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
                       a, v, width, ppu_prof_resolve_host(ra));
               extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
@@ -2308,7 +2492,7 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
     if (!b) return;
     if (a >= b + 0x40 && a < b + 0xC0) {
         static int _n = 0;
-        if ((_n < 48 && (_n++, 1)))
+        if (PS3_LOG_FIRST(_n, 48))
             fprintf(stderr, "[sync-write] +0x%02X <- 0x%X (w%d) guest-fn=0x%08X\n",
                     a - b, v, width, ppu_prof_resolve_host(ra));
     }
@@ -2415,7 +2599,7 @@ void flow_record_alloc(unsigned int ptr, unsigned int size, unsigned int lr) {
 void flow_lookup_alloc(unsigned int p) {
     static int en = -1; if (en < 0) en = getenv("PS3_ALLOCTAG") ? 1 : 0;
     if (!en) return;
-    static int n = 0; if (n++ >= 4) return;
+    static int n = 0; if (!PS3_LOG_FIRST(n, 4)) return;
     const flow_alloc_rec* best = 0;
     for (int i = 0; i < 8192; i++) {
         const flow_alloc_rec& r = g_alloc_ring[i];
@@ -2473,7 +2657,7 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
         i = (i + 1) & PPU_HASH_MASK;
     }
     static int warned = 0;
-    if ((warned < 4 && (warned++, 1)))
+    if (PS3_LOG_FIRST(warned, 4))
         fprintf(stderr, "[ppu] function table full (%u/%u) -- raise PPU_HASH_BITS; "
                 "0x%08X dropped\n", g_fn_count, (unsigned)PPU_HASH_SIZE, a);
 }
@@ -2538,7 +2722,7 @@ extern "C" void ydkj_memmove_0036FA74(ppu_context* ctx)
     if (vm_base && dst <= 0x400240A8u && 0x400240A8u < dst + n) {
         uint32_t soff = 0x400240A8u - dst + src;
         uint32_t sval = __builtin_bswap32(*(volatile uint32_t*)(vm_base + soff));
-        static int _n=0; if((_n < 8 && (_n++, 1)))
+        static int _n=0; if(PS3_LOG_FIRST(_n, 8))
             fprintf(stderr,"[memfix] copy dst=0x%08X src=0x%08X n=0x%X -> 0x400240A8 gets src[0x%08X]=0x%08X\n",
                     dst, src, n, soff, sval);
     }
@@ -2583,6 +2767,36 @@ static uint32_t ppu_code_hi(void)
     return hi;
 }
 
+/* Whether a guest stack scan may read guest bytes [ea, ea+n).
+ *
+ * vm_oob() only bounds the arena. Inside it, vm_stack_allocate() leaves an
+ * inaccessible guard page below every guest thread's stack, so a scan that
+ * runs up past the top of a shallow stack lands on the guard of the stack
+ * allocated after it. On Windows the port's demand-commit handler turns that
+ * read into a commit; on POSIX it is a SIGSEGV, and the diagnostic takes the
+ * title down with it. Off Windows, ask the kernel first: write() from an
+ * unreadable page fails with EFAULT instead of faulting. */
+static bool ppu_dump_readable(uint32_t ea, uint32_t n)
+{
+    if (vm_oob(ea, n)) return false;
+#ifdef _WIN32
+    return true;
+#else
+    static int s_probe[2] = {-1, -1};
+    static const bool s_have_probe = pipe(s_probe) == 0;
+    if (!s_have_probe) return true;           /* cannot probe: read as before */
+    const uintptr_t pg    = (uintptr_t)vm_host_page_size();
+    const uintptr_t first = (uintptr_t)(vm_base + ea) & ~(pg - 1);
+    const uintptr_t last  = (uintptr_t)(vm_base + ea + n - 1) & ~(pg - 1);
+    for (uintptr_t a = first; a <= last; a += pg) {
+        char c;
+        if (write(s_probe[1], (const void*)a, 1) != 1) return false;
+        if (read(s_probe[0], &c, 1) != 1) return false;
+    }
+    return true;
+#endif
+}
+
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 {
     if (!ctx || !vm_base) return;
@@ -2612,8 +2826,8 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
                               (uint32_t)ctx->gpr[row * 8 + c]);
           fprintf(stderr, "%s\n", gr);
       } }
-    if (!vm_oob(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
-        for (int i=0;i<24 && !vm_oob(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
+    if (ppu_dump_readable(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
+        for (int i=0;i<24 && ppu_dump_readable(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
         fprintf(stderr,"%s\n",rw); }
     /* Identify the worker's dispatched method: func_000750A8 vcalls
      * [[arg+0xC]+0] (code) with toc [[arg+0xC]+4]. Dump for the known thread
@@ -2621,12 +2835,12 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
      * receive-loop function even though the thread stack has no return addrs. */
     { const uint32_t args[2] = {0x40003450u, 0x40003E80u};
       for (int j=0;j<2;j++){ uint32_t o=args[j];
-        if (vm_oob(o+0x10,4)) continue;
+        if (!ppu_dump_readable(o+0xC,8)) continue;
         uint32_t vt, code, toc; { uint32_t t;
           memcpy(&t,vm_base+o+0xC,4); vt=__builtin_bswap32(t);
           if (vt<0x600000 || vt>=0x50000000u) { /* vt could be a guest ptr */ }
         }
-        if (!vm_oob(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
+        if (ppu_dump_readable(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
           memcpy(&t,vm_base+vt+4,4); toc=__builtin_bswap32(t);
           fprintf(stderr,"      ARG[0x%08X] vtbl=0x%08X -> method code=0x%08X toc=0x%08X (worker body?)\n", o, vt, code, toc); }
       } }
@@ -2645,10 +2859,10 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     { char bc[900]; int bp = snprintf(bc, sizeof bc, "[GSTACK:%s] chain:", tag ? tag : "?");
       uint32_t f = sp;
       for (int d = 0; d < 24 && bp < 820; d++) {
-          if (vm_oob(f, 8)) break;
+          if (!ppu_dump_readable(f, 8)) break;
           uint32_t t; memcpy(&t, vm_base + f + 4, 4);   /* low half of the 64-bit back chain */
           uint32_t prev = __builtin_bswap32(t);
-          if (prev <= f || vm_oob(prev + 0x14, 4)) break;   /* stacks grow down */
+          if (prev <= f || !ppu_dump_readable(prev + 0x14, 4)) break;   /* stacks grow down */
           memcpy(&t, vm_base + prev + 0x14, 4);         /* low half of the saved lr */
           uint32_t ra = __builtin_bswap32(t);
           if (ra >= 0x10000 && ra < ppu_code_hi()) {
@@ -2664,7 +2878,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     char gs[1200]; int gp = snprintf(gs, sizeof gs, "[GSTACK:%s] sp=0x%08X:", tag ? tag : "?", sp);
     uint32_t last = 0;
     for (int i = 0; i < 700 && gp < 1100; i++) {
-        uint32_t a = sp + i*4; if (vm_oob(a,4)) break;
+        uint32_t a = sp + i*4; if (!ppu_dump_readable(a,4)) break;
         uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= ppu_code_hi()) continue;
         uint32_t bg = 0;
@@ -2688,7 +2902,7 @@ int ppu_alloc_probe(void* vctx, uint32_t size, uint32_t obj, uint32_t sp)
     if (!en) return 0;
     if (size < 0x40000000u) return 0;            /* sane size -> ignore */
     static int n = 0;
-    if (n++ >= 6) return 0;
+    if (!PS3_LOG_FIRST(n, 6)) return 0;
     ppu_context* ctx = (ppu_context*)vctx;
     fprintf(stderr, "\n[ALLOCPROBE] size=0x%08X (%d) obj=0x%08X sp=0x%08X lr=0x%08X bswap(size)=0x%08X\n",
             size, (int)size, obj, sp, (uint32_t)ctx->lr, __builtin_bswap32(size));
@@ -2698,7 +2912,7 @@ int ppu_alloc_probe(void* vctx, uint32_t size, uint32_t obj, uint32_t sp)
     char gs[1400]; int gp = snprintf(gs, sizeof gs, "      GSTACK-codeptrs:");
     uint32_t last = 0;
     for (int i = 0; i < 900 && gp < 1300; i++) {
-        uint32_t a = sp + i*4; if (vm_oob(a,4)) break;
+        uint32_t a = sp + i*4; if (!ppu_dump_readable(a,4)) break;
         uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= 0x900000) continue;
         uint32_t bg = 0;
@@ -2732,7 +2946,7 @@ void ppu_dbg4(const char* tag, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
     if (en < 0) en = getenv("ALLOCPROBE") ? 1 : 0;
     if (!en) return;
     static int n = 0;
-    if (n++ >= 16) return;
+    if (!PS3_LOG_FIRST(n, 16)) return;
     fprintf(stderr, "[DBG:%s] a=0x%08X b=0x%08X c=0x%08X d=0x%08X\n", tag, a, b, c, d);
 }
 
@@ -2847,6 +3061,18 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
  * call before (phase 0) and after (phase 1) it runs; null = none. */
 extern "C" { void (*g_ps3_icall_observer)(ppu_context*, uint32_t, int) = nullptr; }
 static void ps3_indirect_call_observed(ppu_context* ctx);
+/* ps3_indirect_call_to: dispatch to an explicit guest target with CTR left as
+ * the guest had it (b<cond>lrl branches through LR; CTR must not change). */
+static PPU_THREAD_LOCAL uint32_t g_icall_target;
+static PPU_THREAD_LOCAL int      g_icall_target_set;
+extern "C" void ps3_indirect_call(ppu_context* ctx);
+extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
+{
+    g_icall_target = target;
+    g_icall_target_set = 1;
+    ps3_indirect_call(ctx);
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     if (g_ps3_icall_observer) { ps3_indirect_call_observed(ctx); return; }
@@ -2903,13 +3129,14 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
       if(bc){ unsigned t=(unsigned)ctx->thread_id & 63; g_bc_last[t]=(uint32_t)ctx->ctr; g_bc_cnt[t]++; } }
 #ifdef _WIN32
     { static int64_t tw=-2; if(tw==-2){const char*e=getenv("PPU_TOCWATCH"); tw=e?(int64_t)strtoul(e,0,16):-1;}
-      if(tw>=0 && (uint32_t)ctx->gpr[2]==(uint32_t)tw){ static int _n=0; if((_n < 4 && (_n++, 1))){
+      if(tw>=0 && (uint32_t)ctx->gpr[2]==(uint32_t)tw){ static int _n=0; if(PS3_LOG_FIRST(_n, 4)){
         char* mb=(char*)GetModuleHandleA(0); void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
         char ln[800]; int p=snprintf(ln,sizeof ln,"[TOCWATCH] r2=0x%08X ctr=0x%08X bt:",(uint32_t)ctx->gpr[2],(uint32_t)ctx->ctr);
         for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
         fprintf(stderr,"%s\n",ln); } } }
 #endif
     uint32_t addr = (uint32_t)ctx->ctr;
+    if (g_icall_target_set) { addr = g_icall_target; g_icall_target_set = 0; }
     /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
      * generic visibility into vtable/callback dispatch (e.g. which job body a
      * JobManager worker runs). */
@@ -3078,7 +3305,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
                 uint32_t _c = __builtin_bswap32(*(volatile uint32_t*)(vm_base + _opd));
                 if (_c && (_c & 3) == 0) {
                     static int _n2 = 0;
-                    if ((_n2 < 8 && (_n2++, 1)))
+                    if (PS3_LOG_FIRST(_n2, 8))
                         fprintf(stderr, "[ppu] OPD-RECOVER: ctr=0 -> dispatching opd[0]=0x%08X\n", _c);
                     addr = _c;
                 }
@@ -3090,7 +3317,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * error code. Tokyo Jungle: cellAudioSetNotifyEventQueue(key=0x23A0)
          * "failed" with status 0x23A0 -- the key itself. Say so."*/
         static int n = 0;
-        if (n++ < 400)
+        if (PS3_LOG_FIRST(n, 400))
         { char who[64]; ppu_guest_caller(who, sizeof who);
           if (n <= 400) {
             /* The lifted import thunk leaves the OPD address it loaded in r12,
@@ -3147,7 +3374,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         ppu_fn fn2 = ppu_lookup(toc_reg);
         if (fn2) {
             static int _n = 0;
-            if ((_n < 8 && (_n++, 1))) fprintf(stderr, "[ppu] OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
+            if (PS3_LOG_FIRST(_n, 8)) fprintf(stderr, "[ppu] OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
             ctx->gpr[2] = addr;        /* callee TOC = the (TOC) value from the code slot */
             addr = toc_reg; ctx->ctr = toc_reg;
             fn = fn2;
@@ -3157,10 +3384,10 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
          * and blow the host stack. Cap the depth, log once, then unwind. */
-        static thread_local int s_depth = 0;
+        int& s_depth = g_dispatch_depth;
         if (s_depth > 4000) {
             static int warned = 0;
-            if ((warned < 8 && (warned++, 1)))
+            if (PS3_LOG_FIRST(warned, 8))
                 fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_depth);
             return;
         }
@@ -3187,7 +3414,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         /* PPU_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3)
          * equals this, pinning the exact virtual method that produces the poison. */
         { static int64_t rw=-2; if(rw==-2){const char*e=getenv("PPU_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
-          if(rw>=0 && (uint32_t)ctx->gpr[3]==(uint32_t)rw){ static int _n=0; if((_n < 8 && (_n++, 1))){
+          if(rw>=0 && (uint32_t)ctx->gpr[3]==(uint32_t)rw){ static int _n=0; if(PS3_LOG_FIRST(_n, 8)){
             fprintf(stderr,"[RETWATCH] vcall -> func_%08X returned r3=0x%08X\n", addr, (uint32_t)rw);
 #ifdef _WIN32
             void* bt[16]; unsigned short fr=RtlCaptureStackBackTrace(0,16,bt,0);
@@ -3227,9 +3454,9 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
           if(_nv && ((tgt & 3u)!=0u || tgt < 0x10000u || tgt >= 0x40000000u)) _invalid = true; }
         if (_invalid) {
             static int _gn = 0;
-            if ((_gn < 12 && (_gn++, 1))) fprintf(stderr, "[ppu] garbage vcall -> 0x%08X this=0x%08X (uninit/stale object) -- no-op, r3=0\n", tgt, (uint32_t)ctx->gpr[3]);
+            if (PS3_LOG_FIRST(_gn, 12)) fprintf(stderr, "[ppu] garbage vcall -> 0x%08X this=0x%08X (uninit/stale object) -- no-op, r3=0\n", tgt, (uint32_t)ctx->gpr[3]);
 #ifdef _WIN32
-            if (getenv("PPU_VCALL_BT")) { static int _b=0; if((_b < 4 && (_b++, 1))){
+            if (getenv("PPU_VCALL_BT")) { static int _b=0; if(PS3_LOG_FIRST(_b, 4)){
                 char* mb=(char*)GetModuleHandleA(0); void* bt[26]; unsigned short fr=RtlCaptureStackBackTrace(0,26,bt,0);
                 char ln[820]; int p=snprintf(ln,sizeof ln,"      GVBT this=0x%08X r2=0x%08X lr=0x%08X rva:",(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[2],(uint32_t)ctx->lr);
                 for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
@@ -3473,12 +3700,26 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
 extern "C" int lv2_try_syscall(ppu_context* ctx);
+extern "C" int64_t sys_mmapper_allocate_address(ppu_context* ctx);
+extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out);
 
 /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+/* cellGcmSys.c, when linked. ppu_hle.cpp already holds a weak reference, and
+ * under COFF a second weak declaration emits a second fallback definition, so
+ * every port failed to link. On Windows use the linker's own default instead. */
+#if defined(_MSC_VER)   /* MSVC and clang-cl: link.exe/lld-link */
+extern "C" void ppu_gcm_pump(void);
+extern "C" void ppu_gcm_pump_absent(void) {}
+#pragma comment(linker, "/alternatename:ppu_gcm_pump=ppu_gcm_pump_absent")
+#define PPU_GCM_PUMP_LINKED 1
+#else
+extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
+#define PPU_GCM_PUMP_LINKED (ppu_gcm_pump != nullptr)
+#endif
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3495,6 +3736,15 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           const char* e = getenv("PPU_GUARD_EA");
           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
+    /* Deliver pending GCM vblank/flip/user callbacks at the timer sleeps too,
+     * not only at HLE imports (ppu_hle.cpp): on hardware they fire
+     * asynchronously, and a guest thread that polls with usleep alone would
+     * otherwise never see the handler it is waiting for. inFAMOUS 2 defers its
+     * FIFO put to the flip handler (0x13AC88 stores it at obj+72, 0x13AC34
+     * writes it) and then spins in 0x13ACE8 on the ref register with
+     * sys_timer_usleep only; it used to be rescued by another thread's HLE
+     * call, and hung once that thread had nothing left to poll. */
+    if ((num == 141 || num == 142) && PPU_GCM_PUMP_LINKED) ppu_gcm_pump();
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
@@ -3504,11 +3754,19 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * A thread blocked in a syscall shows no in-flight HLE (syscalls do not go
      * through ps3_hle_call) and a stale CTR, so without this a wedged thread is
      * just "somewhere in ntdll". Cleared on every exit path by the guard. */
+    /* It also closes the PS3_FTRACE span: how long this thread sat in the
+     * syscall, and at which guest call site (lr at entry). */
     struct _ScGuard {
-        ppu_context* c;
+        ppu_context* c; uint64_t num, t0; uint32_t lr;
         ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0; }
-    } _sg{ ctx };
+                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
+                      if (PS3_FT_ON() && t0) {
+                          const uint64_t t1 = ps3_ft_now();
+                          if (num == 141) ps3_ft_usleep(t, lr, t0, t1);   /* sys_timer_usleep */
+                          else if (t1 - t0 >= ps3_ft_min_ns())
+                              ps3_ft_span(PS3_FT_SYSCALL, t, (uint32_t)num, lr, t0, t1);
+                      } }
+    } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
@@ -3519,22 +3777,22 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */
     { static int64_t ws=-2; if(ws==-2){ws=getenv("PS3_SCTRACE_TID")?1:0;}
-      if(ws && ctx->thread_id==1){ static int _n=0; if(_n++<60)
+      if(ws && ctx->thread_id==1){ static int _n=0; if(PS3_LOG_FIRST(_n, 60))
         fprintf(stderr,"[WORKERSC tid1 #%d] syscall %llu r3=%08X r4=%08X r5=%08X r6=%08X\n",
           _n,(unsigned long long)num,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); } }
     /* One-shot: resolve the guest function that makes the flag=100 spin syscall
      * (num=141 r3=0x64), so we can inspect its lifted arg setup (is mode=garbage a
      * lift bug or a real uninit-object field?). */
-    if (num==141 && (uint32_t)ctx->gpr[3]==0x64) { static int _s=0; if((_s < 3 && (_s++, 1))){
-        void* ra=__builtin_return_address(0);
+    if (num==141 && (uint32_t)ctx->gpr[3]==0x64) { static int _s=0; if(PS3_LOG_FIRST(_s, 3)){
+        void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(0);
         uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
         for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
         fprintf(stderr,"[sc-caller] flag=100 syscall from func_%08X+0x%llX (r5/mode=0x%08X r7/timeout=0x%08X lr=0x%08X)\n",
                 bg,(unsigned long long)(tgt-bh),(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[7],(uint32_t)ctx->lr); } }
     /* Trace the port_send(port=1) sender (the cri kick): who sends it + the data
      * (data=0 seen -> is the decode-job payload null? a real uninit field?). */
-    if (num==138 && (uint32_t)ctx->gpr[3]==1) { static int _s=0; if((_s < 4 && (_s++, 1))){
-        void* ra=__builtin_return_address(0);
+    if (num==138 && (uint32_t)ctx->gpr[3]==1) { static int _s=0; if(PS3_LOG_FIRST(_s, 4)){
+        void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(0);
         uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
         for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
         fprintf(stderr,"[sc-caller] port_send(port=1) from func_%08X+0x%llX data=0x%08X/0x%08X/0x%08X\n",
@@ -3550,16 +3808,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
                    * u64 alignment, u32* alloc_addr) -> reserve guest VA range */
-        static uint32_t s_next_va = 0x11000000u;   /* just past the loaded image */
-        uint32_t size  = (uint32_t)ctx->gpr[3];
-        uint32_t align = (uint32_t)ctx->gpr[5];
-        uint32_t out   = (uint32_t)ctx->gpr[6];
-        if (align < 0x100000u) align = 0x100000u;   /* 1 MB min */
-        s_next_va = (s_next_va + align - 1) & ~(align - 1);
-        uint32_t va = s_next_va;
-        s_next_va += (size + 0xFFFFFu) & ~0xFFFFFu;
-        if (out) vm_write32(out, va);
-        ctx->gpr[3] = 0;
+        int64_t rc = sys_mmapper_allocate_address(ctx);
+        ctx->gpr[3] = (uint64_t)rc;
         return;
     }
     case 337: {   /* sys_mmapper_search_and_map(u32 start_addr, u32 mem_id,
@@ -3572,20 +3822,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t start  = (uint32_t)ctx->gpr[3];
         uint32_t mem_id = (uint32_t)ctx->gpr[4];
         uint32_t outp   = (uint32_t)ctx->gpr[6];
-        static uint32_t s_map_next = 0;
-        if (!s_map_next) s_map_next = start ? start : 0x11000000u;
         uint32_t size = ps3_mmapper_block_size(mem_id);
         if (!size) size = 0x100000u;
-        uint32_t va = s_map_next;
-        s_map_next = (s_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
-        /* MAP the block, don't just name it. This handed back an address into
-         * MEM_RESERVE, so the page only ever came into existence if the PPU
-         * happened to touch it first (the boot harness commits on fault; a
-         * port with its own main() does not even do that). An SPU-written
-         * output buffer is the case that breaks: the SPU is the FIRST writer,
-         * its DMA guard sees an uncommitted EA and skips the transfer, and the
-         * job's results are silently dropped. */
-        vm_commit(va, size);
+        uint32_t va = 0;
+        int64_t rc = sys_mmapper_search_map_address(start, size, &va);
+        if (rc != CELL_OK) {
+            ctx->gpr[3] = (uint64_t)rc;
+            return;
+        }
         if (outp) vm_write32(outp, va);
         ctx->gpr[3] = 0;
         return;
@@ -3656,7 +3900,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 bt[bn] = 0;
                 if (strstr(bt, pat)) {
                     static int tn = 0;
-                    if ((tn < 3 && (tn++, 1))) {
+                    if (PS3_LOG_FIRST(tn, 3)) {
                         fprintf(stderr, "%c[TTY_BT] \"%.90s\"%c", 10, bt, 10);
                         ppu_log_host_chain("tty-bt");
                     }
@@ -3675,7 +3919,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 strstr(pt, "sentinel") || strstr(pt, "double-deallocate") ||
                 strstr(pt, "out of memory on request")) {
                 static int pc = 0;
-                if ((pc < 3 && (pc++, 1))) { fprintf(stderr, "\n[POOLTRACE] \"%.90s\"\n", pt); ppu_log_host_chain("pool-corrupt"); }
+                if (PS3_LOG_FIRST(pc, 3)) { fprintf(stderr, "\n[POOLTRACE] \"%.90s\"\n", pt); ppu_log_host_chain("pool-corrupt"); }
             }
         }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title's tty output carries a
@@ -3759,7 +4003,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             static long s_minms = -1;
             if (s_minms < 0) { const char* e = getenv("PS3_SCBLOCK_MINMS"); s_minms = e ? atol(e) : 150; }
             if ((_dt >= (ULONGLONG)s_minms || (num==130 && _dt >= 8 && s_minms <= 150)) && (s_only < 0 || (long)num == s_only)) {
-                static int _bn=0; if ((_bn < 40 && (_bn++, 1))) {
+                static int _bn=0; if (PS3_LOG_FIRST(_bn, 40)) {
                 void* ra=__builtin_return_address(0);
                 uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
                 for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
@@ -3813,6 +4057,20 @@ static uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); 
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
 static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32(p + 4); }
 
+/* Loaded image ranges remain live during entry-stack construction and later
+ * allocations. BSS is owned too, even though it has no file-backed bytes. */
+struct ppu_image_range { uint64_t begin, end; };
+static std::vector<ppu_image_range> g_ppu_image_ranges;
+extern "C" void sys_memory_set_image_query(uint64_t (*query)(uint64_t, uint64_t));
+
+static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
+{
+    uint64_t next = addr;
+    for (const auto& r : g_ppu_image_ranges)
+        if (addr < r.end && r.begin < end && r.end > next) next = r.end;
+    return next;
+}
+
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
     FILE* f = fopen(path, "rb");
@@ -3833,6 +4091,8 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     uint16_t phentsize = be16(file + 54);
     uint16_t phnum = be16(file + 56);
 
+    g_ppu_image_ranges.clear();
+    sys_memory_set_image_query(ppu_image_overlap_end);
     int loaded = 0;
     for (uint16_t i = 0; i < phnum; i++) {
         uint64_t ph_off = phoff + (uint64_t)i * phentsize;
@@ -3874,6 +4134,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         memcpy(vm_base + (uint32_t)p_vaddr, file + p_offset, (size_t)p_filesz);
         if (p_memsz > p_filesz)
             memset(vm_base + (uint32_t)p_vaddr + (uint32_t)p_filesz, 0, (size_t)(p_memsz - p_filesz));
+        g_ppu_image_ranges.push_back({p_vaddr, p_vaddr + (p_memsz > p_filesz ? p_memsz : p_filesz)});
         loaded++;
     }
     free(file);
@@ -3970,7 +4231,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
                           if (memcmp(vm_base + keep_ea, keep, keep_len)) {
                               memcpy(vm_base + keep_ea, keep, keep_len);
                               static int n = 0;
-                              if ((n < 8 && (n++, 1))) fprintf(stderr, "[keep] restored 0x%08X%c", keep_ea, 10);
+                              if (PS3_LOG_FIRST(n, 8)) fprintf(stderr, "[keep] restored 0x%08X%c", keep_ea, 10);
                           }
                           Sleep(2);
                       } } };
@@ -4020,19 +4281,30 @@ extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
  * block; this is the same thing for the static path.
  *
  * ponytail: bump allocator, never freed. A thread's block is dead once it
- * exits, but the window holds dozens and titles create their threads at boot
- * and keep them. Reuse a free list if a title ever churns threads. */
+ * exits, but the 1 MB window holds about 250 page-sized blocks (for a small
+ * TLS image) and titles create their threads at boot and keep them. Reuse a
+ * free list if a title ever churns threads. */
 static uint32_t ppu_tls_new_block(void)
 {
     if (!g_tls_memsz) return 0;                 /* no PT_TLS: nothing to copy */
-    uint32_t total = (g_tls_memsz + 0x7000u + 0xFFFu) & ~0xFFFu;
+    /* A block holds the TLS image only. r13 = base + 0x7000 is the ABI's bias
+     * (the guest addresses TLS as r13 - 0x7000 + off with off < memsz), not
+     * storage: counting the 0x7000 in the size made every block 0x8000, so the
+     * 1 MB window held 31 threads and the 32nd onwards shared the main block. */
+    uint32_t total = (g_tls_memsz + 0xFFFu) & ~0xFFFu;
     uint32_t lim   = 0x11000000u;               /* same bound the main block uses */
     if (ppu_vm_size && ppu_vm_size < lim) lim = ppu_vm_size;
     /* Threads are created concurrently, so hand out offsets atomically. */
     static uint32_t s_bump = 0;
     uint32_t off  = __atomic_fetch_add(&s_bump, total, __ATOMIC_RELAXED);
     uint32_t base = PPU_TLS_IMG + total + off;  /* main block occupies the first */
-    if (base + total > lim) return 0;           /* out of room: share, as before */
+    if (base + total > lim) {                   /* out of room: share, as before */
+        static int s_warned = 0;
+        if (!__atomic_exchange_n(&s_warned, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[ppu] TLS window full after %u thread blocks: later "
+                    "threads share the main thread's TLS\n", (unsigned)(off / total));
+        return 0;
+    }
     if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);
     if (g_tls_memsz > g_tls_filesz)
         memset(vm_base + base + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
@@ -4092,6 +4364,75 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* The guest stack an HLE -> guest callback runs on.
+ *
+ * This used to be the fixed EA 0xCFFE0000 in every host thread (the variable
+ * was thread-local, its value was not). The movie player's cellAdec and cellVdec
+ * callbacks run synchronously on two different MoviePlayerStream threads, so
+ * they built their frames over each other: the adec callback's scoped mutex
+ * guard (func_005F0CA8, guard at 0xCFFDFE50) read back a NULL mutex pointer,
+ * unlocked NULL (the [null-write] at 0x005EF018 / [null-read] of 0x8 in the
+ * hung runs) and left the player mutex locked for good -- the next lock of it
+ * (func_005EEFE4) never returned. 0xCFFE0000 is also inside RSX local memory
+ * (0xC0000000 + 256 MB), so VRAM writes could land on it as well.
+ *
+ * lv2 runs these callbacks on a real PPU thread with a stack of its own (the
+ * decoder's thread, or the thread that asked for the callback). Give every
+ * host thread its own 256 KB slot in VM_CB_STACK_REGION, and start a nested
+ * callback below the live frame of the one it is nested in. */
+/* Slots in use, one bit each. A host thread takes the lowest free one on its
+ * first callback and gives it back when it exits (cb_slot_owner below), so a
+ * title that starts and ends threads all session -- a movie player starts
+ * several per movie -- never runs out: only more than 64 host threads making
+ * callbacks AT ONCE share a slot. */
+static std::atomic<uint64_t> s_cb_slots_used{0};
+struct cb_slot_owner {
+    int slot = -1;
+    ~cb_slot_owner()
+    {
+        if (slot >= 0) s_cb_slots_used.fetch_and(~(1ull << slot), std::memory_order_acq_rel);
+    }
+};
+static thread_local cb_slot_owner t_cb_slot;
+
+static uint32_t ppu_cb_stack_sp(const ppu_context* active)
+{
+    static PPU_THREAD_LOCAL uint32_t s_lo = 0, s_hi = 0;
+    if (!s_hi) {
+        const uint32_t slots = VM_CB_STACK_REGION / VM_CB_STACK_SIZE;
+        static_assert(VM_CB_STACK_REGION / VM_CB_STACK_SIZE <= 64, "one bit per slot");
+        uint32_t i = slots;
+        uint64_t used = s_cb_slots_used.load(std::memory_order_acquire);
+        while (~used & (slots >= 64 ? ~0ull : (1ull << slots) - 1u)) {
+            uint32_t k = 0;
+            while (used >> k & 1u) k++;
+            if (s_cb_slots_used.compare_exchange_weak(used, used | (1ull << k),
+                                                      std::memory_order_acq_rel)) {
+                i = k;
+                t_cb_slot.slot = (int)k;
+                break;
+            }
+        }
+        if (i < slots) {
+            s_lo = VM_CB_STACK_BASE + i * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+        } else {
+            /* Out of slots: share the last one, and say so. */
+            s_lo = VM_CB_STACK_BASE + (slots - 1) * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+            fprintf(stderr, "[ppu] guest_call: more than %u live host threads make guest "
+                            "callbacks; callback stack slot %u is SHARED\n", slots, slots - 1);
+        }
+    }
+    if (active) {
+        uint32_t sp = (uint32_t)active->gpr[1];
+        /* Nested: below the outer callback's frame and its 288-byte protected zone. */
+        if (sp > s_lo + 0x1000 && sp <= s_hi) return (sp - 0x400) & ~0xFu;
+    }
+    /* Room above the first frame for the callee's LR/CR save words (sp+8, sp+16). */
+    return (s_hi - 0x100) & ~0xFu;
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -4116,14 +4457,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
         return 0; }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -4163,12 +4499,9 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -4191,13 +4524,20 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     return ctx.gpr[3];
 }
 
+extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
-    /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
-     * (stderr); with a redirected block-buffered stdout, printf lines sat in
-     * the buffer for minutes and were LOST when the run was killed -- which
-     * made "the log line is absent" unusable as evidence. */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* HLE logs mix printf (stdout) with probe fprintf (stderr); with a
+     * redirected block-buffered stdout and nothing flushing it, printf lines
+     * sat in the buffer for minutes and were LOST when the run was killed --
+     * which made "the log line is absent" unusable as evidence. This used to
+     * set stdout unbuffered, which with mingw-w64 costs one write() per
+     * character. ps3_stdio_init() buffers stdout and stderr and flushes them
+     * every PS3_STDIO_FLUSH_MS (50 ms), at exit, on abort and on a crash, so a
+     * killed run loses at most one interval (runtime/platform/ps3_stdio.h).
+     * PS3_STDIO_UNBUFFERED=1 restores the old unbuffered stdout. */
+    ps3_stdio_init();
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
     uint32_t code = 0, toc = 0;
@@ -4219,6 +4559,9 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
       ctx.thread_id = ppu_thread_register_main();
       extern void ppu_thread_set_main_stack(uint32_t, uint32_t);
       ppu_thread_set_main_stack(stack_top, 0x00100000u); }
+    /* For samplers on other threads (a port's periodic stack dump): the main
+     * thread's context lives on this frame, not in the thread table. */
+    g_ppu_main_ctx = &ctx;
 
     /* PS3 process-entry ABI: the loader hands _start register state the CRT
      * (_initialize) consumes directly:
@@ -4284,10 +4627,37 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
             }
         }
 
-        uint32_t argv_base = 0x00B00000u;          /* scratch in the .data/heap gap */
-        /* argc_n argv pointers, a NULL argv terminator, then a NULL envp. */
-        uint32_t slots     = (argc_n + 2u) * 8u;
-        uint32_t str_addr  = argv_base + ((slots + 0x1Fu) & ~0x1Fu);
+        /* Reserve entry arguments at the top of the caller-provided main
+         * stack, above a fresh ABI frame. Guest frames grow down from the new
+         * SP, so the strings live until process exit without claiming a fixed
+         * "gap" inside an ELF or the title's heap. The caller already owns this
+         * stack reservation; no later thread/heap allocation may reuse it.
+         * Bound the reservation to 64 KiB of the normal 1 MiB main stack. */
+        uint32_t slots = (argc_n + 2u) * 8u;
+        uint64_t strings_offset = (slots + 0x1Fu) & ~uint64_t(0x1F);
+        uint64_t bytes = strings_offset;
+        for (uint32_t a = 0; a < argc_n; a++)
+            bytes += (strlen(argp[a]) + 1u + 0xFu) & ~uint64_t(0xF);
+        const uint32_t entry_frame = 0x80;  /* linkage + register argument area */
+        uint64_t reserve = (entry_frame + bytes + 0x1Fu) & ~uint64_t(0x1F);
+        uint64_t top = stack_top & ~uint64_t(0x1F);
+        uint64_t vm_end = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+        if (reserve > 0x10000 || top > vm_end || top < VM_MAIN_MEM_BASE + reserve) {
+            fprintf(stderr, "[ppu] invalid entry argument stack reservation\n");
+            return -1;
+        }
+        uint32_t entry_sp = (uint32_t)(top - reserve);
+        for (const auto& range : g_ppu_image_ranges) {
+            if (entry_sp < range.end && top > range.begin) {
+                fprintf(stderr, "[ppu] entry argument stack overlaps loaded image\n");
+                return -1;
+            }
+        }
+        ctx.gpr[1] = entry_sp;
+        for (uint32_t off = 0; off < entry_frame; off += 8)
+            vm_write64(entry_sp + off, 0);
+        uint32_t argv_base = entry_sp + entry_frame;
+        uint32_t str_addr = argv_base + (uint32_t)strings_offset;
         uint32_t sp_cur    = str_addr;
         for (uint32_t a = 0; a < argc_n; a++) {
             uint32_t j = 0;
@@ -4307,6 +4677,8 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
          * an empty boot device before deadlocking on a data.toc it never loaded. */
         ctx.gpr[3] = argc_n;                        /* argc */
         ctx.gpr[4] = argv_base;                     /* argv */
+        ctx.gpr[5] = argv_base + (argc_n + 1u) * 8u; /* envp (NULL-terminated) */
+        ctx.gpr[6] = 0;                             /* envc */
         /* Read back: demand-committed pages can swallow a write, and a silently
          * empty argv is hard to recognise from the guest side. */
         for (uint32_t a = 0; a < argc_n; a++) {
@@ -4318,7 +4690,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
         }
         fprintf(stderr, "[ppu] argc=%u argv=0x%08X\n", argc_n, argv_base);
     }
-    fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
+    fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, (uint32_t)ctx.gpr[1]);
     g_active_ctx = &ctx;
     ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
     ppu_inl_cfg_refresh();     /* the lifted code's memory gate, now that the host is set up */

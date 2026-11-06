@@ -21,6 +21,16 @@ static SceNpBasicPresenceHandler s_presence_handler = NULL;
 static void* s_handler_arg = NULL;
 static SceNpBasicPresence s_own_presence;
 
+/* sceNpBasic is usable once sceNpInit has run: in the SDK a title calls
+ * sceNpInit and then sceNpBasic*, and many never call sceNpBasicInit. Checking
+ * only Basic's own flag answered NOT_INITIALIZED to every presence, message
+ * and handler call of such a title. sceNpBasicInit still works for callers
+ * that use it. sceNp.h and this file's header cannot share a translation
+ * unit, so the accessor is declared here (defined in sceNp.c; the name
+ * stays outside the cell/sys/sce prefixes gen_hle_nids.py exports). */
+int np_is_initialized(void);
+static int basic_ready(void) { return s_initialized || np_is_initialized(); }
+
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -79,7 +89,7 @@ s32 sceNpBasicRegisterHandler(SceNpBasicEventHandler handler,
 {
     printf("[sceNpBasic] RegisterHandler()\n");
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     s_event_handler = handler;
@@ -92,7 +102,7 @@ s32 sceNpBasicUnregisterHandler(void)
 {
     printf("[sceNpBasic] UnregisterHandler()\n");
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     s_event_handler = NULL;
@@ -118,7 +128,7 @@ s32 sceNpBasicGetFriendListEntry(u32 index, SceNpBasicFriendListEntry* entry)
     (void)index;
     (void)entry;
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
@@ -130,7 +140,7 @@ s32 sceNpBasicGetFriendPresence(const SceNpOnlineId* onlineId,
     (void)onlineId;
     (void)presence;
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
@@ -141,7 +151,7 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
     presence = GUEST_PTR(presence, const SceNpBasicPresence*);
     printf("[sceNpBasic] SetPresence()\n");
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     if (!presence)
@@ -161,7 +171,7 @@ s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
     printf("[sceNpBasic] SendMessage(to=%.16s)\n",
            to ? to->data : "(null)");
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_NOT_CONNECTED;
@@ -179,7 +189,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
            to ? to->data : "(null)",
            subject ? subject : "(null)");
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_NOT_CONNECTED;
@@ -195,7 +205,7 @@ s32 sceNpBasicSendInGameInvitation(const SceNpOnlineId* to,
     printf("[sceNpBasic] SendInGameInvitation(to=%.16s)\n",
            to ? to->data : "(null)");
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_NOT_CONNECTED;
@@ -207,7 +217,7 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
     (void)data;
     (void)dataMaxSize;
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     if (dataSize)
@@ -231,7 +241,7 @@ s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
     printf("[sceNpBasic] AddBlockListEntry(%.16s)\n",
            onlineId ? onlineId->data : "(null)");
 
-    if (!s_initialized)
+    if (!basic_ready())
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     /* No-op in offline mode */

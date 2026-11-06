@@ -8,11 +8,14 @@ Step-by-step guide to recompiling your first PS3 game.
 
 - **CMake** 3.20 or later: [cmake.org](https://cmake.org/download/)
 - **C/C++ compiler** with C17 and C++20 support:
-  - Windows: Visual Studio 2022 (MSVC 17+) or Clang 14+
-  - Linux: GCC 12+ or Clang 14+
-  - macOS: Xcode 14+ (Apple Clang)
-- **Python** 3.9+: Required for the recompiler tools
-- **Ninja** (recommended): Faster than Make/MSBuild -- `pip install ninja`
+  - Windows: Visual Studio 2022 with clang-cl. Plain `cl` builds the runtime library (see BUILDING.md), but a lifted game needs clang-cl (Step 6)
+  - Linux: GCC or Clang
+  - macOS: Xcode (Apple Clang)
+  - CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
+- **Python** 3.10+ (CI uses 3.12): Required for the recompiler tools
+- **Ninja**: Faster than Make/MSBuild and what the commands in this guide use -- `pip install ninja`
+
+Prefer not to build from source? Each [release](https://github.com/sp00nznet/ps3recomp/releases/latest) includes a prebuilt SDK bundle per platform (see the README's Downloads paragraph).
 
 ### Required Game Files
 
@@ -25,7 +28,7 @@ Step-by-step guide to recompiling your first PS3 game.
 ### Python Dependencies
 
 ```bash
-pip install -r tools/requirements.txt
+pip install -r requirements.txt   # run from the repository root
 ```
 
 ## Installation
@@ -64,8 +67,8 @@ here ever stops matching the tools:
 ```bash
 python tools/ppu_loader.py  game/EBOOT.ELF -o out/          # 1. image, OPD functions, imports
 python tools/ppu_lifter.py  game/EBOOT.ELF --functions out/EBOOT.functions.json \
-                            --hle-stubs out/EBOOT.imports.json -o src/recomp/   # 2. lift
-python tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp   # 3. HLE handler table
+                            --hle-stubs out/EBOOT.imports.json -o recompiled/   # 2. lift
+python tools/gen_hle_nids.py --all --out recompiled/ppu_hle_nids.cpp   # 3. HLE handler table
 cmake -B build -G Ninja && cmake --build build                      # 4. build
 ```
 
@@ -131,7 +134,7 @@ python tools/gen_imports.py game/EBOOT.ELF -o out/imports_named.json
 ```bash
 cp -r templates/project/ my_game/
 cd my_game/
-# Edit config.toml -- set the elf_path
+# config.toml is reference only (no tool reads it yet); the paths go on the command lines below
 # Edit CMakeLists.txt -- set the project name
 ```
 
@@ -141,7 +144,7 @@ cd my_game/
 python ../tools/ppu_lifter.py game/EBOOT.ELF \
     --functions out/EBOOT.functions.json \
     --hle-stubs out/EBOOT.imports.json \
-    --output src/recomp/
+    --output recompiled/
 ```
 
 This writes `ppu_recomp.h` plus `ppu_recomp_NNN.cpp` chunks (which can total
@@ -164,6 +167,52 @@ whatever word it read, which is the next trampoline's own first instruction:
 `ps3_hle_call(<nid>, ctx)`, so both direct `bl` and indirect calls to it reach
 the HLE handler.
 
+### Step 4b: Lift SPU programs (only if the title has SPU code)
+
+Skip this if the title never starts SPU programs. Otherwise the SPU ELFs are
+embedded in the PPU binary (and sometimes in other decrypted files), and each
+one is lifted to C separately from the PPU code. `tools/extract_spu_images.py`
+finds them, `tools/spu_lifter.py` lifts one image, and
+`tools/build_spu_workloads.py` runs the lifter over a directory of images and
+writes the registration file:
+
+```bash
+python ../tools/extract_spu_images.py game/EBOOT.ELF --output spu/images
+python ../tools/build_spu_workloads.py \
+    --images spu/images --lifted spu --out spu/spu_workloads.c --constructor
+```
+
+`build_spu_workloads.py --input FILE` (repeatable) does the discovery itself,
+so the first command is only needed if you want to look at the images.
+`tools/lift_jobmods.py` does the same for SPURS job modules (raw code and
+data blobs, not ELFs; `SPU_DUMP_MISS=<dir>` collects the ones that only exist
+at run time) once they are saved as `.bin` files (`--jobmods DIR --out spu`, optionally
+`--merge-chunks`); see [Game Porting Guide](GAME_PORTING_GUIDE.md#lifting-spu-programs).
+
+**The project template can run the discovery and lift at configure time.**
+`PORT_ENABLE_SPU` (default `ON`) and `PORT_SPU_INPUTS` (a semicolon-separated
+list of decrypted ELF/PRX files to scan) are in `templates/project/CMakeLists.txt`;
+the helper is `cmake/PS3RecompSPU.cmake`:
+
+```bash
+cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp -DRECOMP_DIR=$PWD/recompiled \
+    '-DPORT_SPU_INPUTS=game/EBOOT.ELF'
+```
+
+Without `PORT_SPU_INPUTS`, the template compiles any `spu/*/spu_recomp.c` it
+finds, plus `spu_workloads.c`, `jobmods_register.c` and
+`taskset_policy_bytes.c` when they exist.
+
+The generated file registers each lifted image with the runtime by content
+fingerprint (`spu_workload_register` / `spu_workload_register_img` in
+`runtime/spu/spu_workload.c`); cellSpurs then runs the lifted code when the
+game hands it a matching image. SPU code that is not lifted (for example a job
+body the game DMAs into local store at run time) is not an error: it runs in
+the SPU interpreter (`runtime/spu/spu_interp.c`), slower, and when it branches
+to a lifted entry the lifted code resumes
+([SPU_INTERPRETER_LIFTED_HANDOFF.md](SPU_INTERPRETER_LIFTED_HANDOFF.md)).
+The lifter itself is documented in [SPU_LIFTER.md](SPU_LIFTER.md).
+
 ### Step 5: Generate the HLE handler table
 
 Lifting produces the game's own code. It does **not** produce the bridge from
@@ -171,7 +220,7 @@ firmware NIDs to this runtime's HLE implementations — that is a separate
 generated file:
 
 ```bash
-python ../tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp
+python ../tools/gen_hle_nids.py --all --out recompiled/ppu_hle_nids.cpp
 ```
 
 Compile the result into the port along with the lifted sources. It defines
@@ -181,7 +230,7 @@ it still links, which is why the omission is not a build error. The runtime
 warns at startup when it ends up with no handlers registered.
 
 **The project template does this for you.** Its `CMakeLists.txt` generates the
-every-module table at configure time unless `src/recomp/ppu_hle_nids.cpp`
+every-module table at configure time unless `recompiled/ppu_hle_nids.cpp`
 already exists, so this step only needs running by hand in a build system you
 rolled yourself — which is exactly where it gets forgotten.
 
@@ -196,7 +245,7 @@ reaches the table in the first place. Do both.
 ### Step 6: Build the Recompiled Game
 
 ```bash
-cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp
+cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp -DRECOMP_DIR=$PWD/recompiled
 cmake --build build
 ```
 
@@ -255,7 +304,7 @@ After setup, your project should look like:
 ```
 my_game/
   CMakeLists.txt          # Build configuration
-  config.toml             # Recompiler settings
+  config.toml             # Reference only: not read by the tools yet
   main.cpp                # Entry point (from template)
   stubs.cpp               # Game-specific overrides
   out/                    # ppu_loader.py stage-1 output
@@ -263,14 +312,12 @@ my_game/
     EBOOT.imports.json
     EBOOT.image.json
     EBOOT.loader.json
-  src/
-    recomp/               # Generated by ppu_lifter.py
-      ppu_recomp.h
-      ppu_recomp_000.cpp
-      ppu_recomp_001.cpp
-      ...
-    gen/
-      ppu_hle_nids.cpp    # Generated by gen_hle_nids.py
+  recompiled/             # RECOMP_DIR: generated by ppu_lifter.py
+    ppu_recomp.h
+    ppu_recomp_000.cpp
+    ppu_recomp_001.cpp
+    ...
+    ppu_hle_nids.cpp      # Optional, from gen_hle_nids.py (CMake generates one in build/ if absent)
   build/                  # CMake build directory
 ```
 
@@ -316,7 +363,7 @@ the loop waits on is never written (see `[HOTREAD]` above).
 
 ### Crash on startup / segfault
 
-- Enable `break_on_unimplemented = true` in `config.toml` and run under a debugger.
+- Run under a debugger. (`break_on_unimplemented` in `config.toml` has no effect yet: nothing reads that file.)
 - Check that the ELF was properly decrypted (wrong keys produce garbage code).
 - Verify memory layout: some games require specific address ranges.
 
@@ -328,6 +375,8 @@ the loop waits on is never written (see `[HOTREAD]` above).
 - See [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for the full graphics architecture.
 
 ### Audio crackling or silence
+
+The `config.toml` settings below are reference only: nothing reads that file yet.
 
 - Check that `cellAudio` is set to `"hle"` in modules config.
 - Verify the audio backend matches your OS (`wasapi` for Windows, `pulseaudio` for Linux).

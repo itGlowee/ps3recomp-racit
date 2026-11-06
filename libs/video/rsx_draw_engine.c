@@ -2648,11 +2648,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
-        rsx_vp_branch_bits = branch_bits;
+        rsx_vp_set_branch_bits(branch_bits);   /* ps3recomp v0.18: the decompiler keeps the bits */
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        rsx_vp_branch_bits = 0;
+        rsx_vp_set_branch_bits(0);
         rsx_fp_shadow_mask = shadow_mask;
         rsx_fp_biased_mask = dyn_tex ? 0u : biased_mask;
         rsx_fp_gamma_mask = dyn_tex ? 0u : gamma_mask;

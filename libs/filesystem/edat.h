@@ -47,6 +47,16 @@ int edat_decrypt_file(const char* in_path, const char* out_path);
  * it is newer than the source. Set PS3_EDAT=0 to disable the whole path. */
 const char* edat_resolve(const char* host_path, char* buf, size_t cap);
 
+/* Hand the runtime a klicensee the guest supplied. On hardware a game that owns
+ * free (license type 3) or disc-bound EDATs passes its own klicensee to
+ * sceNpDrmIsAvailable / sceNpDrmIsAvailable2 before opening them; the kernel keeps
+ * it and decrypts later opens with it. These keys are title-specific and live in
+ * the game's code, so a runtime cannot carry them: it has to take them from the
+ * guest call. Registered keys are tried before the built-in ones, and each one is
+ * still checked against the file's dev_hash before use. Up to 16 are kept (a
+ * duplicate is ignored). */
+void edat_add_klicensee(const uint8_t klic[16]);
+
 /* Self-check of the AES-128 and AES-CMAC primitives against the FIPS-197 and
  * RFC 4493 vectors. Returns 0 if both match. Run once on first use: silently
  * wrong crypto here produces plausible-looking garbage, which is the single most

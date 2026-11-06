@@ -319,6 +319,24 @@ static const struct { const char* name; uint8_t key[16]; } KLIC_CANDIDATES[] = {
                         0xFC,0x87,0x9E,0x74,0x33,0x43,0xBB,0x4F } },  /* PSP Remasters  */
 };
 
+/* Klicensees the guest passed to sceNpDrmIsAvailable[2] (edat_add_klicensee). */
+#define EDAT_GUEST_KLIC_MAX 16
+static uint8_t s_guest_klic[EDAT_GUEST_KLIC_MAX][16];
+static int     s_guest_klic_n = 0;
+
+void edat_add_klicensee(const uint8_t klic[16])
+{
+    if (!klic) return;
+    for (int i = 0; i < s_guest_klic_n; i++)
+        if (memcmp(s_guest_klic[i], klic, 16) == 0) return;
+    if (s_guest_klic_n >= EDAT_GUEST_KLIC_MAX) {
+        fprintf(stderr, "[edat] klicensee table full -- ignoring a new key\n");
+        return;
+    }
+    memcpy(s_guest_klic[s_guest_klic_n++], klic, 16);
+    fprintf(stderr, "[edat] guest klicensee #%d registered\n", s_guest_klic_n);
+}
+
 static const uint8_t NP_OMAC_KEY_2[16] = {
     0x6B,0xA5,0x29,0x76,0xEF,0xDA,0x16,0xEF,0x3C,0x33,0x9F,0xB2,0x97,0x1E,0x25,0x6B };
 static const uint8_t SDAT_KEY[16] = {
@@ -488,23 +506,41 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
         fprintf(stderr, "[edat] SDAT: key derived from dev_hash\n");
         have_key = 1;
     } else {
+        /* dev_hash = AES-CMAC(klic ^ NP_OMAC_KEY_2) over header bytes 0x00..0x5F.
+         * The check is the same for NPD versions 2, 3 and 4 (version 3 only adds
+         * the metadata ECDSA signature, which a reader may skip). Keys from the
+         * guest first: a title's own klicensee is the common case for game data,
+         * the built-in ones only cover the platform-wide free/PSX/PSP keys. */
+        const int n_builtin = (int)(sizeof KLIC_CANDIDATES / sizeof KLIC_CANDIDATES[0]);
         int found = -1;
-        for (int c = 0; c < (int)(sizeof KLIC_CANDIDATES / sizeof KLIC_CANDIDATES[0]); c++) {
+        const uint8_t* found_key = NULL;
+        for (int c = 0; c < s_guest_klic_n + n_builtin && found < 0; c++) {
+            const uint8_t* k = (c < s_guest_klic_n) ? s_guest_klic[c]
+                                                    : KLIC_CANDIDATES[c - s_guest_klic_n].key;
             uint8_t ck[16], mac[16];
-            for (int i = 0; i < 16; i++)
-                ck[i] = (uint8_t)(KLIC_CANDIDATES[c].key[i] ^ NP_OMAC_KEY_2[i]);
+            for (int i = 0; i < 16; i++) ck[i] = (uint8_t)(k[i] ^ NP_OMAC_KEY_2[i]);
             aes128_cmac(ck, hdr, 0x60, mac);
-            if (memcmp(mac, dev_hash, 16) == 0) { found = c; break; }
+            if (memcmp(mac, dev_hash, 16) == 0) { found = c; found_key = k; }
         }
         if (found >= 0 && (license & 3) == 3) {
-            memcpy(key, KLIC_CANDIDATES[found].key, 16);
+            memcpy(key, found_key, 16);
             have_key = 1;
-            fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n",
-                    KLIC_CANDIDATES[found].name);
+            if (found < s_guest_klic_n)
+                fprintf(stderr, "[edat] guest klicensee #%d verified against dev_hash\n", found + 1);
+            else
+                fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n",
+                        KLIC_CANDIDATES[found - s_guest_klic_n].name);
         } else if (edat_rif_key(in_path, key)) {
             have_key = 1;
             fprintf(stderr, "[edat] license type %u: using the supplied RIF key%s\n",
                     license, found >= 0 ? "" : " (dev_hash names an unknown klicensee)");
+        }
+        if (!have_key && (license & 3) == 3) {
+            fprintf(stderr,
+                "[edat] license type 3 (free): no known klicensee verifies dev_hash.\n"
+                "[edat]   The title's klicensee comes from its own sceNpDrmIsAvailable[2]\n"
+                "[edat]   call (edat_add_klicensee); open the file after that call.\n");
+            fclose(in); return -6;
         }
         if (!have_key) {
             fprintf(stderr,

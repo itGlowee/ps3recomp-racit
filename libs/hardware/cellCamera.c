@@ -236,3 +236,22 @@ s32 cellCameraRemoveNotifyCallback(s32 devNum)
     (void)devNum;
     return CELL_OK;
 }
+
+/* The lv2-event-queue notification forms: the title binds a queue it owns to
+ * camera events (cellCameraSetNotifyEventQueue2) and later unbinds it. The
+ * virtual camera raises no events, so there is nothing to bind; accept, so
+ * the Move/camera init that asks (inFAMOUS 2's "Motion Controller Update")
+ * carries on instead of hitting the unresolved stub. */
+s32 cellCameraSetNotifyEventQueue2(u64 key, u64 source, u64 flag)
+{
+    (void)key; (void)source; (void)flag;
+    if (!s_initialized) return (s32)CELL_CAMERA_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellCameraRemoveNotifyEventQueue2(u64 key)
+{
+    (void)key;
+    if (!s_initialized) return (s32)CELL_CAMERA_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}

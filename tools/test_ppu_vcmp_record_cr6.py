@@ -39,8 +39,8 @@ L = _load("ppu_lifter", "tools/ppu_lifter.py")
 
 
 def _lift_one(mnemonic, operands):
-    insns = [SimpleNamespace(addr=0x1000, mnemonic=mnemonic, operands=operands),
-             SimpleNamespace(addr=0x1004, mnemonic="blr", operands="")]
+    insns = [SimpleNamespace(addr=0x1000, mnemonic=mnemonic, operands=operands, raw=None),
+             SimpleNamespace(addr=0x1004, mnemonic="blr", operands="", raw=None)]
     func = L.PPULifter().lift_function(insns, 0x1000, 0x1008)
     return "\n".join(ln for ln in func.body_lines if "return" not in ln)
 

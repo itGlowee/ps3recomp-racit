@@ -33,6 +33,7 @@ typedef int http_socket_t;
 #define HTTP_INVALID_SOCKET (-1)
 #define http_closesocket close
 #endif
+#include "host_socket_send.h"
 
 /* Guest-EA marshalling: the generic HLE adapter passes PPC r3.. verbatim, so
  * pointer arguments are guest effective addresses, not host pointers. Translate
@@ -153,7 +154,7 @@ static int http_send_all(http_socket_t sock, const char* data, u32 len)
 {
     u32 total = 0;
     while (total < len) {
-        int n = send(sock, data + total, (int)(len - total), 0);
+        int n = send(sock, data + total, (int)(len - total), PS3_NET_HOST_SEND_FLAGS);
         if (n <= 0)
             return -1;
         total += (u32)n;
@@ -385,14 +386,15 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
     if (!method || !uri || !transId)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    /* CellHttpUri is { const char* scheme, hostname, path, username,
-     * password; u32 port; } -- five 4-byte EAs then the port, twenty bytes
-     * to the guest against forty to us, so nothing but scheme lines up if
-     * you cast. Pull each field out by guest offset. */
+    /* CellHttpUri is { const char* scheme, hostname, username, password,
+     * path; u32 port; u8 reserved[4]; } -- five 4-byte EAs then the port,
+     * twenty-eight bytes to the guest, so nothing but scheme lines up if you
+     * cast. Pull each field out by guest offset: the path is the fifth
+     * pointer (+16); +8 is the username, NULL in most requests. */
     u32 uri_ea = (u32)(uintptr_t)uri;
     u32 ea_scheme   = vm_read32(uri_ea +  0);
     u32 ea_hostname = vm_read32(uri_ea +  4);
-    u32 ea_path     = vm_read32(uri_ea +  8);
+    u32 ea_path     = vm_read32(uri_ea + 16);
     u32 uri_port    = vm_read32(uri_ea + 20);
     const char* uri_scheme   = ea_scheme   ? (const char*)(vm_base + ea_scheme)   : NULL;
     const char* uri_hostname = ea_hostname ? (const char*)(vm_base + ea_hostname) : NULL;
@@ -708,7 +710,10 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         if (want == 0)
             break;
 
-        int n = recv(t->sock, (char*)buf + filled, (int)want, 0);
+        /* buf is a guest address (the overflow copy above already translates
+         * it); recv() into the raw value wrote to the host address of the same
+         * number whenever a body outgrew the header read. */
+        int n = recv(t->sock, GUEST_PTR(buf, char*) + filled, (int)want, 0);
         if (n < 0) {
             /* Error - if we already have some data, return it */
             if (filled > 0)
@@ -735,6 +740,99 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
     if (received)
         vm_write32((u32)(uintptr_t)received, (u32)filled);
 
+    return CELL_OK;
+}
+
+/* The response getters under their SDK names (the NIDs are computed from
+ * these names); the older cellHttpGetStatusCode / cellHttpGetResponseContentLength
+ * below keep their names. Titles call these after cellHttpSendRequest and
+ * before the first cellHttpRecvResponse, so they read the response headers
+ * first. Without them the three imports took the unresolved-NID path (CELL_OK,
+ * the code unset, a NULL header array) and a title gave up on every response. */
+static HttpTransSlot* http_resp_slot(CellHttpTransId transId, s32* err)
+{
+    *err = CELL_OK;
+    if (!s_http_initialized) { *err = CELL_HTTP_ERROR_NOT_INITIALIZED; return NULL; }
+    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use) { *err = CELL_HTTP_ERROR_NOT_FOUND; return NULL; }
+    HttpTransSlot* t = &s_transactions[transId];
+    if (!t->headers_parsed) {
+        *err = cellHttpRecvResponse(transId, NULL, 0, NULL);   /* reads and parses the headers only */
+        if (*err != CELL_OK) return NULL;
+    }
+    return t;
+}
+
+s32 cellHttpResponseGetStatusCode(CellHttpTransId transId, s32* code)
+{
+    s32 err;
+    HttpTransSlot* t = http_resp_slot(transId, &err);
+    if (!t) return err;
+    if (!code) return CELL_HTTP_ERROR_INVALID_PARAMETER;
+    vm_write32((u32)(uintptr_t)code, (u32)t->status_code);
+    return CELL_OK;
+}
+
+s32 cellHttpResponseGetContentLength(CellHttpTransId transId, u64* length)
+{
+    s32 err;
+    HttpTransSlot* t = http_resp_slot(transId, &err);
+    if (!t) return err;
+    if (!length) return CELL_HTTP_ERROR_INVALID_PARAMETER;
+    if (!t->content_length_known) return CELL_HTTP_ERROR_NO_CONTENT_LENGTH;
+    vm_write64((u32)(uintptr_t)length, (u64)t->content_length);
+    return CELL_OK;
+}
+
+/* CellHttpHeader is { const char* name; const char* value; } (two guest pointers). With no pool (or one too small)
+ * only *required is written; with a pool of *required bytes the array comes first, then the NUL-terminated strings,
+ * and *headers / *items point at it. The header bytes are the server's: only copied, never longer than the
+ * header buffer. */
+s32 cellHttpResponseGetAllHeaders(CellHttpTransId transId, void* headers, u32* items, void* pool, u32 poolSize,
+                                  u32* required)
+{
+    s32 err;
+    HttpTransSlot* t = http_resp_slot(transId, &err);
+    if (!t) return err;
+    const char* end = http_find_header_end(t->hdr_buf, t->hdr_buf_len);
+    if (!end) return CELL_HTTP_ERROR_RECV_FAILED;
+    const char* p = memchr(t->hdr_buf, '\n', (size_t)(end - t->hdr_buf));   /* skip the status line */
+    u32 pool_ea = (u32)(uintptr_t)pool;
+    u32 count = 0, strings = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        u32 at = pool_ea + count * 8u, k = 0;          /* pass 1: strings after the array of `count` entries */
+        for (const char* l = p ? p + 1 : end; l < end;) {
+            const char* nl = memchr(l, '\n', (size_t)(end - l));
+            const char* le = nl ? nl : end;
+            const char* lt = (le > l && le[-1] == '\r') ? le - 1 : le;
+            const char* colon = memchr(l, ':', (size_t)(lt - l));
+            if (colon && colon > l) {
+                const char* v = colon + 1;
+                while (v < lt && (*v == ' ' || *v == '\t')) v++;
+                u32 nlen = (u32)(colon - l), vlen = (u32)(lt - v);
+                if (pass == 0) { count++; strings += nlen + 1 + vlen + 1; }
+                else {
+                    memcpy(vm_base + at, l, nlen); vm_base[at + nlen] = 0;
+                    vm_write32(pool_ea + k * 8u, at);
+                    at += nlen + 1;
+                    memcpy(vm_base + at, v, vlen); vm_base[at + vlen] = 0;
+                    vm_write32(pool_ea + k * 8u + 4u, at);
+                    at += vlen + 1;
+                    k++;
+                }
+            }
+            l = le + 1;
+        }
+        if (pass == 0) {
+            u32 need = count * 8u + strings;
+            if (required) vm_write32((u32)(uintptr_t)required, need);
+            if (!pool_ea || poolSize < need) {
+                if (items) vm_write32((u32)(uintptr_t)items, 0);
+                return pool_ea ? CELL_HTTP_ERROR_NO_BUFFER : CELL_OK;
+            }
+        }
+    }
+    if (headers) vm_write32((u32)(uintptr_t)headers, pool_ea);
+    if (items) vm_write32((u32)(uintptr_t)items, count);
     return CELL_OK;
 }
 

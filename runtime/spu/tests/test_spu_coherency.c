@@ -25,6 +25,7 @@
 /* The unit under test, compiled straight in: it is one small file whose only
  * dependency on the rest of the runtime is spu_ch_wake, stubbed below. */
 #include "../spu_coherency.c"
+#include "../../../tests/spu_ls_watch_fixture.h"
 
 /* The real PPU store and store-conditional path the hook lives in. */
 #include "../../ppu/ppu_memory.h"
@@ -342,6 +343,83 @@ static void test_block_stores(void)
     CHECK(g_wakes == 0);
 }
 
+/* More live virtual contexts than physical SPUs, including persistent
+ * policy contexts which are idle while another workload runs. */
+static void test_many_contexts(void)
+{
+    enum { N = 20 };
+    spu_context* c[N];
+    for (unsigned i = 0; i < N; ++i) {
+        c[i] = calloc(1, sizeof(*c[i]));
+        CHECK(c[i] != NULL);
+        spu_reset(c[i], i);
+        spu_getllar(c[i], LINE_A);
+    }
+    TEST("same-value writes invalidate every registered context, beyond eight");
+    g_wakes = 0;
+    vm_write32(LINE_A, vm_read32(LINE_A));
+    for (unsigned i = 0; i < N; ++i) {
+        CHECK(c[i]->resv_valid == 0);
+        CHECK(c[i]->event_status & SPU_EVENT_LR);
+    }
+    CHECK(g_wakes == N);
+    TEST("ABA writes also invalidate every context even though bytes match again");
+    for (unsigned i = 0; i < N; ++i) {
+        c[i]->event_status = 0;
+        spu_getllar(c[i], LINE_B);
+    }
+    uint32_t old = vm_read32(LINE_B);
+    g_wakes = 0;
+    vm_write32(LINE_B, old ^ 1u);
+    vm_write32(LINE_B, old);
+    for (unsigned i = 0; i < N; ++i) {
+        CHECK(c[i]->resv_valid == 0);
+        CHECK(c[i]->event_status & SPU_EVENT_LR);
+    }
+    CHECK(g_wakes == N);
+    TEST("unregister and same-address reuse preserve only current holders");
+    for (unsigned i = 0; i < N; ++i) {
+        c[i]->event_status = 0;
+        spu_getllar(c[i], LINE_C);
+        if (i & 1) spu_coh_unregister(c[i]);
+    }
+    g_wakes = 0;
+    vm_write32(LINE_C, vm_read32(LINE_C));
+    for (unsigned i = 0; i < N; ++i)
+        CHECK(!!(c[i]->event_status & SPU_EVENT_LR) == !(i & 1));
+    CHECK(g_wakes == N / 2);
+    for (unsigned i = 0; i < N; ++i) {
+        c[i]->event_status = 0;
+        spu_getllar(c[i], LINE_B);
+    }
+    g_wakes = 0;
+    vm_write32(LINE_B, vm_read32(LINE_B));
+    CHECK(g_wakes == N);
+    for (unsigned i = 0; i < N; ++i) {
+        spu_coh_unregister(c[i]);
+        spu_coh_unregister(c[i]);
+        free(c[i]);
+    }
+    g_wakes = 0;
+    vm_write32(LINE_B, vm_read32(LINE_B));
+    CHECK(g_wakes == 0);
+    TEST("range cleanup removes adjacent entries without dropping other holders");
+    spu_context* range = calloc(3, sizeof(*range));
+    CHECK(range != NULL);
+    for (unsigned i = 0; i < 3; ++i) {
+        spu_reset(&range[i], i);
+        spu_getllar(&range[i], LINE_A);
+    }
+    spu_reset(&g_spu_a, 0);
+    spu_getllar(&g_spu_a, LINE_A);
+    spu_coh_forget_range((uintptr_t)range, (uintptr_t)(range + 3));
+    free(range);
+    g_wakes = 0;
+    vm_write32(LINE_A, vm_read32(LINE_A));
+    CHECK(g_wakes == 1 && !g_spu_a.resv_valid);
+    spu_coh_unregister(&g_spu_a);
+}
+
 /* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
@@ -353,6 +431,9 @@ int main(void)
     test_all_store_widths();
     test_store_conditional();
     test_block_stores();
+    spu_coh_unregister(&g_spu_a);
+    spu_coh_unregister(&g_spu_b);
+    test_many_contexts();
 
     printf("\nSPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);

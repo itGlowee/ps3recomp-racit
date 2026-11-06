@@ -124,6 +124,7 @@ typedef struct CellFontConfig {
  * -----------------------------------------------------------------------*/
 
 s32 cellFontInit(const CellFontConfig* config);
+s32 cellFontInitializeWithRevision(u64 revisionFlags, const CellFontConfig* config);
 s32 cellFontEnd(void);
 
 s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 uniqueId);

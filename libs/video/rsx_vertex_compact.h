@@ -118,8 +118,10 @@ void rsx_vertex_fetch_plan_prepare(
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
 
-/* rsx_vertex_fetch_one for refs[0..count) into consecutive vertices of
- * plan->layout.stride bytes: the same values, a loop per attribute. */
+/* rsx_vertex_fetch_one for refs[0..count) into consecutive compact vertices
+ * at out (layout.stride apart), with the same values and the same failure:
+ * 0 when some vertex's enabled ATTR0 cannot be fetched. Walks attribute by
+ * attribute so each vertex type decodes in a loop of its own. */
 int rsx_vertex_fetch_many(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out);

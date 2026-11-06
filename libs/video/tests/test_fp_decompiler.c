@@ -12,8 +12,10 @@
  * how many SV_TARGETs a program that writes more than one export gets.
  */
 
+#define _POSIX_C_SOURCE 200809L   /* setenv */
 #include "../rsx_fp_decompiler.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_pass = 0, g_fail = 0;
@@ -89,6 +91,39 @@ static void check_true(const char* test, int cond)
 int main(void)
 {
     char hlsl[16384];
+
+    /* RSX_FP_DEBUG=<hash>:<n>:<reg>: the named register, captured after the
+     * program's n-th instruction, becomes colour target 0 with alpha 1 --
+     * in that program only. The variable is read once, on the first
+     * decompile, so this runs first. */
+    {
+        u8 prog[32];
+        u32 mask_xy = (1u<<9)|(1u<<10);
+        put_word(prog + 0, OPC(0x02) | mask_xy | OUTREG(1));          /* MUL r1.xy, r0, r0 */
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        char spec[64];
+        snprintf(spec, sizeof spec, "%llx:1:r1.xyyy", (unsigned long long)
+                 rsx_fp_structural_hash(prog, sizeof prog, 1469598103934665603ull));
+        setenv("RSX_FP_DEBUG", spec, 1);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("fp_debug_capture", hlsl,
+              "r[1].xy = _v.xy; }\n"
+              "    _rsx_dbg = (float4)((r[1]).xyyy);\n"
+              "    { float4 _v = (float4)((saturate(input.col0)).xyzw);");
+        check("fp_debug_export", hlsl, "_d.w = 1.0; r[0] = _d; h[0] = _d; }\n"
+                                       "    float4 _o = r[0];");
+        u8 other[16];
+        memcpy(other, prog + 16, sizeof other);
+        rsx_fp_decompile(other, sizeof(other), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("fp_debug_other_program", hlsl, "_rsx_dbg");
+        unsetenv("RSX_FP_DEBUG");
+    }
 
     /* Test 1: MOV r0, COL0  (write all, END). */
     {
@@ -298,6 +333,262 @@ int main(void)
                                 ife < then && then < els && els < alt && alt < lif);
         check_absent("ife_not_skipped", hlsl, "flow-control op skipped");
         check_absent("lif_handled", hlsl, "unhandled FP opcode");
+    }
+
+    /* A unit bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3) is
+     * declared Texture3D and sampled with three coordinates; TXP divides
+     * them by w. inFAMOUS 2's occlusion volumes look up an 8x8x8 cone LUT. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TEX TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 1u,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("vol_decl",   hlsl, "Texture3D   rsx_tex0 : register(t0);");
+        check("vol_sample", hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc0).xyzw).xyz)");
+        put_word(prog + 0, OPC(0x18) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TXP TC0 */
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 1u,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("vol_txp", hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc0).xyzw).xyz / ((input.tc0).xyzw).w)");
+        /* No volume units: the array declaration and 2D sample as before. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 0,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("vol_none", hlsl, "rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)");
+    }
+
+    /* A 4096-byte program fits the D3D12 caller's input bound, but its
+     * predicated, CC-writing instructions expand beyond 32 KiB of HLSL.
+     * Assemble it here instead of depending on a captured game shader. */
+    {
+        enum { INSTRUCTION_COUNT = 256 };
+        u8 prog[INSTRUCTION_COUNT * 16];
+        static char backend_hlsl[RSX_FP_HLSL_BUFFER_SIZE];
+        for (int i = 0; i < INSTRUCTION_COUNT; i++) {
+            u8* ins = prog + i * 16;
+            u32 end = i == INSTRUCTION_COUNT - 1 ? END : 0u;
+            u32 opcode = i == 0 ? OPC(0x01) : OPC(0x04);
+            u32 condition = i == 0 ? EXEC_ALWAYS : (1u << 20);
+            put_word(ins + 0, opcode | OUTMASK_ALL | INSRC(1) |
+                             (1u << 8) | end); /* MOV/MAD r0, set CC0 */
+            put_word(ins + 4, T_INPUT | SWZ_IDENT | condition);
+            put_word(ins + 8, T_TEMP | REG(0) | SWZ_IDENT);
+            put_word(ins + 12, T_TEMP | REG(1) | SWZ_IDENT);
+        }
+        int n = rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO,
+                                 backend_hlsl, sizeof(backend_hlsl));
+        printf("-- source capacity: %d instr, %zu HLSL bytes\n",
+               n, strlen(backend_hlsl));
+        check_true("backend_source_capacity", n == INSTRUCTION_COUNT);
+        check_true("source_exceeds_old_capacity", strlen(backend_hlsl) > 32768u);
+        check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
+    }
+
+    /* A predicated write is a select, not a blend: MOV r0, COL0 executed
+     * only where CC0 > 0 must keep r0 bit for bit in the other components.
+     * lerp(r0, v, mask) is arithmetic, so an Inf/NaN in either operand
+     * leaks into the components the condition leaves alone. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | (1u << 20) |          /* exec_if gt */
+                           (0u << 21) | (1u << 23) | (2u << 25) | (3u << 27));
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("pred_select", hlsl,
+              "r[0].xyzw = (_p.xyzw != 0.0) ? _v.xyzw : r[0].xyzw;");
+        check_absent("pred_no_lerp", hlsl, "lerp(");
+    }
+
+    /* Depth export: SHADER_CONTROL bits 1-3 (0xE) make r1.z the fragment
+     * depth. The program must declare SV_Depth and write r1.z, clamped,
+     * even with a single colour target; without those bits it keeps the
+     * single float4 return. */
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | OUTREG(1) | INSRC(4)); /* MOV r1, TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);     /* MOV r0, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT | 0xEu, hlsl, sizeof(hlsl));
+        check("depth_export_semantic", hlsl, "    float depth : SV_Depth;\n");
+        check("depth_export_entry",    hlsl, "PSOutput main(PSInput input) {");
+        check("depth_export_colour",   hlsl, "_out.t0 = (_o0 == _o0) ? _o0 : (float4)0;");
+        check("depth_export_value",    hlsl, "    float _d = r[1].z;\n"
+                                             "    _out.depth = (_d == _d) ? saturate(_d) : 0.0;\n");
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("no_depth_export_semantic", hlsl, "SV_Depth");
+        check("no_depth_export_entry", hlsl, "float4 main(PSInput input) : SV_TARGET {");
+    }
+
+    /* Sign expansion: a TEX on a unit whose SET_TEXTURE_ADDRESS asks for the
+     * biased unsigned remap returns the masked lanes re-centred, and with
+     * EXP_TEX (OPDEST bit 21, the _bx2 modifier) as x*2-1 (RPCS3
+     * _process_texel). inFAMOUS 2's deferred composite reads its normals
+     * G-buffer that way; read unexpanded, normalize() ran on 0..1 encodings
+     * and every normal leaned towards (1,1,1). */
+    {
+        u8 prog[16];
+        u8 expand[16] = {0};
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | (1u << 21) | END); /* TEX TC0, EXP_TEX */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        expand[0] = 0x7;   /* R, G, B lanes signed */
+        check_true("expand_units", rsx_fp_texture_expand_units(prog, sizeof prog, expand) == 1u);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_wrapped", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        check("expand_helper",  hlsl, "float4 _rsx_expand_input(float4 v, uint mask, bool bx2)");
+        check("expand_math",    hlsl, "v * 2.0 - 1.0");
+
+        expand[0] = 0;     /* the unit is not biased: _bx2 still expands every lane */
+        check_true("expand_units_none", rsx_fp_texture_expand_units(prog, sizeof prog, expand) == 0u);
+        check_true("bx2_units", rsx_fp_texture_bx2_units(prog, sizeof prog) == 1u);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_bx2_unbiased", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        /* ...and the older entry point, with no masks, is byte-identical. */
+        char plain[16384];
+        rsx_fp_decompile_buffered_shadow_color_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                  plain, sizeof plain, &nk);
+        check_true("expand_old_entry_identical", strcmp(plain, hlsl) == 0);
+
+        /* Biased but no EXP_TEX bit: the fetch still re-centres (RPCS3 applies
+         * the remap to every read; only the formula and gamma differ). */
+        expand[0] = 0x7;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        check_true("expand_units_nobit", rsx_fp_texture_expand_units(prog, sizeof prog, expand) == 1u);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_nobit_wrapped", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 7u, false)");
+        check("expand_nobit_math",    hlsl, "(floor(v * 255.0 + 0.5) - 128.0) / 127.0");
+
+        /* Gamma lanes are decoded, not re-centred: gamma rgb + biased rgba
+         * leaves the expansion with the alpha lane only, around the gamma. */
+        u8 gamma[16] = {0}; gamma[0] = 0x7; expand[0] = 0xF;
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, gamma,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_after_gamma", hlsl,
+              "_rsx_expand_input(_rsx_gamma_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 7u), 8u, false)");
+        /* Gamma on every biased lane: nothing left to expand. */
+        gamma[0] = 0xF;
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, gamma,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check_absent("expand_all_gamma", hlsl, "_rsx_expand_input(rsx_tex");
+        /* With EXP_TEX, gamma steps aside and every biased lane is x*2-1. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | (1u << 21) | END);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, gamma,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_bx2_over_gamma", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        check_absent("expand_bx2_no_gamma", hlsl, "_rsx_gamma_input(");
+        /* Bit 4 (16-bit channels) rides along in the mask argument. */
+        expand[0] = 0x13;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_16bit", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 19u, false)");
+    }
+
+    /* SRC2 bit 31 (perspective_corr) on a texcoord read multiplies the input
+     * by 1/w (RPCS3 FragmentProgramDecompiler: "Perspective correct flag
+     * multiplies the result by 1/w"). inFAMOUS 2's water writes uv*w from the
+     * vertex program and samples TC2 with the flag set; read raw, uv*w lands
+     * far outside the screen copy and the river samples black. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(6) | TEXU(0) | END); /* TEX TC2 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 1u << 31);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("persp_tc_scaled", hlsl, "(input.tc2 * _rsx_inv_w(input.position))");
+        check("persp_helper",    hlsl, "#define _rsx_inv_w(p)");
+
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("persp_off_raw",    hlsl, "((input.tc2).xyzw).xy");
+        check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
+    }
+
+    /* WPOS on an antialiased target held at its sample grid: every sample
+     * reads the centre of its pixel. A perspective-corrected texcoord keeps
+     * reading w from the same SV_POSITION, which the rewrite leaves alone. */
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0));            /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x17) | OUTMASK_ALL | OUTREG(1) | INSRC(6) | TEXU(0) | END);
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);              /* TEX r1, TC2 */
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 1u << 31);
+        u32 nk = 0;
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        char before[sizeof hlsl];
+        memcpy(before, hlsl, sizeof hlsl);
+
+        check_true("wpos_grid_1x1_noop", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 1, 1) == 0 &&
+                                         !strcmp(before, hlsl));
+        check_true("wpos_grid_short_buffer",
+                   rsx_fp_apply_wpos_grid(hlsl, (u32)strlen(hlsl) + 8, 2, 1) == -1 &&
+                   !strcmp(before, hlsl));
+        check_true("wpos_grid_2x1", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 1) == 1);
+        check("wpos_grid_first_line", hlsl,
+              "float4 main(PSInput input) : SV_TARGET {\n"
+              "    input.position.xy = floor(input.position.xy / float2(2, 1)) + 0.5;\n");
+        check("wpos_grid_inv_w_kept", hlsl, "_rsx_inv_w(input.position)");
+        check_true("wpos_grid_once", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 1) == -1);
+
+        /* Two colour exports: the PSOutput entry point. */
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | OUTREG(2) | INSRC(0) | END); /* MOV r2, WPOS */
+        put_word(prog + 28, 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_true("wpos_grid_mrt_2x2", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 2) == 1);
+        check("wpos_grid_mrt_line", hlsl,
+              "PSOutput main(PSInput input) {\n"
+              "    input.position.xy = floor(input.position.xy / float2(2, 2)) + 0.5;\n");
+
+        /* No WPOS read: byte-identical. */
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);      /* MOV r0, COL0 */
+        rsx_fp_decompile_buffered_ex(prog, 16, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        memcpy(before, hlsl, sizeof hlsl);
+        check_true("wpos_grid_no_wpos_noop", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 2) == 0 &&
+                                             !strcmp(before, hlsl));
+    }
+
+    /* WPOS follows the SET_SHADER_WINDOW convention through fp_alpha.y/.z in a
+     * buffered program; an unbuffered one has no fp_alpha and reads the host
+     * position as before. A program that does not read WPOS gets no helper. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0) | END); /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("wpos_buffered_read",   hlsl, "_rsx_wpos(input.position)");
+        check("wpos_buffered_helper", hlsl,
+              "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)");
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("wpos_unbuffered_identity", hlsl, "#define _rsx_wpos(p) (p)\n");
+
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_absent("wpos_no_read_no_helper", hlsl, "_rsx_wpos");
+
     }
 
     printf("\n===========================================\n");

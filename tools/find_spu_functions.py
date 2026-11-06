@@ -137,6 +137,20 @@ def read_symbols(buf, shs):
     return funcs
 
 
+def text_image(buf, phs):
+    """(bytes, vaddr) spanning EVERY executable PT_LOAD segment, gaps zeroed.
+    Some task ELFs carry a second PF_X segment (TM level-load task: 0x34B00,
+    called from the main text); lifting only the first left it as stubs."""
+    xs = [ph for ph in phs if ph["type"] == 1 and (ph["flags"] & 1)]
+    if not xs:
+        raise SystemExit("No executable PT_LOAD segment found")
+    lo = min(ph["vaddr"] for ph in xs)
+    img = bytearray(max(ph["vaddr"] + ph["filesz"] for ph in xs) - lo)
+    for ph in xs:
+        img[ph["vaddr"] - lo:ph["vaddr"] - lo + ph["filesz"]] = buf[ph["off"]:ph["off"] + ph["filesz"]]
+    return bytes(img), lo
+
+
 def pick_text(phs):
     """Return (file_off, vaddr, size) of the executable PT_LOAD segment."""
     for ph in phs:
@@ -546,6 +560,18 @@ _TERMINATORS_NO_FALLTHROUGH = {
 }
 
 
+# lv2 SPU-thread syscalls made with stop-and-signal. The kernel services them
+# and RESUMES the SPU at the next instruction, which reads the reply from the
+# inbound mailbox (sys_spu_thread_receive_event: stop 0x110, then rdch x4).
+# Ending the function at the stop dropped that reply-handling code from the
+# lift entirely. 0x101/0x102 (group/thread exit) really are terminal.
+LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
+
+
+def is_resuming_stop(ins):
+    return ins.mnemonic == "stop" and (ins.raw & 0x3FFF) in LV2_RESUMING_STOPS
+
+
 def is_return(ins):
     """SPU ABI: `bi $r0` is the standard return."""
     if ins.mnemonic != "bi":
@@ -569,7 +595,7 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
             break
         if is_return(ins):
             return pc + 4
-        if ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH:
+        if ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH and not is_resuming_stop(ins):
             # Unconditional control flow -- if the target is not within this
             # range, the function ends here.
             return pc + 4
@@ -595,8 +621,10 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
         text_off, text_va, text_size = 0, base, len(buf)
     else:
         elf = parse_elf(buf)
-        text_off, text_va, text_size = pick_text(elf["phs"])
-    code = buf[text_off:text_off + text_size]
+        text_off, text_va, _ = pick_text(elf["phs"])
+        code, text_va = text_image(buf, elf["phs"])
+    if raw:
+        code = buf[text_off:text_off + text_size]
     base = base_override if base_override is not None else text_va
     insns = disassemble_spu(code, base_addr=base)
     insns_by_addr = {ins.addr: ins for ins in insns}

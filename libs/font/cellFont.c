@@ -200,6 +200,15 @@ s32 cellFontInit(const CellFontConfig* config)
     return CELL_OK;
 }
 
+/* cellFontInitializeWithRevision(revisionFlags, config): the entry point titles built with a newer SDK use instead of
+ * cellFontInit (NID 0xF03DCC29). Without it every later cellFont call returns CELL_FONT_ERROR_UNINITIALIZED, which
+ * a title that ignores the result never notices. */
+s32 cellFontInitializeWithRevision(u64 revisionFlags, const CellFontConfig* config)
+{
+    (void)revisionFlags;
+    return cellFontInit(config);
+}
+
 s32 cellFontEnd(void)
 {
     printf("[cellFont] End()\n");

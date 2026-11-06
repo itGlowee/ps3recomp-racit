@@ -58,9 +58,22 @@ int rsx_hlsl_to_spirv(const char* hlsl, int stage,
                       u32* words, u32 max_words, u32* out_words,
                       char* log, u32 log_size);
 
-/* Translations answered from the SPIR-V cache (memory, or the file named by
- * RSX_SHADER_CACHE) and translations actually run, since start. */
-void rsx_hlsl_to_spirv_cache_stats(unsigned long* hits, unsigned long* misses);
+/* The translation cache (rsx_shader_spirv.cpp). A request is answered from
+ * memory, else from PS3RECOMP_SPIRV_CACHE's directory, else by glslang. */
+typedef struct RsxSpirvCacheStats {
+    u32 memory_hits;
+    u32 disk_hits;
+    u32 translations;   /* glslang runs that succeeded */
+} RsxSpirvCacheStats;
+
+void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out);
+/* racacit: the same as two totals -- answered from a cache (memory or file)
+ * and translated -- for the Vulkan backend's [RSX vulkan] lines. */
+void rsx_hlsl_to_spirv_cache_counts(unsigned long* hits, unsigned long* misses);
+
+/* Empties the memory cache, zeroes the counters and reads
+ * PS3RECOMP_SPIRV_CACHE again on the next request. Disk files stay. */
+void rsx_hlsl_to_spirv_cache_reset(void);
 
 #ifdef __cplusplus
 }

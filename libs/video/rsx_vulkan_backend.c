@@ -5452,7 +5452,7 @@ static FILE* vk_pw_find_programs(vk_pw_spv* sp, u32 ns, const u32* wc, u32 nw, u
      * it open -- so the walk waits for that first translation. */
     for (;;) {
         unsigned long h = 0, m = 0;
-        rsx_hlsl_to_spirv_cache_stats(&h, &m);
+        rsx_hlsl_to_spirv_cache_counts(&h, &m);
         if (h + m || SDL_AtomicGet(&s_pw.stop)) break;
         SDL_Delay(20);
     }
@@ -6494,7 +6494,7 @@ void rsx_vulkan_engine_stats_report(void)
     fprintf(stderr, "[RSX vulkan] shader translations %llu (%.1f ms), pipeline variants %llu (%.1f ms)%c",
             s_vkt_spv, s_vkt_spv_us / 1000.0, s_vkt_var, s_vkt_var_us / 1000.0, 10);
     s_vkt_spv = s_vkt_spv_us = s_vkt_var = s_vkt_var_us = 0;
-    { unsigned long h = 0, m = 0; rsx_hlsl_to_spirv_cache_stats(&h, &m);
+    { unsigned long h = 0, m = 0; rsx_hlsl_to_spirv_cache_counts(&h, &m);
       fprintf(stderr, "[RSX vulkan] spirv cache since start: %lu hits, %lu translated%c", h, m, 10); }
     fprintf(stderr, "[RSX vulkan] created: images %llu memory %llu framebuffers %llu samplers %llu views %llu pipelines %llu buffers %llu%c",
             s_vkc[0], s_vkc[1], s_vkc[2], s_vkc[3], s_vkc[4], s_vkc[5], s_vkc[6], 10);

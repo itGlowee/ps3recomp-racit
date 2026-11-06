@@ -425,6 +425,9 @@ Gave the project its first CI and its second platform, in **v0.9.0**.
   register-file draw engine. Every `ps3recomp_host` scene passes on it under
   the Khronos validation layer — on lavapipe in CI, and on a Nintendo Switch's
   Tegra X1.
+- **Vulkan stencil** (#231): the depth format now carries stencil
+  (`D32_SFLOAT_S8_UINT` first), so the engine's stencil state takes effect.
+  Verified with a two-pass stencil scene on lavapipe and on the Switch.
 
 ### André Brum — [@andrebrumdev](https://github.com/andrebrumdev)
 Lifter and RSX correctness found bringing up *God of War II HD* and *Ben 10
@@ -444,9 +447,298 @@ Omniverse* — every fix arrives with a test that fails on master.
 - **`-msse4.1` probed instead of assumed** (#206) — Apple clang 21 and aarch64
   GCC reject it outright.
 
+### Kurtisone — [@Kurtisone](https://github.com/Kurtisone)
+Draw-engine, Vulkan and SPURS fixes found bringing up *Twisted Metal* on
+Linux/Vulkan. Each one comes with a measurement or a test, and most of v0.14.0
+came from this work.
+- **Surfaces read through guest memory in another format** (#236): a depth
+  buffer read as colour, a Z16 shadow map, a float packed into RGBA8. Write
+  serials let the engine pick the newer of the two surfaces at one address.
+  Plus `RSX_ENGINE_PASS_DUMP` to find which pass of a frame first goes wrong
+  (#237).
+- NV3089 surface coherence (#224), display buffers and flips handed to the
+  engine (#223), texel-addressed coordinates (#221), B8 (#220), Z16 far-plane
+  clears (#235).
+- Vulkan: RGBA16F targets (#222), cube maps (#229), images sized by the device
+  limit (#227), cached readbacks (#245), and dumping every nth frame (#219).
+- **An SPU-signalled SPURS task wakes at once** (#242). It used to wait out a
+  1 s timeout, which made one frame of post-FX take 4.1 s.
+- SPURS taskset fields kept out of guest memory (#240), barrier and
+  `GetTasksetInfo` (#241), IO-table-first offsets (#238), a POSIX
+  `ps3_ms_now` (#244), real POSIX lwmutex/lwcond (#225), safe stack scans
+  (#217), SPU disassembler `orbi`/`xorhi`/`xorbi` (#239), `--chunk-lines`
+  (#216), `PS3_NULL_READ_STACK` (#226) and `g_ppu_main_ctx` (#228).
+- Depth bounds test in the draw engine and Vulkan (#319), measured on Twisted
+  Metal's deferred lighting.
+- **v0.16.0, 12 PRs.** In-stream flips that complete when the RSX reaches them
+  (#343), get across a JUMP (#347), FP16 transfers (#367) and pixel-wise row
+  conversion (#348); a cache of HLSL to SPIR-V translations (#346); Vulkan
+  feedback snapshots (#352) and a split present (#351); atomic task signal
+  bits (#340), job frames below cache buffers (#366), AVX2/SSE2 SPU float
+  (#369, #370), and AIO reads that keep the fd's position (#376).
+- **v0.18.0, 5 PRs.** `SPU_PCSAMPLE` is read once at init instead of on every
+  DMA, with the regression test the competing fix lacked (#243). AVX2 estimate,
+  interpolation and float/int conversion helpers, four lanes at a time (#500).
+  In Vulkan, each draw gets its own vertices, indices, constants and descriptor
+  set rather than sharing one set across the frame (#536). A cellPad port with
+  no controller attached reports centred sticks instead of zero, which several
+  titles read as a stick held hard left (#496). The twistedmetal regression run
+  clears its FIOS file cache before starting, so a stale cache cannot make a
+  run look green (#498).
+
+
+### undecuple — [@undecuple](https://github.com/undecuple)
+- **Real video decode in cellVdec** (#215): H.264 and MPEG-2 through FFmpeg,
+  loaded at run time and never linked. Pictures come out in display order, with
+  pic items, PICOUT and EndSeq flush, in YUV420/UYVY/ARGB/RGBA. The loader is
+  reusable for cellAdec and cellDmux.
+- A detailed set of about 60 general fixes from a *Killzone 3* port (#214),
+  each with a focused test against v0.13.0.
+- **v0.15.0, 33 PRs from the Killzone 2/3 ports.** In the lifter: VMX lane
+  order (#269), `lwax` jump tables (#285), `sc` fall-through (#297), carry-form
+  callee-save reloads (#320), and `--chunks` (#254). In the loader: TLS sizing
+  (#253), a per-coroutine call-depth guard (#270), and MinGW thread-locals
+  (#271). In cellGcm: IO table and leak (#255), `GET_REPORT` DMA context
+  (#256), user commands (#273), and in-FIFO flip (#275). Depth export,
+  depth-as-texture, Z16 clears, MSAA, predicated selects and sampler keys
+  (#278-#282, #321). cellFs (#257, #258), PSF saves (#322), UserAutoSave
+  (#276), cellHttp (#260, #261), NP (#259, #323), EDAT klicensee (#274),
+  lwcond layout (#277), cellFont (#324), SPURS argument ABI (#309, #310), SMC
+  `lqa`/`stqa` (#268), and the MFC table (#272).
+- **v0.18.0, 11 PRs.** The published error-code bases move: GCM to
+  `0x80210000` and SPURS task codes onto their own `0x80410900` (#414) — the
+  one change in the batch a downstream port can see in a literal value. A
+  thread that has exited is gone and its id is not handed straight back out
+  (#415). The licence area answers as system parameter `0x0122` (#429).
+  cellVdec never returns handle 0 (#495). XInput is loaded at run time instead
+  of being imported, which also takes `xinput` off the Windows link line
+  (#494). stdout and stderr are buffered with a timed flush, and nothing is
+  lost at exit, on `abort()` or through the unhandled-exception filter (#524).
+  Five docs PRs: `SPU_LIFTER.md` (#425), the SPU workflow in `GETTING_STARTED`
+  and the porting guide (#426), prerequisites reconciled across five documents
+  (#427), template paths matched to the CMake (#428), and `CITATION.cff`
+  (#535).
+
+
+### robbe1912 — [@robbe1912](https://github.com/robbe1912)
+- **D3D12 fragment-program source capacity** (#230): a 256-instruction program
+  produced 57 KB of HLSL against a 32 KB buffer and was dropped as a decompile
+  failure. Comes with a synthetic regression fixture.
+
+### tekulvw — [@tekulvw](https://github.com/tekulvw)
+- **SPU interpreter `ILH`** (#234): it had shared `IL`'s case and repeated a
+  32-bit immediate instead of a halfword. The test runs the real interpreter.
+- **v0.15.0, 34 PRs: a correctness sweep of the runtime and the Metal
+  backend**, each with a fixture that fails before the fix.
+  - SPURS policy scheduling with per-instance workers and contention limits
+    (#291), private per-context DMA and reservation state (#290), interpreter
+    hand-off (#266), and SPU ELF discovery in the build (#288). Also SDCRZ
+    (#295), FNMS (#318), the interrupt-enable bit (#289), and the SPURS
+    task/taskset fixes (#283, #284, #298, #306).
+  - argv/envp (#263) and HLE registration regeneration (#262).
+  - RSX: depth compare (#302), sRGB output (#304), texture gamma (#305),
+    colour-input clamp (#303), depth24 (#299), depth-export cache keys
+    (#301), and immediate vertices (#292). Metal: depth readback (#300),
+    colour snapshots (#307), clears (#293), window close (#308), and FPS
+    diagnostics (#294).
+  - cellFs directory entries and disc roots (#247, #249), GCM strict IO
+    mapping (#248), network (#250, #265), timezone (#264), sysmodules (#267),
+    dialogs (#251), and Sail (#252).
+- Guest spinlocks with a 32-bit atomic on LP64 hosts, an arm64 fault
+  (#326, v0.16.0).
+- **v0.18.0, 45 PRs — the largest set in the release.** Three threads run
+  through it.
+  - **SPU dispatch and residency.** Streamed code regions are verified once
+    per load and then dispatched by residency (#420); resident-code ownership
+    is honoured when the interpreter rejoins lifted code (#419); a per-thread
+    cache sits in front of `spu_lifted_lookup`, on by default (#481).
+    Indirect-dispatch registry lookups (#436) and the per-thread MFC engine
+    lookup (#421) are memoized, and an image's fingerprint is reused while its
+    bytes are unchanged (#433). Lifter coverage verifies job-module regions
+    and embedded SPU programs, reports dispatch misses loudly rather than
+    silently, and handles spilled PPU jump tables (#444).
+  - **Exact float and coherency.** NEON float ops without scalar fix-up lanes
+    (#445), and opt-in `SPU_FLOAT_RZ` running single precision natively under
+    a round-toward-zero FPCR (#479). `GETLLAR` without the lock-line lock for
+    registered holders (#441), only the reserved lines of a PUT copied under
+    it (#484), a brief spin before parking on the POSIX lock-line lock (#443),
+    DMA event producers serialized against reservation-lost notifications
+    (#418), and the parked-task scan bounded on every committed lock line
+    (#450).
+  - **Draw engine and Metal.** A larger surface is reused only on the same
+    sample grid (#422), each texture key remembers where it was last found
+    (#438), the per-draw pipeline key is cheaper (#459), index runs append in
+    one pass (#465), and a draw's vertices are fetched attribute by attribute
+    (#458). `rsx_state` is handed only the methods with outside effects when
+    the draw engine is on (#466). The Metal staging arena records into a
+    pooled `MTLBuffer` (#440) with one reused depth-readback buffer (#461).
+  - Plus the diagnostics gates the release is named for: the GCM FIFO walker
+    stops calling `getenv` per packet (#437), the guest load/store watch hooks
+    go behind one inlined load (#483), the PUT poison scan runs only when it
+    can be reported (#454), and `PS3_TPROF` (#480) and `RSX_WALKER_PROF`
+    (#467) arrive as opt-in samplers.
+
+
+### Noah Peterson — [@NoahBPeterson](https://github.com/NoahBPeterson)
+Runs the *inFAMOUS* port.
+- **Hardware-exact SPU float semantics** (#287): extended range, truncation,
+  denormal flush, `frest`'s table, and an exact-arithmetic referee. NEON paths
+  are bit-identical and 1.6-4x faster. Replaces the old GPL-derived float code.
+- **Exact VMX and branch decode in the PPU lifter** (#286): about 45 VMX ops
+  that were no-ops, VSCR/CR6, BO/BI decoding, and 64-bit CTR.
+- Both are pieces of the LLE firmware and conformance work in #213.
+
+### erikomis — [@erikomis](https://github.com/erikomis)
+Fixes found bringing up *inFAMOUS 2* on the inFamous branch, sent to master as
+well:
+- jump tables behind a tail-call epilogue (#311);
+- a parked FIFO given time to be patched (#312);
+- the `SPU_RdDec` 231 s wrap (#313);
+- NV40 pack/unpack opcodes (#314);
+- cellGem/cellCamera imports (#315);
+- Metal command-buffer errors reported (#316).
+- **v0.16.0, 21 PRs.** 3D textures (#335); FACING/TC8/TC9 (#328),
+  perspective-correct texcoords (#329), `_bx2` and biased-remap fetches (#331),
+  Y16_X16/HILO8 crossbars (#332); flips that complete in order (#354), a
+  bounded semaphore acquire (#327), GCM callbacks at timer sleeps (#353),
+  unscaled NV3089 rows (#334); Metal MRT masks (#330), anisotropy (#373),
+  FXAA and sharpening (#374), gamma (#355) and `precise::` math (#356);
+  sparse texture re-hashing (#375) and per-draw vertex spans (#357);
+  `PS3_FTRACE` (#339), FP debug knobs (#336), `PS3_LANG` (#333),
+  `PS3_GAMEDATA_ROOT` (#338) and full-strength rumble (#372).
+- **v0.18.0, 41 PRs**, and the macOS and Linux bring-up work is the spine of
+  it.
+  - **Raw SPUs run on POSIX** (#473) — each with its own program, `SPU_RunCntl
+    = 0` stopping a running one (#505), and raw-SPU images carrying a
+    parameter area the loader fills in (#538).
+  - **One window across an `exitspawn`** on macOS, via `tools/host_window` and
+    a Metal host-surface mode over shared IOSurfaces (#509), with the guest
+    moved off the main thread (#477) and the whole 32-bit guest space backed
+    on POSIX as it already was on Windows (#475). One host clock backs `mftb`,
+    system time and timers, through `mach_absolute_time` (#540).
+  - **SSE4.1 and AVX2 forms of the per-lane integer and quadword helpers**
+    (#512) — about 72 helpers, including a rewrite of `cbd`/`chd`/`cwd`/`cdd`
+    that drops their 16-byte control loops on every host, arm64 included.
+  - **Metal**: HLSL→MSL translations cached in memory and on disk (#511),
+    `SET_TEXTURE_BORDER_COLOR` honoured in the sampler (#476), and a vertex
+    program's position invariant compiling (#563).
+  - **The depth-snapshot chain**: a stale snapshot is released (#502) and a
+    snapshot is the region the texture names (#507) — the pair the eviction
+    work in #499 had to land behind.
+  - **New HLE surface**: `cellSysconfOpen`/`cellSysconfAbort` (#564),
+    `cellSysutilNpEula` answering through its callback (#542), sceNp tickets,
+    account region and network time as OFFLINE (#543), the cellNetCtl
+    net-start dialog (#503), `cellPadInfoSensorMode`/`SetSensorMode` (#565),
+    and `ps3_host_quit` so the close button and Cmd+Q reach the guest (#544).
+  - Plus `SPU_DIRECT` tail calls (#510), atomic `event_status` (#492),
+    `SPU_IRQWAIT_DIAG` (#491), per-thread HLE→guest callback stacks (#489),
+    `lift_jobmods` at the link base each header names (#488), and
+    `ppu_lifter --insn-patches` (#539).
+
+### deucebucket — [@deucebucket](https://github.com/deucebucket)
+- Reported that `fw_spu/` was tracking decrypted firmware PRXs and lifted C,
+  against our own firmware policy (#210). It came out in #212.
+
 ### bojogon7 — [@bojogon7](https://github.com/bojogon7)
 - Added [AnyPS5](https://github.com/boykopovar/AnyPS5) to the README's list of
   sibling recompilation projects (#209).
+
+### n0madic — [@n0madic](https://github.com/n0madic)
+Fixes from a *SoulCalibur II HD* port
+([n0madic/Soulcalibur2HD-recomp](https://github.com/n0madic/Soulcalibur2HD-recomp)):
+- **An SPU thread runs the image its own bytes identify** (#362), not
+  whichever registered image has code at its entry point. SPU user events
+  find the port the PPU binds (#363).
+- **NV3089's 12.4 source origin** (#358): copies were 256 times too short.
+- The D3D12 vertex program cache keyed on the program (#361), which took
+  most D3DCompile calls off the FIFO thread.
+- `cellGameBootCheck` game type from PARAM.SFO (#359), and the msg-dialog
+  NONE/INVALID button codes (#360).
+- **v0.18.0, 9 PRs.** Shadow compare is `depth FUNC reference`, not the
+  reverse (#424) — it had been backwards, so every shadow test was inverted. A
+  depth surface read as a texture converts on the GPU, with eviction from full
+  surface and zeta tables (#499). 3D texel coordinates divide by depth (#482),
+  the vertex program branches on the transform branch bits with leaders up to
+  slot 544 (#485), WPOS counts pixels on antialiased targets (#446), and the
+  depth formats present their one channel on every crossbar source (#501). A
+  flip in the FIFO restores `ZSTENCIL_CLEAR_VALUE`, and a 0 clear value is the
+  near plane (#526). Frequency 1 under a modulo divider bit is one element for
+  the whole draw (#547). A thread created above its creator's priority runs
+  until it blocks, under `PS3_PRIO_START=1` (#416).
+
+### kalpakprod — [@kalpakprod](https://github.com/kalpakprod)
+- `CELL_FS_O_*` flag values corrected so `O_CREAT` creates (#349).
+- `/dev_hdd1` maps to a writable host root with its cache directory (#350).
+- Syscall 14 classifies lock-line addresses by guest segment (#341).
+
+### rigaz29 — [@rigaz29](https://github.com/rigaz29)
+**The D3D12 backend's guest-shader pipeline, and the GCM FIFO walker.** 33 PRs
+in **v0.18.0**, their first release here, and the largest single body of new
+capability in it.
+- **D3D12 guest pipelines**: guest depth/stencil state and samplers are folded
+  into the guest-FP pipelines (#558), with depth surfaces per zeta offset that
+  are readable as textures and FP depth export (#559). Indexed triangle lists
+  are drawn with their own indices rather than being expanded (#530). Guest
+  textures stage through a shared upload ring with least-recently-used slots
+  (#579), vertices are converted once per draw (#518), and a small batch can be
+  held back across two flips (#583). The texture-slot SRVs that were
+  overwriting the SRV heap are gone (#557). New `D3D12_VSYNC=0` (#575) and
+  on-demand RenderDoc capture with resources named in guest terms (#561).
+- **GCM FIFO walker**: NOP runs are passed over and 3D method runs decoded a
+  command at a time (#554); vertex-program methods are taken first, with one
+  diagnostic gate per FIFO word instead of one per method (#548); the drain's
+  own ring recycle counts as the JUMP to begin (#553); `GCM_PARK_GRACE_MS`
+  bounds how long a park may stand (#531). GCM handlers run from blocked
+  semaphore waits on Windows (#576).
+- **PPU loader and lifter**: guest stores inline, to match the inline loads
+  (#573), on a cheaper access sequence — memory-model copy, one compare, a
+  branch hint (#574). The SPU reserved-line bitmap is tested inline on guest
+  stores (#534), and the reservation is re-checked once the lock-line lock is
+  held (#522).
+- **Diagnostics**: `SPU_INTERP_STATS` now says where the interpreter was
+  entered (#523), `PS3_SAMPLE_DRAIN=1` samples only the RSX drain thread (#520)
+  with exact attribution under `PS3_SAMPLE_RVAS` and a one-thread fast path
+  (#568), an ftrace span is recorded per HLE import call with its own report
+  section (#580), and the remaining hot debug switches are read once rather
+  than per event (#519, #521, #527).
+- Also: `sysPrxForUser` lwmutex on an atomic lock word with a fast path for
+  leaf HLE imports (#577), named runtime host threads (#567), the interpreter
+  rejoining inside resident regions (#525), per-hop hook fast paths (#533),
+  CMP (11-11-10) attribute decode (#529), swizzled decode that steps the offset
+  instead of re-interleaving each texel (#578), an empty XInput slot polled once
+  a second instead of every frame (#581), and `--merge-chunks` in the SPU
+  program build (#549).
+
+### MaChInEgUn3 — [@MaChInEgUn3](https://github.com/MaChInEgUn3)
+First release here, 5 PRs in **v0.18.0**.
+- **`VK_DRAW_BATCH=1`** records engine draws, snapshots, uploads and clears
+  into a single Vulkan submission instead of one per operation (#532), with
+  readback staging reused and changed textures refreshed in place (#552).
+- **WPOS follows the RSX's own window convention** — `SET_SHADER_WINDOW`
+  origin and pixel centres (#589).
+- Straight quadword load/store sequences run in the SMC microstep on a tight
+  loop (#571), and halt and `iret` longjmp without unwinding on 64-bit Windows
+  (#572).
+
+### xuxinsss — [@xuxinsss](https://github.com/xuxinsss)
+First release here, 2 PRs in **v0.18.0**.
+- **The runtime builds with plain MSVC (`cl`)**, not only clang-cl (#588) —
+  five files across the SPU and PPU, mostly SIMD intrinsics and statement
+  expressions that only the Clang front end accepted.
+- lv2 syscall 22 is registered as `_sys_process_exit` (#587).
+
+### feanor-noldorin — [@feanor-noldorin](https://github.com/feanor-noldorin)
+First release here, 1 PR in **v0.18.0**.
+- **cellFs repositions the stream when a fd switches between reading and
+  writing** (#456), which the C library requires and the previous code did
+  not do — a read after a write returned bytes from the wrong offset. Comes
+  with two new tests.
+
+### Tzeentchnet — [@Tzeentchnet](https://github.com/Tzeentchnet)
+First release here, 1 PR in **v0.18.0**.
+- **Duplicate clear-presented flips are skipped in D3D12, and only those**
+  (#486) — the narrow form matters: a title that legitimately presents the
+  same cleared frame twice still gets both.
 
 ---
 

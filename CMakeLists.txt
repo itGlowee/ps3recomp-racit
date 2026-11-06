@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
 # "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
-    VERSION 0.11.0
+    VERSION 0.18.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
@@ -207,6 +207,25 @@ if(PS3RECOMP_RSX_VULKAN)
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 
+# cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
+# is loaded at run time (dlopen / LoadLibrary), never linked, so building needs
+# only the FFmpeg headers, and a binary run where FFmpeg is absent -- or with
+# PS3RECOMP_FFMPEG=0 -- keeps the callback-only decoders. FFmpeg stays a
+# separate, user-supplied LGPL library. See libs/codec/ffmpeg_runtime.h.
+option(PS3RECOMP_FFMPEG_RUNTIME "Decode media through FFmpeg loaded at run time (needs the FFmpeg headers)" OFF)
+if(PS3RECOMP_FFMPEG_RUNTIME)
+    find_path(PS3RECOMP_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
+    if(NOT PS3RECOMP_FFMPEG_INCLUDE_DIR)
+        message(FATAL_ERROR "FFmpeg headers not found. Debian/Ubuntu: "
+            "libavcodec-dev, Fedora: ffmpeg-free-devel, MSYS2: mingw-w64-x86_64-ffmpeg "
+            "-- or pass -DPS3RECOMP_FFMPEG_INCLUDE_DIR=<dir containing libavcodec/avcodec.h>")
+    endif()
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
+    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+    message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
+endif()
+
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL
 # ---------------------------------------------------------------------------
@@ -315,6 +334,7 @@ if(PS3RECOMP_RSX_VULKAN)
             target_link_libraries(ps3recomp_runtime PRIVATE
                 glslang::glslang-default-resource-limits)
         endif()
+        set(PS3RECOMP_SPIRV_TRANSLATION ON)
         message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
     else()
@@ -344,7 +364,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. -O3 as the lifted code: the render thread's
         # per-draw path and the SPU helpers are as hot as anything in it.
-        $<$<CONFIG:Release,RelWithDebInfo>:-O3>
+        # Every configuration but Debug, including none: a port configured
+        # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
+        # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
+        $<$<NOT:$<CONFIG:Debug>>:-O3>
     )
     # zig's memcmp, memset and sqrt are baseline, byte-at-a-time or software: see the file.
     if(WIN32)
@@ -419,6 +442,89 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    # Syscall 14's address/flags classification as a plain unit test: the
+    # check is pure, so the test links one runtime translation unit
+    # (lv2_lock_line.c) and nothing else.
+    add_subdirectory(tests/syscalls)
+    # cellVdec through its guest API: the callback-only decoder always, and
+    # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
+    add_subdirectory(libs/codec/tests)
+    # cellGcm's FIFO walker without a backend: where GET_REPORT writes for
+    # each report DMA context. Links the runtime like the POSIX host below.
+    if(UNIX)
+        add_subdirectory(tests/gcm_reports)
+    endif()
+    # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
+    add_executable(test_log_first tests/test_log_first.c)
+    target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME log_first COMMAND test_log_first)
+
+    if(NOT WIN32)
+        # The vector single-precision ops against the exact per-lane references.
+        add_executable(test_spu_float_exact
+            runtime/spu/tests/test_spu_float_exact.c)
+        target_include_directories(test_spu_float_exact PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_exact PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_exact PRIVATE m)
+        add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
+        set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
+
+        add_executable(test_spu_lockline_wait
+            runtime/spu/tests/test_spu_lockline_wait.c)
+        target_include_directories(test_spu_lockline_wait PRIVATE include)
+        target_compile_options(test_spu_lockline_wait PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
+        add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
+        set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
+
+    endif()
+    add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
+    target_include_directories(test_rsx_present_policy PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+
+
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME spinlock_word_width
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
+        add_test(NAME spurs_task_exit_code_initialize
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_code_initialize.py")
+        add_test(NAME spurs_taskset_size
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_taskset_size.py")
+        add_test(NAME spu_sdcrz
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
+        add_test(NAME spu_dma_repeat
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
+    endif()
+    if(NOT WIN32)
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME spu_fnms_zero_extended
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
+        endif()
+    endif()
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME loaded_image_memory
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loaded_image_memory.py")
+        add_test(NAME loader_memory_domain
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loader_memory_domain.py")
+        add_test(NAME mmapper_hle_heap
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mmapper_hle_heap.py")
+        add_test(NAME user_memory_domain
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -461,6 +567,52 @@ if(UNIX AND NOT ANDROID)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+
+        # The polygon offset through the engine and the Metal backend on the
+        # GPU; the guest programs need the translation above.
+        if(APPLE)
+            add_executable(test_metal_poly_offset
+                libs/video/tests/test_metal_poly_offset.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_poly_offset.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_poly_offset PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_poly_offset PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            # Only what the engine and the backend reach; the rest of the
+            # runtime is not linked in.
+            target_link_options(test_metal_poly_offset PRIVATE "-Wl,-dead_strip")
+        endif()
+    endif()
+
+    # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang
+    # only, no GPU.
+    if(PS3RECOMP_SPIRV_TRANSLATION)
+        add_executable(test_shader_spirv
+            libs/video/tests/test_shader_spirv.c
+            libs/video/rsx_shader_spirv.cpp
+        )
+        target_include_directories(test_shader_spirv PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_shader_spirv PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(test_shader_spirv PRIVATE
+                glslang::glslang-default-resource-limits)
+        endif()
+        set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
     endif()
 endif()
 

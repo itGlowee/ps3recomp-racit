@@ -35,6 +35,8 @@ BASE = 0x10000
 def w_cmpwi(bf, ra, si):  return (11 << 26) | (bf << 23) | (ra << 16) | (si & 0xFFFF)
 def w_bc(bo, bi, rel):    return (16 << 26) | (bo << 21) | (bi << 16) | (rel & 0xFFFC)
 def w_blr():              return (19 << 26) | (20 << 21) | (16 << 1)
+def w_li(rt, si):         return (14 << 26) | (rt << 21) | (si & 0xFFFF)
+def w_sc():               return 0x44000002
 
 
 def lift(words):
@@ -62,10 +64,15 @@ def main() -> int:
     check("unconditional goto is a terminator",
           _last_line_is_terminator(["        goto loc_00010000;"]), True)
     check("return is a terminator", _last_line_is_terminator(["        return;"]), True)
+    check("syscall is not a terminator", _last_line_is_terminator(["        lv2_syscall(ctx);"]), False)
 
     # End to end: `loop: cmpwi r3,0; bne loop` falls through to the next address.
     func = lift([w_cmpwi(0, 3, 0), w_bc(4, 2, -4)])
     check("function ending in bne records its fall-through", func.fallthrough_to, BASE + 8)
+    # `li r11,141; sc` (sys_timer_usleep) cut at the instruction after `sc`: the
+    # syscall returns, so the fragment must continue at the next address.
+    func = lift([w_li(11, 141), w_sc()])
+    check("function ending in sc records its fall-through", func.fallthrough_to, BASE + 8)
     # Control: ending in blr needs no continuation.
     func = lift([w_cmpwi(0, 3, 0), w_blr()])
     check("function ending in blr has no fall-through", func.fallthrough_to, 0)

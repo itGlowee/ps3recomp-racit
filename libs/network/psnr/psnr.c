@@ -43,6 +43,7 @@
    typedef struct pollfd pollfd_t;
 #endif
 
+#include "../host_socket_send.h"
 #define HEARTBEAT_SECS 20
 
 static uint64_t now_ms(void)
@@ -75,7 +76,7 @@ struct psnr_client {
 static int send_all(psnr_client* c, const uint8_t* p, size_t n)
 {
     while (n) {
-        int k = send(c->s, (const char*)p, (int)n, 0);
+        int k = send(c->s, (const char*)p, (int)n, PS3_NET_HOST_SEND_FLAGS);
         if (k < 0) {
             pollfd_t pf;
             if (!WOULD_BLOCK()) { c->dead = 1; return -1; }
@@ -351,7 +352,7 @@ static int64_t stream_leg(const psnr_client* c, uint8_t type, const uint8_t* bod
     psnr_put16(f + 1, (uint16_t)(4 + len));
     psnr_put32(f + 3, 1);
     memcpy(f + 7, body, len);
-    if (send(s, (const char*)f, 7 + len, 0) != 7 + len) goto fail;
+    if (send(s, (const char*)f, 7 + len, PS3_NET_HOST_SEND_FLAGS) != 7 + len) goto fail;
 
     /* The reply: READY, or an ERROR. The server waits up to 10 s for the
      * other side to accept. */

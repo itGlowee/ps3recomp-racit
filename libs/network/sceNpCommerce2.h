@@ -26,7 +26,7 @@ typedef u32 SceNpCommerce2Context;
 /* Functions */
 s32 sceNpCommerce2Init(void);
 s32 sceNpCommerce2Term(void);
-s32 sceNpCommerce2CreateCtx(u32 version, const void* npId,
+s32 sceNpCommerce2CreateCtx(u32 version, const void* npId, u32 handler, u32 arg,
                               SceNpCommerce2Context* ctx);
 s32 sceNpCommerce2DestroyCtx(SceNpCommerce2Context ctx);
 s32 sceNpCommerce2CreateSessionStart(SceNpCommerce2Context ctx);

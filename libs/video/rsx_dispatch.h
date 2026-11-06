@@ -36,6 +36,10 @@ extern "C" {
 #define RSX_DSP_NUM_VERTEX_ATTR 16
 #define RSX_DSP_NUM_TEXTURES    16               /* fragment texture units   */
 
+/* ZSTENCIL_CLEAR_VALUE (0x1D8C) after a reset: depth 1.0, stencil 0 in the
+ * Z24S8 layout. The RSX puts it back at every flip as well (cellGcmSys.c). */
+#define RSX_DSP_ZSTENCIL_CLEAR_RESET 0xFFFFFF00u
+
 /* rsx_dsp_texture.format values (gcm public format byte, incl. the LN/UN
  * modifier bits: 0x20 = linear/no-swizzle, 0x40 = unnormalized coords) */
 #define RSX_TEX_FMT_B8              0x81
@@ -49,8 +53,8 @@ extern "C" {
 #define RSX_TEX_FMT_G8B8            0x8B
 #define RSX_TEX_FMT_DEPTH24_D8      0x90
 #define RSX_TEX_FMT_DEPTH24_D8_F    0x91
-#define RSX_TEX_FMT_DEPTH16        0x92
-#define RSX_TEX_FMT_DEPTH16_F      0x93
+#define RSX_TEX_FMT_DEPTH16         0x92
+#define RSX_TEX_FMT_DEPTH16_F       0x93
 #define RSX_TEX_FMT_LINEAR          0x20         /* modifier: no swizzle     */
 #define RSX_TEX_FMT_UNNORM          0x40         /* modifier: texel coords   */
 #define RSX_TEX_FMT_BASE_MASK       0x9F         /* format sans modifiers    */
@@ -110,6 +114,10 @@ typedef struct rsx_dispatch_sink {
     void (*inline_array)(void* user, const rsx_dispatch* rsx,
                          const u8* data, u32 bytes);
     void (*flip)(void* user, const rsx_dispatch* rsx, u32 arg);
+    /* A completed ATTR0 DATA3F/DATA4F inside BEGIN emits one vertex.
+     * Snapshot the current attributes now; later register writes replace them.
+     * Array formats, offsets and frequencies do not describe this stream. */
+    void (*immediate_vertex)(void* user, const rsx_dispatch* rsx);
 } rsx_dispatch_sink;
 
 struct rsx_dispatch {
@@ -195,6 +203,13 @@ typedef struct rsx_dsp_surface {
     u32 zeta_offset;
     u32 zeta_pitch;
     u32 zeta_location;
+    /* SURFACE_FORMAT antialias field (bits 12-15) and the sample grid it
+     * implies. An antialiased surface is held at its sample resolution, as
+     * in guest memory: DIAGONAL_CENTERED_2 (3) is 2x1 samples per pixel,
+     * SQUARE_CENTERED_4 (4) and SQUARE_ROTATED_4 (5) are 2x2. clip_x/y/w/h
+     * above are already multiplied by it; the viewport and scissor registers
+     * stay in pixels, so consumers scale them by aa_sx/aa_sy. */
+    u32 antialias, aa_sx, aa_sy;
 } rsx_dsp_surface;
 void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out);
 
@@ -228,6 +243,17 @@ u32 rsx_dsp_vertex_data_base_index(const rsx_dispatch* rsx);
 static inline u32 rsx_dsp_resolve_vertex_index(u32 index, u32 base_index)
 {
     return (index + base_index) & 0x000FFFFFu;
+}
+
+/* VERTEX_DATA_BASE_OFFSET is added to an array's offset and the sum is taken
+ * modulo 2^28 (the size of a location's address space) before it is
+ * translated through the array's location, for local and main memory alike.
+ * Resistance: Fall of Man relies on the wrap: its world lighting stream sits
+ * at base + offset = 0x1Fxxxxxx, which is local 0x0Fxxxxxx. The element
+ * offset (index * stride) is added after the mask. */
+static inline u32 rsx_dsp_resolve_vertex_offset(u32 base_offset, u32 array_offset)
+{
+    return (base_offset + array_offset) & 0x0FFFFFFFu;
 }
 
 /* Index array state (IDXBUF_OFFSET / IDXBUF_FORMAT) */

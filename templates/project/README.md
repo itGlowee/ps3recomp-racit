@@ -17,20 +17,23 @@ short version:
 # 1. load the title (function table, imports, TOC, segment manifest)
 python /path/to/ps3recomp/tools/ppu_loader.py game/EBOOT.ELF -o out/
 
-# 2. lift it (writes src/recomp/ppu_recomp*.cpp and ppu_recomp.h)
+# 2. lift it (writes recompiled/ppu_recomp.h and recompiled/ppu_recomp_NNN.cpp)
 python /path/to/ps3recomp/tools/ppu_lifter.py game/EBOOT.ELF \
     --functions out/EBOOT.functions.json \
     --hle-stubs out/EBOOT.imports.json \
-    --output src/recomp/
+    --output recompiled/
 
 # 3. now configure and build -- CMakeLists generates the NID -> HLE handler
-#    table itself unless src/recomp/ppu_hle_nids.cpp already exists
+#    table itself unless recompiled/ppu_hle_nids.cpp already exists
 cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp
 cmake --build build
 ```
 
-`CMakeLists.txt` globs `src/recomp/*.cpp`, so re-run CMake after a fresh lift so
-the new files are picked up.
+`CMakeLists.txt` reads the lift from `RECOMP_DIR` (default `recompiled/` next to
+it; override with `-DRECOMP_DIR=`). It stops with "No ppu_recomp.h in ..." if
+that directory has no `ppu_recomp.h`, and globs `${RECOMP_DIR}/*.c` and
+`${RECOMP_DIR}/*.cpp`, so re-run CMake after a fresh lift so the new files are
+picked up.
 
 ## What the template gives you
 
@@ -39,7 +42,7 @@ the new files are picked up.
 | `main.cpp` | Boots the runtime and runs the ELF entry point. |
 | `stubs.cpp` | Where you add HLE bridges for functions the runtime does not implement yet. |
 | `CMakeLists.txt` | Links `ps3recomp_runtime`, compiles the per-game PPU scaffold from `runtime/ppu/`, and sets `/bigobj` for the large generated translation units. |
-| `config.toml` | Lifter/porting settings for the title. |
+| `config.toml` | Reference settings for the title. Reference only: no tool or CMake file reads it yet. |
 
 ## Running
 
@@ -52,3 +55,54 @@ directory the guest filesystem should resolve against:
 
 Graphics come up on Direct3D 12 on Windows and Metal on macOS with no extra
 configuration; see [docs/BUILDING.md](../../docs/BUILDING.md#graphics-backends).
+
+## Automatically discover and register SPU ELF programs
+
+Supply the decrypted files your port uses when configuring the project. With
+`PORT_ENABLE_SPU=ON` (the default), `PORT_SPU_INPUTS` scans every supplied file
+for embedded ELF32 big-endian SPU programs, deduplicates exact images, lifts
+supported programs, and compiles their generated registration table:
+
+```bash
+cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp \
+    -DRECOMP_DIR=/path/to/my_game/recompiled \
+    '-DPORT_SPU_INPUTS=/path/to/EBOOT.ELF;/path/to/decrypted_module.elf'
+cmake --build build
+```
+
+Generation is fresh and lives in `build/generated_spu/`. Input or generator
+changes trigger reconfiguration. `inventory.json` records every occurrence,
+exact-image SHA256, runtime fingerprints, generated image IDs, per-program
+status, and tool/input/output provenance. Configure fails if a candidate is
+invalid or unsupported, so a partial registration table cannot silently pass.
+With no supplied inputs, the existing manually generated `SPU_DIR` workflow
+continues to work.
+
+This scans only supplied files. It does not decrypt, decompress, infer raw
+job-module boundaries, or promise that a generated program can run correctly.
+Automated lifting currently supports one executable PT_LOAD per ELF with
+nonoverlapping memory ranges across all PT_LOAD segments, including BSS tails.
+Overlapping loads are reported as unsupported because the loader can overwrite
+code that a segment-based lift would use. Executable
+sections bound code when present; stripped images use the executable segment
+and may need manual code/data boundaries. The workload registry distinguishes
+programs by fingerprint; standalone SPU thread selection still uses the
+runtime's existing entry-address logic.
+
+For discovery outside CMake, use the same builder directly:
+
+```bash
+python /path/to/ps3recomp/tools/build_spu_workloads.py \
+    --input /path/to/EBOOT.ELF --input /path/to/decrypted_module.elf \
+    --lifted /path/to/owned_spu_output \
+    --out /path/to/owned_spu_output/spu_workloads.c --constructor
+```
+
+The output directory must be empty or previously created by this command, and
+`--out` must be directly inside it. Every run replaces that generation as a
+unit, including after failure; failure retains diagnostics and omits buildable
+registration/source-list files. `--allow-partial` explicitly permits supported
+registrations while keeping `complete=false` in the report; the template always
+requires complete coverage. `--extra-funcs` accepts the discovered `spu_<sha256>`
+name for explicit entry overrides. The existing `--images` interface is still
+available for manually extracted programs.

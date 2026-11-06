@@ -34,7 +34,7 @@ jobs:
         build_type: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # SDL2 is not optional off Windows: cellPad and cellAudio select their
       # SDL2 backends unconditionally there, and CMakeLists.txt hard-fails
@@ -84,7 +84,7 @@ jobs:
       # the host compiler, so it is genuinely testing this platform's codegen
       # and not just re-checking the lifter's Python.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
@@ -104,6 +104,61 @@ jobs:
             -std=gnu17 -I include -I runtime/spu \
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
+
+      # The AVX2 single-precision fast path must match the exact scalar path bit for bit.
+      - name: Run the SPU float fast-path test (AVX2)
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime/spu \
+              -o /tmp/test_spu_float_neon runtime/spu/tests/test_spu_float_neon.c -lm
+            /tmp/test_spu_float_neon
+          else
+            echo "no AVX2 on this runner: skipped"
+          fi
+
+      # runtime/spu/tests/test_spu_int_x86.c checks #512's SSE4.1 and AVX2 integer
+      # and quadword-shift forms against their scalar spu_X_ref references. #512
+      # added the file and wired it into nothing -- no workflow step, no CMake
+      # target. This step is @rigaz29's from #550, retargeted: #550 covered the
+      # same helper set and was closed as a subset of #512, and carrying its CI
+      # wiring over was promised in that review.
+      - name: Run the SPU integer helper test (SSE4.1)
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -msse4.1 -I include -I runtime -I runtime/spu \
+            -o /tmp/test_spu_int_x86_sse41 runtime/spu/tests/test_spu_int_x86.c -lm
+          /tmp/test_spu_int_x86_sse41
+
+      # The AVX2 forms of the same helpers, where the runner has AVX2.
+      - name: Run the SPU integer helper test (AVX2)
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime -I runtime/spu \
+              -o /tmp/test_spu_int_x86_avx2 runtime/spu/tests/test_spu_int_x86.c -lm
+            /tmp/test_spu_int_x86_avx2
+          else
+            echo "no AVX2 on this runner: skipped"
+          fi
+
+      # The AVX2 estimate, interpolate and conversion helpers must match the scalar ones bit for bit.
+      - name: Run the SPU estimate/conversion test (AVX2)
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime/spu \
+              -o /tmp/test_spu_float_est runtime/spu/tests/test_spu_float_est.c -lm
+            /tmp/test_spu_float_est
+          else
+            echo "no AVX2 on this runner: skipped"
+          fi
+
+      # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
+      - name: Run the cellFont init test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_font_initialize_with_revision libs/font/tests/test_font_initialize_with_revision.c -lm
+          /tmp/test_font_initialize_with_revision
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
@@ -126,12 +181,49 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # The net-start dialog ends cancelled offline and connected with
+      # PS3_NET_ONLINE=1, its result word big-endian.
+      - name: Run the net-start dialog test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/system -o /tmp/test_netctl_netstart libs/network/tests/test_netctl_netstart.c
+          /tmp/test_netctl_netstart
+          PS3_NET_ONLINE=1 /tmp/test_netctl_netstart
+
+      # cellVideoOutSetGamma's float argument comes from f1, and the value
+      # reaches the presenter.
+      - name: Run the video out gamma test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_avconf_gamma libs/misc/tests/test_avconf_gamma.c
+          /tmp/test_avconf_gamma
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
+
+      # sceNpCommerce2CreateCtx takes the SDK's five arguments and stores the context id through the fifth.
+      - name: Run the Commerce2 CreateCtx test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_commerce2 libs/network/tests/test_np_commerce2.c
+          /tmp/test_np_commerce2
+
+      # cellPadSetActDirect: the small motor is on/off at full strength, and
+      # a rumble lasts until the title changes it (renewed from the pad poll).
+      - name: Run the pad rumble test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_rumble
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_sensor_mode libs/input/tests/test_pad_sensor_mode.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_sensor_mode
+
+      # cellPad SDL hot-plug: a controller switched off and on again is
+      # reopened into its old port (fake SDL that behaves like sdl2-compat).
+      - name: Run the pad hot-plug test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_hotplug
 
 
       # Guest vertex and fragment programs through the decompilers, glslang
@@ -220,6 +312,10 @@ jobs:
           # plausible and still fails here. Exercises rsx_texture_layout and
           # rsx_texture_decode end to end with no GPU involved.
           ./build/ps3recomp_host --tex
+          # The same texture after the guest also derived a VRAM offset in its
+          # 1 MB page number: the texture says main memory, so it must still
+          # resolve through the IO map rather than into VRAM.
+          ./build/ps3recomp_host --tex-io
           # A polygon and a quad strip, neither of which any host API draws:
           # both have to be expanded into triangles first. The pentagon is
           # green and the strip red over it, and the centre pixel belongs to
@@ -262,10 +358,25 @@ jobs:
           # is where those get checked at all.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
+          # The vertex fetch plan's stable ranges against the per-attribute
+          # walk they are now computed without.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+          /tmp/test_vertex_fetch_plan
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
           /tmp/test_rsx_transform_constants
+          # Vertex-program microcode and constant runs taken in one call leave the
+          # state exactly as the same words do one by one.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_vp_run libs/video/tests/test_rsx_vp_run.c libs/video/rsx_commands.c
+          /tmp/test_rsx_vp_run
+          # Texture offsets are 31 bits; bit 31 is not an address bit.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
+          /tmp/test_rsx_texture_offset
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c
+          /tmp/test_rsx_command_texture_offset
 
       # The Win32 shim every POSIX host runs the runtime through: interlocked
       # widths and return conventions, SRW/CS/condition variables, events,
@@ -284,6 +395,21 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
           /tmp/test_guest_ptr_trap
+
+      # Buffered stdout/stderr with a timed flush (runtime/platform/ps3_stdio.c):
+      # buffered by default, a line reaches the pipe within the flush interval,
+      # and nothing is lost at exit, on abort() or on a crash through the
+      # unhandled-exception filter; PS3_STDIO_UNBUFFERED=1 restores unbuffered.
+      - name: Run the stdio flush test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
+          /tmp/test_stdio_flush
+
+      # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
+      - name: Run the savedata PARAM.SFO test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
+          /tmp/test_savedata_param_sfo
 
       # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
       # queue) on host threads. It was Windows-only until the shim grew joinable
@@ -329,6 +455,57 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
+
+      # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
+      # that with PUTLLC on the taskset line, which never woke the parked
+      # task's host thread: it saw the signal only when its 1 s wait timed out.
+      - name: Run the SPURS task wake test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_taskset_wake \
+            runtime/spu/tests/test_spu_taskset_wake.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spu_taskset_wake
+
+      # The host setting or consuming a task's signal bit against an SPU commit
+      # to the same word. The read was outside the lock-line lock, so a commit
+      # between the read and the write was lost and that task never woke.
+      - name: Run the SPURS signalled-bit atomicity test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_signalled_atomic \
+            runtime/spu/tests/test_spurs_signalled_atomic.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spurs_signalled_atomic
+
+      # The host's task-id search, task registration and task exit against each
+      # other on the taskset's bitset line. A plain read then write undid a task
+      # exit, so the exited task's enabled bit came back and JoinTask2 hung.
+      - name: Run the SPURS taskset bitset atomicity test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_taskset_bits_atomic \
+            runtime/spu/tests/test_spurs_taskset_bits_atomic.c libs/spurs/spurs_taskset.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spurs_taskset_bits_atomic
 
       # A thread group starting its threads on their image's LIFTED code. This
       # is the path a real title needs and the one that used to be missing: the
@@ -376,3 +553,21 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
+
+      # A SPURS job's entry saves its link register at 16($sp), in the caller's
+      # frame. The runner put $sp 16 bytes under the stack top, where the cache
+      # buffers start, so that save overwrote the first quadword of
+      # cacheBuffer[0]: Twisted Metal's Edge jobs lost their viewport there.
+      - name: Run the SPURS job stack frame test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_job_stack \
+            runtime/spu/tests/test_spurs_job_stack.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spurs_job_stack

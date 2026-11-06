@@ -39,7 +39,7 @@ L = _load("ppu_lifter", "tools/ppu_lifter.py")
 
 
 def _insn(addr, mnemonic, operands):
-    return SimpleNamespace(addr=addr, mnemonic=mnemonic, operands=operands)
+    return SimpleNamespace(addr=addr, mnemonic=mnemonic, operands=operands, raw=None)
 
 
 def _lift(base, seq):

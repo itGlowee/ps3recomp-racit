@@ -1,58 +1,19 @@
-/*
- * Every live SPU context gets an MFC engine of its own, and gives it back.
- *
- * There are eight slots in the per-context MFC table and a thread group starts
- * all of its threads at once, so the claim is a race between as many host
- * threads as the group has, each arriving on its first DMA. Two of them taking
- * the same slot is silent: both SPUs then share one engine's command queue and
- * tag-completion mask, so one SPU's tag wait is satisfied by the other SPU's
- * transfer and a job reads a buffer that has not arrived yet. Nothing reports
- * it, and it does not reproduce -- it depends on which two threads collided on
- * a particular run.
- *
- * The other half is the table running dry. Slots used to be claimed and never
- * released, so a title with more SPU contexts over its life than there are
- * slots ran everything past the eighth on one shared fallback engine, carrying
- * whatever queue and tag state the previous owners left in it.
- *
- * So the assertions are: eight contexts claiming at the same instant get eight
- * different engines; each engine keeps the state its own context wrote while
- * the others are writing theirs; the engines are handed out again to the next
- * eight contexts, freshly initialized; and over thirty-two rounds -- two
- * hundred and fifty-six contexts, none of them at an address a previous one
- * used -- exactly the same eight engines are handed out, which is what says
- * the slots came back rather than the overflow engine being shared.
- *
- * spu_channels.c is compiled in rather than linked, because the slot table and
- * mfc_for() are file-static: the same reason test_spu_lifted_start.c compiles
- * in lv2_register.c.
- *
- * Build:
- *   clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
- *         -o /tmp/test_spu_mfc_slots \
- *         runtime/spu/tests/test_spu_mfc_slots.c \
- *         runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
- *         runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
- *         runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
- *         runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
- *         runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
- *         runtime/platform/win32_compat.c -lpthread
- *
- * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
- */
+/* Concurrent per-context MFC ownership, including more than eight live
+ * contexts and stalled lists retained across interleaved context use. */
 
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Guest memory. Nothing here issues a DMA, so the arena stays empty; the
- * symbol exists because the DMA paths compiled in below read through it. */
-uint8_t* vm_base = NULL;
+/* Guest memory. The stalled-list checks exercise actual DMA into private local stores. */
+static uint8_t guest_memory[1u << 20];
+uint8_t* vm_base = guest_memory;
 uint32_t ppu_vm_size = 0;
 
 /* The unit under test. */
 #include "../spu_channels.c"
+#include "../spu_lifted_job.h"
 
 /* ---------------------------------------------------------------------------
  * Harness
@@ -69,10 +30,10 @@ static void check(int ok, const char* what)
 #define CHECK(cond)  check((cond), #cond)
 
 /* ---------------------------------------------------------------------------
- * Eight contexts claiming at once, thirty-two times over
+ * More than eight contexts claiming concurrently, across repeated lifetimes
  * -----------------------------------------------------------------------*/
-#define NCTX    SPU_MAX_CONTEXTS   /* exactly fills the table */
-#define ROUNDS  32                 /* 256 contexts, well past the eight slots */
+#define NCTX    12   /* exceeds the old hardware-count registry */
+#define ROUNDS  4
 
 /* Every context in the run is live at once and none is freed, so no two ever
  * share an address. A round that reused an address would find a leaked slot by
@@ -106,7 +67,7 @@ static void barrier_wait(void)
     LONG gen = g_bar_gen;
     if (InterlockedIncrement(&g_bar_arrived) == NCTX) {
         g_bar_arrived = 0;
-        InterlockedIncrement(&g_bar_gen);   /* releases the other seven */
+        InterlockedIncrement(&g_bar_gen);   /* releases the other threads */
         return;
     }
     ULONGLONG start = GetTickCount64();
@@ -123,7 +84,7 @@ static void* claim_thread(void* arg)
     for (int r = 0; r < ROUNDS; r++) {
         spu_context* ctx = g_ctx[r][w];
 
-        barrier_wait();                       /* all eight claim together */
+        barrier_wait();                       /* all contexts claim together */
         mfc_engine* e = mfc_for(ctx);
         g_engine[r][w] = e;
         /* A slot that came back from a previous owner has to come back clean:
@@ -147,12 +108,13 @@ static void* claim_thread(void* arg)
     return NULL;
 }
 
-/* Is `e` in the first `n` entries of `set`? */
-static int engine_seen(mfc_engine* const* set, int n, const mfc_engine* e)
+static void transient_job(spu_context* ctx)
 {
-    for (int i = 0; i < n; i++)
-        if (set[i] == e) return 1;
-    return 0;
+    mfc_engine* engine = mfc_for(ctx);
+    CHECK(engine->queue_count == 0);
+    CHECK(engine->tag_completed == 0xFFFFFFFFu);
+    engine->queue_count = 7;
+    engine->tag_completed = 0;
 }
 
 int main(void)
@@ -198,48 +160,85 @@ int main(void)
         }
     }
 
-    /* Two hundred and fifty-six contexts, eight engines. More than eight would
-     * mean a round fell through to the shared overflow engine, which is what
-     * happens when a slot is not given back. */
-    mfc_engine* seen[ROUNDS * NCTX];
-    int nseen = 0;
-    for (int r = 0; r < ROUNDS; r++)
-        for (int w = 0; w < NCTX; w++)
-            if (g_engine[r][w] && !engine_seen(seen, nseen, g_engine[r][w]))
-                seen[nseen++] = g_engine[r][w];
-    CHECK(nseen == NCTX);
-
     /* Releasing a context that never issued a DMA, and so holds no slot, is a
      * scan that finds nothing rather than a slot lost. */
     spu_context* idle = (spu_context*)calloc(1, sizeof(spu_context));
     CHECK(idle != NULL);
     spu_mfc_release(idle);
 
-    /* The table is empty again: fill it, then check what the ninth context
-     * gets. Sharing the overflow engine is the documented behaviour above
-     * SPU_MAX_CONTEXTS -- a real group has at most six -- and it must not cost
-     * a slot, so releasing one of the eight hands that same slot to the next
-     * context that asks. */
+    /* Retain all contexts while one completes a stalled list. The completion
+     * must not complete another context's same-numbered tag. */
     spu_context* held[NCTX];
-    mfc_engine*  helde[NCTX];
+    mfc_engine* helde[NCTX];
     for (int i = 0; i < NCTX; i++) {
         held[i] = (spu_context*)calloc(1, sizeof(spu_context));
         CHECK(held[i] != NULL);
+        spu_context_init(held[i], (uint32_t)i);
         helde[i] = mfc_for(held[i]);
+        uint32_t ea = 0x20000u + (uint32_t)i * 0x100u;
+        memset(guest_memory + ea, i + 1, 16);
+        memset(guest_memory + ea + 16, i + 0x80, 16);
+        spu_ls_write32(held[i], 0x1000, 0x80000010u); /* transfer then stall */
+        spu_ls_write32(held[i], 0x1004, ea);
+        spu_ls_write32(held[i], 0x1008, 16);
+        spu_ls_write32(held[i], 0x100C, ea + 16);
+        held[i]->mfc_lsa = 0x2000;
+        held[i]->mfc_eal = 0x1000;
+        held[i]->mfc_size = 16;
+        held[i]->mfc_tag = 3;
+        spu_wrch(held[i], MFC_Cmd, spu_make_preferred_u32(MFC_GETL_CMD));
+        CHECK(held[i]->ls[0x2000] == i + 1);
+        CHECK(held[i]->ls[0x2010] == 0); /* tail must wait for this context's ack */
     }
-    spu_context* ninth = (spu_context*)calloc(1, sizeof(spu_context));
-    CHECK(ninth != NULL);
-    mfc_engine* ninthe = mfc_for(ninth);
-    CHECK(ninthe != NULL);
-    CHECK(!engine_seen(helde, NCTX, ninthe));   /* the overflow one */
-
+    for (int i = 0; i < NCTX; i++) {
+        CHECK(mfc_for(held[i]) == helde[i]);
+        CHECK(!(helde[i]->tag_completed & (1u << 3)));
+        CHECK(held[i]->list_stall_mask == (1u << 3));
+        spu_wrch(held[i], MFC_WrListStallAck, spu_make_preferred_u32(3));
+        for (unsigned n = 0; n < 16; ++n)
+            CHECK(held[i]->ls[0x2010 + n] == i + 0x80);
+        CHECK(helde[i]->tag_completed & (1u << 3));
+        CHECK(held[i]->list_stall_mask == 0);
+        for (int j = i + 1; j < NCTX; j++)
+            CHECK(!(helde[j]->tag_completed & (1u << 3)));
+    }
+    /* A new lifetime at the SAME address gets clean engine state. Other live
+     * engines must remain untouched, regardless of allocator address reuse. */
+    helde[3]->queue_count = 7;
+    helde[3]->tag_completed = 0;
     spu_mfc_release(held[3]);
-    spu_context* reuser = (spu_context*)calloc(1, sizeof(spu_context));
-    CHECK(reuser != NULL);
-    mfc_engine* reusere = mfc_for(reuser);
-    CHECK(reusere == helde[3]);                 /* the freed slot, not overflow */
+    mfc_engine* reusere = mfc_for(held[3]);
+    CHECK(reusere->queue_count == 0);
     CHECK(reusere->tag_completed == 0xFFFFFFFFu);
+    for (int i = 0; i < NCTX; i++) {
+        spu_mfc_release(held[i]);
+        spu_mfc_release(held[i]); /* idempotent, before a fresh claim */
+        free(held[i]);
+    }
+    free(idle);
+    for (int r = 0; r < ROUNDS; r++)
+        for (int w = 0; w < NCTX; w++) free(g_ctx[r][w]);
 
+    /* Thread-exit cleanup forgets all abandoned owners in a stack range,
+     * including adjacent list nodes, and preserves owners outside that range. */
+    spu_context* range = calloc(3, sizeof(*range));
+    spu_context* outside = calloc(1, sizeof(*outside));
+    CHECK(range != NULL && outside != NULL);
+    for (unsigned i = 0; i < 3; ++i) (void)mfc_for(&range[i]);
+    mfc_engine* outside_engine = mfc_for(outside);
+    outside_engine->tag_completed = 0x12345678;
+    spu_mfc_forget_range((uintptr_t)range, (uintptr_t)(range + 3));
+    CHECK(mfc_for(outside) == outside_engine);
+    CHECK(outside_engine->tag_completed == 0x12345678);
+    CHECK(s_mfc_slots && s_mfc_slots->ctx == outside && !s_mfc_slots->next);
+    free(range);
+    spu_mfc_release(outside);
+    free(outside);
+
+    for (unsigned i = 0; i < 12; ++i) {
+        CHECK(spu_run_lifted_job_img(transient_job, NULL, 0, 0) == 0);
+        CHECK(s_mfc_slots == NULL); /* stack context actually relinquished its node */
+    }
     printf("SPU MFC engine slots: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

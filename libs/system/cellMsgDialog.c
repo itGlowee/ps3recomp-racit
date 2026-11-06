@@ -139,7 +139,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
 
     /* A BUTTON_TYPE_NONE dialog is an informational notice with no buttons: on
      * hardware it stays on screen until the TITLE takes it down with
-     * cellMsgDialogClose/Abort, and only then does its callback fire. We used
+     * cellMsgDialogClose/Abort. Close invokes its callback; Abort discards it. We used
      * to queue that callback immediately, which told the title its own notice
      * had already been dismissed.
      *
@@ -151,8 +151,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
      * 260-second boot, which is where the boot time was going.
      *
      * So a no-button dialog waits, exactly like the progress bar already did.
-     * Close() still queues BUTTON_NONE and Abort() still queues BUTTON_ESCAPE,
-     * so the title gets its callback -- when it asks for it. */
+     * Close() queues BUTTON_NONE; Abort() removes it without a callback. */
     /* OFF BY DEFAULT, and that is a deliberate retreat rather than a doubt
      * about the diagnosis. Holding the no-button dialog open is what hardware
      * does and it removes VF5's check loop completely (26 reopenings -> 1).
@@ -286,18 +285,13 @@ s32 cellMsgDialogAbort(void)
 {
     printf("[cellMsgDialog] Abort()\n");
 
-    if (!s_dialog_open) {
-        return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
-    }
-
+    /* Abort removes a dialog without reporting a button press. It also
+     * succeeds when no dialog is open (RPCS3 documents this as HW-tested).
+     * A queued ESCAPE here can cancel the title's next dialog or operation. */
     s_dialog_open = 0;
     s_nobutton_deadline = 0;
-
-    if (s_callback) {
-        CellMsgDialogCallback cb = s_callback;
-        s_callback = NULL;
-        return queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
-    }
+    s_callback = NULL;
+    s_userdata = NULL;
 
     return CELL_OK;
 }

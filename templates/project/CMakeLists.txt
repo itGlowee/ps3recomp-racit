@@ -90,6 +90,14 @@ if(EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")
 else()
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(HLE_NID_TABLE "${CMAKE_CURRENT_BINARY_DIR}/ppu_hle_nids.cpp")
+    # The generator discovers handlers from library definitions. Rebuild when
+    # an existing module changes, and reconfigure when a new module is added.
+    file(GLOB_RECURSE HLE_NID_SOURCES CONFIGURE_DEPENDS
+        "${PS3RECOMP_DIR}/libs/*.c")
+    # A removed input cannot make the output older than a remaining dependency.
+    # Track the list itself so deletions also remove stale handler references.
+    set(HLE_NID_SOURCE_LIST "${CMAKE_CURRENT_BINARY_DIR}/hle_nid_sources.txt")
+    file(GENERATE OUTPUT "${HLE_NID_SOURCE_LIST}" CONTENT "${HLE_NID_SOURCES}\n")
     add_custom_command(
         OUTPUT "${HLE_NID_TABLE}"
         COMMAND "${Python3_EXECUTABLE}"
@@ -97,6 +105,7 @@ else()
                 --out "${HLE_NID_TABLE}" --all
         DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
                 "${PS3RECOMP_DIR}/tools/nid_database.py"
+                ${HLE_NID_SOURCES} "${HLE_NID_SOURCE_LIST}"
         COMMENT "Generating the HLE NID -> handler table")
     message(STATUS "HLE NID table:   generated (every module)")
 endif()
@@ -129,8 +138,15 @@ set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu" CACHE PATH
     "Directory holding the lifted SPU images (<SPU_DIR>/<image>/spu_recomp.c)")
 option(PORT_ENABLE_SPU "Compile and register the title's lifted SPU images" ON)
 
+set(PORT_SPU_INPUTS "" CACHE STRING
+    "Input files to scan for all embedded SPU ELF programs (semicolon-separated decrypted ELF/PRX/data paths)")
 set(SPU_SOURCES "")
-if(PORT_ENABLE_SPU)
+if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
+    include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")
+    ps3recomp_generate_spu("${CMAKE_CURRENT_BINARY_DIR}/generated_spu" ${PORT_SPU_INPUTS})
+    list(APPEND SPU_SOURCES ${SPU_GENERATED_SOURCES}
+         "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+elseif(PORT_ENABLE_SPU)
     file(GLOB SPU_LIFTED CONFIGURE_DEPENDS "${SPU_DIR}/*/spu_recomp.c")
     if(SPU_LIFTED)
         list(LENGTH SPU_LIFTED SPU_IMAGE_COUNT)
@@ -230,6 +246,17 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(${PROJECT_NAME} PRIVATE
         -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
+        # The lift spells PPC arithmetic as signed C arithmetic, which must wrap;
+        # without this, clang exploits overflow UB (e.g. folds "x*x < 0" to false).
+        -fwrapv
+        # The target-wide -O1 the SPU note above relies on, for a build whose
+        # configuration sets no optimisation level (no CMAKE_BUILD_TYPE, or one
+        # CMake has no defaults for). Without it every lifted PPU TU compiled at
+        # -O0: each static inline helper (ppc_rlw64, vmx_w, vm_read32_inl) is a
+        # real call that spills to the stack, and those calls were most of the
+        # PPU thread's profile. -O1 keeps the huge TUs' build time sane. Debug
+        # and the optimised configurations keep their own levels.
+        $<$<NOT:$<CONFIG:Debug,Release,RelWithDebInfo,MinSizeRel>>:-O1>
     )
 elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
@@ -268,3 +295,26 @@ endif()
 # Install
 # ---------------------------------------------------------------------------
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# The window launcher (macOS)
+# ---------------------------------------------------------------------------
+# A title that replaces its executable (sys_game_process_exitspawn, done by a
+# port as an exec) loses its window with the old process image. The launcher
+# holds the window for the whole session instead: it runs the port with
+# PS3RECOMP_HOST_SURFACES set, the Metal backend renders into IOSurfaces it
+# shares (libs/video/rsx_host_surface.h), and the image an exec brings up
+# attaches to the same window again. One Objective-C file and no runtime
+# library, so it builds in seconds:
+#
+#   ./MyGameRecomp_window [--title T] [--size WxH] -- ./MyGameRecomp <args>
+if(APPLE)
+    enable_language(OBJC)
+    add_executable(${PROJECT_NAME}_window "${PS3RECOMP_DIR}/tools/host_window/host_window.m")
+    target_include_directories(${PROJECT_NAME}_window PRIVATE "${PS3RECOMP_DIR}/libs/video")
+    target_compile_definitions(${PROJECT_NAME}_window PRIVATE HOST_WINDOW_TITLE="${PROJECT_NAME}")
+    target_compile_options(${PROJECT_NAME}_window PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(${PROJECT_NAME}_window PRIVATE
+        "-framework AppKit" "-framework Metal" "-framework QuartzCore" "-framework IOSurface")
+    install(TARGETS ${PROJECT_NAME}_window RUNTIME DESTINATION bin)
+endif()

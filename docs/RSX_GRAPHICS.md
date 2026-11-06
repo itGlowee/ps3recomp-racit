@@ -29,8 +29,8 @@ RSX Command Processor             ← libs/video/rsx_commands.c
   ├──▶ D3D12 Backend              ← libs/video/rsx_d3d12_backend.c
   │    Real GPU rendering (Windows) with compiled shaders
   │
-  └──▶ Vulkan Backend             ← (planned)
-       Cross-platform GPU rendering
+  └──▶ Vulkan Backend             ← opt-in (Linux; PS3RECOMP_RSX_VULKAN)
+       Guest shaders on the shared draw engine
 
 Supporting files:
   libs/video/rsx_primitives.h      ← RSX → D3D12 topology mapping + index conversion

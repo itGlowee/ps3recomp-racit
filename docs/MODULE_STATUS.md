@@ -63,7 +63,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellPamf | PAMF Container | **Complete** | Big-endian PAMF header parser, stream queries, entry points, AVC/ATRAC3+/LPCM/AC3 info |
-| cellVdec | Video Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PICOUT callbacks (populated PicItem), no actual H.264/MPEG2 decode (needs FFmpeg) |
+| cellVdec | Video Decode | Partial | H.264 and MPEG-2 decode through FFmpeg loaded at run time (`-DPS3RECOMP_FFMPEG_RUNTIME=ON`, libavcodec present): pictures in display order with PICOUT, pts/dts/userData and picture type in the PicItem, YUV420/UYVY/ARGB/RGBA output, EndSeq flush. Without FFmpeg: AUDONE+PICOUT per AU and a black picture, as before |
 | cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PCMOUT callbacks (populated PcmItem), no actual AAC/ATRAC3+ decode (needs FFmpeg) |
 | cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set with callback sequencing, AU retrieval, flush |
 | cellVpost | Video Post | **Complete** | Handle management, query, exec stub (no actual color conversion/scaling) |
@@ -73,7 +73,8 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellJpgEnc | JPEG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
 | cellPngEnc | PNG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
 | cellSail | Media Player | **Complete** | Player lifecycle/state machine, open/start/stop/pause, immediate finish (no actual playback) |
-| cellAdecAtrac3p | ATRAC3+ Decode | **Complete** | ATRAC3plus audio decoder — open/close/decode/reset, outputs silence (2048 samples/frame), mono/stereo, 44.1/48kHz |
+| cellAtrac | ATRAC3plus | Partial | All-data-on-memory decode of ATRAC3plus RIFF files with looping, through FFmpeg loaded at run time. No streaming, no plain ATRAC3 |
+| cellAdecAtrac3p | ATRAC3+ Decode | Partial | Open/close/decode/reset, mono/stereo, 44.1/48kHz; outputs silence (2048 samples/frame). Real ATRAC3plus is in cellAtrac |
 | cellAdecCelp8 | CELP8 Decode | **Complete** | CELP8 voice codec — open/close/decode/reset, outputs silence (160 samples/frame @ 8kHz mono), multiple bitrate modes |
 | cellVdecDivx | DivX Decode | **Complete** | DivX video decoder — open/close/decode/reset, outputs black frames, Mobile/Home/HD profiles |
 
@@ -108,7 +109,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | sceNpCommerce | NP Commerce | **Complete** | Context management, store operations return NOT_CONNECTED (offline stub) |
 | sceNpClans | NP Clans | **Complete** | Create/join/leave/search clans, all return NOT_CONNECTED (offline stub) |
 | sceNpTus | NP TUS | **Complete** | Local variable/data storage, set/get/add/delete, per-slot with async polling |
-| sceNpMatching2 | NP Matching | **Complete** | Context start/stop, signaling/room callbacks, operations return SERVER_NOT_AVAILABLE |
+| sceNpMatching2 | NP Matching | **Complete** | Rooms, signaling and callbacks over a [psnr](ONLINE.md) server with `PS3_NET_ONLINE`; offline, operations return SERVER_NOT_AVAILABLE |
 | sceNpSignaling | NP Signaling | **Complete** | Context management, connection ops return NOT_CONNECTED, local net info |
 | sceNpSns | NP SNS | **Complete** | Facebook/Twitter stubs, operations return NOT_CONNECTED |
 | sceNpTrophy | NP Trophies | **Complete** | Persistent JSON storage, unlock with timestamps, progress tracking |
@@ -131,10 +132,10 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). No actual SPU execution |
+| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). Tasks, job chains and workloads run lifted SPU code; see SPU_LIFTER.md |
 | cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push with completion tracking, wait/tryWait with proper BUSY returns, port create/destroy, 16 max queues |
 | cellDaisy | Daisy Chain | **Complete** | Lock-free FIFO pipes with real ring buffer, push/pop/try variants, 32 max pipes, 256 max depth, count/free queries |
-| cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
+| cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext: scheduler, create, RunFibers, WaitSignal/SendSignal, JoinFiber, Yield, Exit, Self |
 | cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |
 | cellSync2 | Sync Primitives 2 | **Complete** | OS-backed mutex/cond/semaphore/queue with timeouts |
 
@@ -173,15 +174,21 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Status | Count |
 |---|---|
-| **Complete** | 93 |
-| Partial | 3 |
-| Not Started | ~3 |
-| **Total** | **~99** |
+| **Complete** | 91 |
+| Partial | 6 |
+| Stubbed | 0 |
+| Not Started | 0 |
+| **Total** | **97** |
+
+Counts are the module rows above (the ones with a Category column) whose Status
+column holds each value. Recount one status with
+`grep -c '^| [^|]* | [^|]* | Partial |' docs/MODULE_STATUS.md`; for Complete use
+`\*\*Complete\*\*` in place of `Partial`.
 
 ## Next Priorities
 
-1. **RSX command buffer processing** — Translate NV47xx methods to Vulkan/D3D12 draw calls (the graphics mountain)
-2. **cellSpurs** — Actual SPU program execution on host threads
-3. **cellVdec / cellAdec / cellDmux** — Integrate FFmpeg for actual video/audio decoding and demuxing
+1. **Metal and Vulkan at D3D12 parity** — the shared draw engine runs guest shaders on both; a title has yet to run on either from this tree
+2. **cellSpurs** — the remaining SPURS surface (Taskset2, workload edge cases)
+3. **cellAdec / cellDmux / cellSail** — Real audio decode and PAMF demux on the run-time FFmpeg loader cellVdec uses (`libs/codec/ffmpeg_runtime.c`)
 4. **cellJpgEnc / cellPngEnc** — Integrate stb_image_write for actual encoding
 5. **Remaining niche modules** — cellAdecExt, cellAudioExt, and any other game-specific needs

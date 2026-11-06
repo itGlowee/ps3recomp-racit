@@ -133,37 +133,26 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
 }
 
 /* ---- flow control -------------------------------------------------------- */
-/* The RSX takes longer programs than 512 instructions (544 slots); at 512 a
- * 532-instruction program in A Crack in Time lost its block openers past the
- * limit while the terminators were still emitted: unbalanced braces, "function
- * does not return a value: @main", and every draw using it dropped. */
-#define RSX_VP_MAX_INSTR 1024
+/* The transform program memory holds 544 slots (RSX_DSP_VP_INSTR), not 512:
+ * a branch target or block leader past slot 511 must still open a block. */
+#define RSX_VP_MAX_INSTR 544
 
 static u32 s_vp_branch_base = 0;   /* VP slot the program being decompiled starts at */
-/* NV4097_SET_TRANSFORM_BRANCH_BITS (0x1FF8) for the draw being translated:
- * BRB/CLB test one of its bits, so a program that has them is translated
- * per value (the engine keys on it -- rsx_vp_uses_branch_bits). */
-u32 rsx_vp_branch_bits = 0;
+void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
 
-int rsx_vp_uses_branch_bits(const void* ucode, u32 bytes)
+static u32 s_vp_branch_bits = 0;   /* SET_TRANSFORM_BRANCH_BITS, tested by BRB/CLB */
+void rsx_vp_set_branch_bits(u32 bits) { s_vp_branch_bits = bits; }
+
+int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes)
 {
-    /* The words as the decompiler reads them (rd_le: the dispatcher keeps the
-     * program in host order). Reading them big-endian looked at byte-swapped
-     * words, so most programs with BRB were called branch-free and translated
-     * with every bit 0 -- A Crack in Time's particle program then skipped the
-     * corner expansion and every particle (fire, shots, sparks) collapsed
-     * to a point. */
-    const u8* p = (const u8*)ucode;
-    for (u32 o = 0; o + 16u <= bytes; o += 16u) {
-        const u32 d1 = rd_le(p + o + 4);
-        const u32 d3 = rd_le(p + o + 12);
-        const u32 op = (d1 >> 27) & 0x1F;
-        if (op == 0x11 || op == 0x12) return 1;
-        if (d3 & 1u) break;
+    if (!ucode) return 0;
+    for (u32 off = 0; off + 16 <= max_bytes; off += 16) {
+        const u32 sca_op = (rd_le(ucode + off + 4) >> 27) & 0x1Fu;
+        if (sca_op == 0x11 || sca_op == 0x12) return 1;   /* BRB, CLB */
+        if (rd_le(ucode + off + 12) & 1u) break;          /* D3.end */
     }
     return 0;
 }
-void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
 
 /* BRA BRI CAL CLI RET BRB CLB (scalar opcodes). */
 static int vp_is_flow(u32 sca_op)
@@ -528,23 +517,20 @@ static int rsx_vp_decompile_impl(
                 snprintf(flow_term, sizeof flow_term,
                          "        if (%s) { if (_csp > 0) { _csp--; _pc = _cs[_csp]; } else _pc = -1; } else _pc = %d;\n",
                          c, next);
-            else {                                         /* BRB/CLB: boolean-register branches */
-                /* D3 [27:23] picks a bit of TRANSFORM_BRANCH_BITS, D3 [28] is
-                 * the value that takes the branch; the CC condition applies
-                 * on top. Known when the program is translated. Galacton's
-                 * particle program skips a MOV of a debug colour this way
-                 * (its hull was magenta while the MOV always ran). */
-                const u32 bi = (d3 >> 23) & 31u, want = (d3 >> 28) & 1u;
-                const int bit_ok = ((rsx_vp_branch_bits >> bi) & 1u) == want;
-                char bc[64];
-                snprintf(bc, sizeof bc, "%s", bit_ok ? c : "false");
-                if (sca_op == 0x11)                        /* BRB */
-                    snprintf(flow_term, sizeof flow_term, "        _pc = %s ? %u : %d; /* BRB b%u==%u */\n",
-                             bc, tgt, next, bi, want);
-                else                                       /* CLB */
+            else {                                         /* BRB, CLB */
+                /* A boolean branch tests bit D3[23:27] of the transform
+                 * branch bits against D3[28] and ignores the CC condition
+                 * (RPCS3's GetOptionalBranchCond). The bits are baked in:
+                 * the caller keys the program on them. */
+                const u32 bit = (s_vp_branch_bits >> ((d3 >> 23) & 0x1Fu)) & 1u;
+                const int taken = bit == ((d3 >> 28) & 1u);
+                if (!taken)
+                    snprintf(flow_term, sizeof flow_term, "        _pc = %d;\n", next);
+                else if (sca_op == 0x11)
+                    snprintf(flow_term, sizeof flow_term, "        _pc = %u;\n", tgt);
+                else
                     snprintf(flow_term, sizeof flow_term,
-                             "        if (%s) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d; /* CLB b%u==%u */\n",
-                             bc, next, tgt, next, bi, want);
+                             "        _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u;\n", next, tgt);
             }
         }
         /* ---- scalar ALU (reads SRC2) ---- */
@@ -631,6 +617,7 @@ static int rsx_vp_decompile_impl(
         "    float4 fog:FOG;\n"
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
          * pre-mapped by the harness to D3D clip space:
@@ -696,7 +683,9 @@ static int rsx_vp_decompile_impl(
     if (has_flow) emit(&o, "    }\n");
 
     /* Output register map (see header comment): o0 = HPOS through the RSX
-     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7. */
+     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7,
+     * o15 = TEX8, o6 = TEX9 (RPCS3's reg_table: TEX9 shares the point-size
+     * register). */
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"
@@ -708,6 +697,7 @@ static int rsx_vp_decompile_impl(
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
         "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
+        "    Out.t8=o[15]; Out.t9=o[6];\n"
         "    return Out;\n"
         "}\n");
 
@@ -715,4 +705,42 @@ static int rsx_vp_decompile_impl(
     (void)n_flow_skipped;
     if (o.overflow) return -1;
     return instrs;
+}
+
+/* See rsx_vp_decompiler.h. The distances go after the last declared output,
+ * so the user varyings keep their locations. */
+int rsx_vp_apply_user_clip(char* hlsl, size_t cap, u32 ops)
+{
+    if (!ops) return 0;
+    if (!hlsl) return -1;
+    static const char decl_at[] = "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n";
+    static const char ret_at[] = "    return Out;\n";
+    char* d = strstr(hlsl, decl_at);
+    char* r = NULL;
+    for (char* q = strstr(hlsl, ret_at); q; q = strstr(q + 1, ret_at)) r = q;
+    if (!d || !r || r < d) return -1;
+    const int hi = (ops >> 8) != 0;   /* planes 4/5 */
+    char decl[128], body[512];
+    snprintf(decl, sizeof decl, "    float4 clipd0:SV_ClipDistance0;%s\n",
+             hi ? " float2 clipd1:SV_ClipDistance1;" : "");
+    static const char* comp[6] = { "o[5].y", "o[5].z", "o[5].w", "o[6].y", "o[6].z", "o[6].w" };
+    char lane[6][48];
+    for (u32 p = 0; p < 6; p++) {
+        const u32 op = (ops >> (p * 2u)) & 3u;
+        if (op == 2u)      snprintf(lane[p], sizeof lane[p], "%s", comp[p]);
+        else if (op == 1u) snprintf(lane[p], sizeof lane[p], "-(%s)", comp[p]);
+        else               snprintf(lane[p], sizeof lane[p], "0.5");
+    }
+    int n = snprintf(body, sizeof body, "    Out.clipd0 = float4(%s, %s, %s, %s);\n",
+                     lane[0], lane[1], lane[2], lane[3]);
+    if (hi) snprintf(body + n, sizeof body - (size_t)n, "    Out.clipd1 = float2(%s, %s);\n", lane[4], lane[5]);
+    const size_t len = strlen(hlsl), dl = strlen(decl), bl = strlen(body);
+    if (len + dl + bl + 1 > cap) return -1;
+    const size_t doff = (size_t)(d - hlsl) + sizeof decl_at - 1, roff = (size_t)(r - hlsl);
+    /* The body first (it is further on), then the declaration. */
+    memmove(hlsl + roff + bl, hlsl + roff, len - roff + 1);
+    memcpy(hlsl + roff, body, bl);
+    memmove(hlsl + doff + dl, hlsl + doff, len + bl - doff + 1);
+    memcpy(hlsl + doff, decl, dl);
+    return 0;
 }

@@ -9,7 +9,9 @@
  * from inside a loop and so called exit 1,435 times in one run, staying alive
  * and holding whatever it held. Arm a jump in the thread proc and unwind to it
  * instead. PS3_NO_THREAD_EXIT_UNWIND=1 restores the old behaviour. */
-#if defined(_MSC_VER)   /* clang/mingw ignores __declspec(thread): it would be ONE global */
+/* MinGW GCC ignores __declspec(thread) ("'thread' attribute directive
+ * ignored"), which would make these two process-wide: MSVC only. */
+#if defined(_MSC_VER)
 #  define PPU_TLS __declspec(thread)
 #else
 #  define PPU_TLS __thread
@@ -20,9 +22,13 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <stddef.h>
 #include "sys_ppu_thread.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
+#include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
+#include "ps3emu/ps3_tprof.h"            /* PS3_TPROF: in-process thread samples */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
+#include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -75,8 +81,11 @@ static void table_unlock(void)
 #endif
 }
 
-/* Guest stacks of threads whose slots were reclaimed, for the next thread
- * that fits (the stack region is a bump allocator that never frees). */
+/* racacit: guest stacks of threads whose slots went FREE, for the next
+ * thread that fits. The stack region is a bump allocator that never frees, and
+ * A Crack in Time starts an "Auto Save Thread" and a "Scaleform Async Load"
+ * for every checkpoint and menu: without reuse each one took fresh stack
+ * space until long play ran the region out. Under the table lock. */
 static struct { uint32_t addr, size; } s_free_stacks[PPU_THREAD_MAX * 2];
 static int s_n_free_stacks;
 
@@ -96,90 +105,30 @@ static uint32_t thread_stack_alloc(uint32_t* size)
     return vm_stack_allocate(&g_vm_stack_alloc, need);
 }
 
-/* Has the host thread behind a slot fully ended (nothing of it still runs
- * the epilogue that touches the slot)? */
-static int thread_host_done(ppu_thread_info* t)
+/* A slot going FREE: keep its guest stack for reuse (never the main thread's). */
+static void thread_stack_keep(ppu_thread_info* t)
 {
-#ifdef _WIN32
-    return !t->host_thread || WaitForSingleObject(t->host_thread, 0) == WAIT_OBJECT_0;
-#else
-    return t->finished;
-#endif
-}
-
-/* A finished thread's slot back to FREE: its handles closed, its stack kept
- * for reuse. Under the table lock. */
-static void thread_slot_reclaim(ppu_thread_info* t)
-{
-#ifdef _WIN32
-    if (t->host_thread) CloseHandle(t->host_thread);
-    if (t->finish_event) CloseHandle(t->finish_event);
-    t->host_thread = NULL; t->finish_event = NULL;
-#else
-    pthread_detach(t->host_thread);
-    pthread_mutex_destroy(&t->finish_mutex);
-    pthread_cond_destroy(&t->finish_cond);
-#endif
-    if (t->stack_addr && t->stack_size && s_n_free_stacks < (int)(sizeof s_free_stacks / sizeof s_free_stacks[0])) {
+    if (t != &g_ppu_threads[0] && t->stack_addr && t->stack_size &&
+        s_n_free_stacks < (int)(sizeof s_free_stacks / sizeof s_free_stacks[0])) {
         s_free_stacks[s_n_free_stacks].addr = t->stack_addr;
         s_free_stacks[s_n_free_stacks].size = t->stack_size;
         s_n_free_stacks++;
     }
-    t->state = PPU_THREAD_STATE_FREE;
+    t->stack_addr = 0; t->stack_size = 0;
 }
 
 /* Find a free slot. Returns index or -1. Must be called under lock.
- *
- * A thread created without SYS_PPU_THREAD_CREATE_JOINABLE is gone once it
- * exits, on hardware; here its slot is reclaimed when the next thread needs
- * one (not at exit: the exiting host thread still touches the slot). And when
- * every slot is taken, a finished thread nobody joined is reclaimed rather
- * than failing the create: A Crack in Time starts an "Auto Save Thread" and a
- * "Scaleform Async Load" for every checkpoint and menu, and once the 64 slots
- * were full of finished ones the next create failed and the game waited for a
- * thread that never came -- the freeze ten to twenty minutes into play.
- *
- * Slots are handed out round-robin, starting after the last one given, so an
- * id comes back only after the other 63 have been used. The id is the slot,
- * and lv2 never reissues an id this soon. A Crack in Time polls a finished
- * save thread's id with sys_ppu_thread_get_priority until ESRCH. Save threads
- * are never joined, so their slots stay FINISHED and are taken back only when
- * no slot is free (the second and third loops). After long play the table is
- * full, and the old lowest-first search then gave the slot of the autosave
- * that had just ended to the next thread. When that was the session's first
- * movie, its "Bink Audio Thread" (alive until the game quits) kept the poll
- * answering OK. The save manager stayed busy, so autosaves stopped and the
- * Save menu dimmed the screen and waited with the save icon flashing. */
-static int s_next_slot;
-
-static int take_slot(int i)
-{
-    s_next_slot = (i + 1) % PPU_THREAD_MAX;
-    return i;
-}
-
+ * The thread id is the slot + 1. A title that polls sys_ppu_thread_get_priority(id) until it returns ESRCH (to see a
+ * worker finish) only gets its answer if the next thread does not take that slot, and so that id, at once. So the
+ * search continues after the slot used last (next-fit): an id comes back only after the other slots were used. */
 static int find_free_slot(void)
 {
+    static int s_next = 0;
     for (int n = 0; n < PPU_THREAD_MAX; n++) {
-        const int i = (s_next_slot + n) % PPU_THREAD_MAX;
-        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE)
-            return take_slot(i);
-    }
-    for (int n = 0; n < PPU_THREAD_MAX; n++) {
-        const int i = (s_next_slot + n) % PPU_THREAD_MAX;
-        ppu_thread_info* t = &g_ppu_threads[i];
-        if (t->state == PPU_THREAD_STATE_FINISHED && !t->joinable && thread_host_done(t)) {
-            thread_slot_reclaim(t);
-            return take_slot(i);
-        }
-    }
-    for (int n = 0; n < PPU_THREAD_MAX; n++) {
-        const int i = (s_next_slot + n) % PPU_THREAD_MAX;
-        ppu_thread_info* t = &g_ppu_threads[i];
-        if (t->state == PPU_THREAD_STATE_FINISHED && thread_host_done(t)) {
-            fprintf(stderr, "[SYS] thread table full: reclaiming tid %d \"%s\" (finished, never joined)\n", i + 1, t->name);
-            thread_slot_reclaim(t);
-            return take_slot(i);
+        int i = (s_next + n) % PPU_THREAD_MAX;
+        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE) {
+            s_next = (i + 1) % PPU_THREAD_MAX;
+            return i;
         }
     }
     return -1;
@@ -195,6 +144,68 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
 }
 
 /* ---------------------------------------------------------------------------
+ * Priority at thread start (PS3_PRIO_START=1, off by default)
+ *
+ * On lv2 a thread created with a higher priority (a lower number) than its creator preempts the creator and runs
+ * until it blocks. SDK libraries rely on it: the SurMixer thread (prio 400, typically created by a prio 1000 thread)
+ * creates the event queue whose key its creator passes to cellAudioSetNotifyEventQueue right after the create
+ * returns, with no synchronisation of their own. Host threads run side by side, so the creator can read the key
+ * before it is written, and the mixer is never notified. With PS3_PRIO_START=1 sys_ppu_thread_create waits until
+ * such a thread reaches a blocking call (ppu_thread_note_block), for at most PRIO_START_TIMEOUT_MS so that a thread
+ * which blocks somewhere not reported, or never blocks, cannot hold its creator up for long.
+ *
+ * Off by default: it changes thread interleaving for every title, and the regression gate's goldens are recorded
+ * without it.
+ * -----------------------------------------------------------------------*/
+#define PPU_DEFAULT_PRIORITY   1000   /* what sys_ppu_thread_get_priority reports for a thread not in the table */
+#define PRIO_START_TIMEOUT_MS  200
+#define PRIO_START_SPIN_MS     2      /* yield instead of sleeping for this long: Sleep(1) is ~15 ms on Windows */
+
+static int prio_start_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3_PRIO_START") ? 1 : 0;
+    return on;
+}
+
+void ppu_thread_note_block(uint64_t tid)
+{
+    if (tid == 0 || tid > PPU_THREAD_MAX) return;
+    int* blocked = &g_ppu_threads[tid - 1].blocked;
+    /* Load first: the wait syscalls call this on every wait, and most threads blocked long ago. */
+    if (!__atomic_load_n(blocked, __ATOMIC_RELAXED))
+        __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
+}
+
+/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
+ * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+static int32_t creator_priority(uint64_t tid)
+{
+    const ppu_thread_info* c = find_thread(tid);
+    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    return c->priority;
+}
+
+/* Called without the table lock, right after the creator made `t`. The acquire load pairs with the release store in
+ * ppu_thread_note_block, so whatever `t` wrote before it blocked (the event queue key above) is visible here. */
+static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
+{
+    const ULONGLONG start = GetTickCount64();
+    for (;;) {
+        if (__atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE)) return;
+        const int state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+        /* Ended before blocking (a detached thread is DETACHED while it still runs). */
+        if (state == PPU_THREAD_STATE_FINISHED || state == PPU_THREAD_STATE_FREE) return;
+        const ULONGLONG waited = GetTickCount64() - start;
+        if (waited >= PRIO_START_TIMEOUT_MS) break;
+        if (waited < PRIO_START_SPIN_MS) SwitchToThread();
+        else                             Sleep(1);
+    }
+    fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
+            (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
+}
+
+/* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
@@ -204,6 +215,7 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
+    ps3_thread_name("ppu %s", info->name);
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -219,11 +231,11 @@ static void* ppu_host_thread_proc(void* param)
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+    ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
 
-    { char _hb[160]; snprintf(_hb, sizeof _hb, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
+    fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());
-      fputs(_hb, stderr); }   /* one write: threads start together and interleave */
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
@@ -262,16 +274,34 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
+    ps3_tprof_thread_exit();
     /* Mark as finished */
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
 
-    if (info->state == PPU_THREAD_STATE_DETACHED) {
-        /* Detached threads self-clean */
+    /* A thread nobody can join (created without SYS_PPU_THREAD_CREATE_JOINABLE, or detached)
+     * frees its slot here, its last use of `info`. The sync objects go first, under the table lock: once the slot is
+     * FREE a new sys_ppu_thread_create may reuse it and create its own. Joinable threads stay FINISHED for the join. */
+    if (!info->joinable) {
+#ifdef _WIN32
+        if (info->finish_event) CloseHandle(info->finish_event);
+        if (info->host_thread) CloseHandle(info->host_thread);
+        info->finish_event = NULL;
+        info->host_thread = NULL;
+#else
+        pthread_mutex_destroy(&info->finish_mutex);
+        pthread_cond_destroy(&info->finish_cond);
+#endif
+        thread_stack_keep(info);
         info->state = PPU_THREAD_STATE_FREE;
-    } else {
-        info->state = PPU_THREAD_STATE_FINISHED;
+        table_unlock();
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
     }
+    info->state = PPU_THREAD_STATE_FINISHED;
     table_unlock();
 
     /* Signal anyone waiting for join */
@@ -323,23 +353,6 @@ void ydkj_release_pending_threads(void) {}
  * for main before any sys_ppu_thread_create so every thread has a unique
  * nonzero id and the special cases die.
  * -----------------------------------------------------------------------*/
-/* racacit stall watch (game/main.cpp): the guest stack of every running
- * created thread, and of the main thread from the context it runs on (slot
- * 0 only reserves its id). Unlocked and racy by design -- a diagnostic read
- * of threads that are, by the time it runs, stuck. */
-void ppu_threads_dump_stacks(ppu_context* main_ctx)
-{
-    extern void ppu_dump_guest_stack(ppu_context*, const char*);
-    if (main_ctx) ppu_dump_guest_stack(main_ctx, "stall main");
-    for (int i = 1; i < PPU_THREAD_MAX; i++) {
-        ppu_thread_info* t = &g_ppu_threads[i];
-        if (t->state != PPU_THREAD_STATE_RUNNING) continue;
-        char tag[96];
-        snprintf(tag, sizeof tag, "stall tid %d %.40s", i + 1, t->name);
-        ppu_dump_guest_stack(&t->ctx, tag);
-    }
-}
-
 uint64_t ppu_thread_register_main(void)
 {
     table_lock();
@@ -350,6 +363,9 @@ uint64_t ppu_thread_register_main(void)
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
+        ps3_ft_name(1, "main");
+        ps3_tprof_thread('P', 1);
+        ps3_thread_name("ppu main");      /* registered from the boot thread itself */
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
@@ -359,21 +375,6 @@ uint64_t ppu_thread_register_main(void)
     }
     table_unlock();
     return 1;
-}
-
-/* racacit: the main thread's stack is set up by the runner, not by
- * sys_ppu_thread_create, so the table had no range for it and
- * sys_ppu_thread_get_stack_information answered (0xD0000000, 1 MB) -- the
- * first CREATED thread's region. A Crack in Time copies into the range it is
- * told is its stack, which landed on another thread's guard page. */
-static uint32_t s_main_stack_addr = 0, s_main_stack_size = 0;
-void ppu_thread_set_main_stack(uint32_t top, uint32_t size)
-{
-    table_lock();
-    s_main_stack_addr = top - size; s_main_stack_size = size;
-    g_ppu_threads[0].stack_addr = top - size;
-    g_ppu_threads[0].stack_size = size;
-    table_unlock();
 }
 
 /* ---------------------------------------------------------------------------
@@ -447,7 +448,7 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
     ppu_thread_info* t = (ppu_thread_info*)p;
     int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
     if (!in_range) { s_prof_main_pc = lr; return; }
-    { static int _n = 0; if ((_n < 0 && (_n++, 1)))
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 0))
         fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
                 vctx, (void*)g_ppu_threads, in_range, lr); }
     if (in_range)
@@ -478,7 +479,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     ppu_thread_info* t = &g_ppu_threads[slot];
     memset(t, 0, sizeof(*t));
 
-    /* Allocate guest stack (a reclaimed thread's, when one fits) */
+    /* Allocate guest stack (a freed one if it fits) */
     uint32_t stack_addr = thread_stack_alloc(&stack_size);
     if (stack_addr == 0) {
         table_unlock();
@@ -498,10 +499,10 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     t->state      = PPU_THREAD_STATE_RUNNING;
     t->priority   = priority;
-    /* SYS_PPU_THREAD_CREATE_JOINABLE (bit 0). PS3_ALL_THREADS_JOINABLE=1:
-     * every thread joinable, as before. */
-    { static int all = -1; if (all < 0) all = getenv("PS3_ALL_THREADS_JOINABLE") ? 1 : 0;
-      t->joinable = (all || (flags & 1u)) ? 1 : 0; }
+    /* SYS_PPU_THREAD_CREATE_JOINABLE is bit 0 of the flags. If every thread were joinable, a thread created without
+     * the flag (nobody will ever join it) would stay FINISHED after its exit and keep its slot, and a title that
+     * starts a short-lived worker per task would see CELL_EAGAIN once 63 of them had run. */
+    t->joinable   = (flags & 1u) ? 1 : 0;
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
@@ -511,6 +512,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     /* Create synchronization for join */
@@ -581,6 +583,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
+        thread_stack_keep(t);
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
         table_unlock();
@@ -629,15 +632,19 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         }
     }
     if (rc != 0) {
+        thread_stack_keep(t);
         t->state = PPU_THREAD_STATE_FREE;
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
+    if (!t->joinable) pthread_detach(t->host_thread);   /* nobody pthread_joins it */
 #endif
 
+    const int preempts = prio_start_enabled() && priority < creator_priority(ctx->thread_id);
     table_unlock();
+    if (preempts) wait_first_block(t, thread_id);
     return CELL_OK;
 }
 
@@ -657,11 +664,11 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
-        if (t->state == PPU_THREAD_STATE_DETACHED) {
-            t->state = PPU_THREAD_STATE_FREE;
-        } else {
+        /* A non-joinable host thread frees its slot in ppu_host_thread_proc, right after the
+         * unwind below (freeing it here let a new thread take the slot while this one still ran its epilogue).
+         * The main thread (slot 0) has no such epilogue and is marked FINISHED as before. */
+        if (t->joinable || t == &g_ppu_threads[0])
             t->state = PPU_THREAD_STATE_FINISHED;
-        }
 
 #ifdef _WIN32
         SetEvent(t->finish_event);
@@ -694,7 +701,8 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(n<30 && (n++, 1)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -768,6 +776,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);
 #endif
+    thread_stack_keep(t);
     t->state = PPU_THREAD_STATE_FREE;
     table_unlock();
 
@@ -800,6 +809,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
 #endif
+        thread_stack_keep(t);
         t->state = PPU_THREAD_STATE_FREE;
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;
@@ -1237,14 +1247,9 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
-    /* racacit: an exited thread is gone as far as lv2 is concerned -- RPCS3 and
-     * hardware answer ESRCH. A Crack in Time runs its save-data job on a worker
-     * thread and polls get_priority until it reports ESRCH; answering OK for the
-     * finished (or already reaped) thread left the save state machine busy and
-     * the boot waiting on it forever. Only ids we have actually issued count;
-     * anything else keeps the old permissive default below. */
-    if ((t && t->state == PPU_THREAD_STATE_FINISHED) ||
-        (!t && tid >= 2 && tid <= PPU_THREAD_MAX)) {
+    if (!t && tid >= 1 && tid <= PPU_THREAD_MAX && g_ppu_threads[tid - 1].entry_addr != 0) {
+        /* A thread created by sys_ppu_thread_create that has exited and been freed (the slot keeps its entry address):
+         * it is gone (ESRCH). */
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
@@ -1255,7 +1260,7 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
          * "Error initializing PSSG"). Report a sane default priority + success. */
         table_unlock();
         if (prio_addr != 0) {
-            int32_t prio = 1000;
+            int32_t prio = PPU_DEFAULT_PRIORITY;
             int32_t* out = (int32_t*)vm_to_host(prio_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
             uint32_t u = (uint32_t)prio;
@@ -1331,6 +1336,7 @@ int64_t sys_ppu_thread_rename(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     table_unlock();
@@ -1373,54 +1379,87 @@ int64_t sys_ppu_thread_get_join_state(ppu_context* ctx)
  * r3 = pointer to receive stack info struct
  *   struct { u32 addr; u32 size; }
  * -----------------------------------------------------------------------*/
+/* The main thread's stack, for a host that runs it on one of its own (the
+ * template's STACK_TOP, say). ppu_run takes only a stack top, so the host sets
+ * these before it; a size of 0 keeps the default below. */
+uint32_t g_ppu_main_stack_addr = 0;
+/* racacit: the loader reports the main thread's guest stack (ppu_loader.cpp). */
+void ppu_thread_set_main_stack(uint32_t top, uint32_t size)
+{
+    extern uint32_t g_ppu_main_stack_size;
+    table_lock();
+    g_ppu_main_stack_addr = top - size; g_ppu_main_stack_size = size;
+    table_unlock();
+}
+
+/* racacit: every running guest thread's stack, for the stall watchdog
+ * (game/main.cpp). */
+void ppu_threads_dump_stacks(ppu_context* main_ctx)
+{
+    extern void ppu_dump_guest_stack(ppu_context*, const char*);
+    if (main_ctx) ppu_dump_guest_stack(main_ctx, "stall main");
+    for (int i = 1; i < PPU_THREAD_MAX; i++) {
+        ppu_thread_info* t = &g_ppu_threads[i];
+        if (t->state != PPU_THREAD_STATE_RUNNING) continue;
+        char tag[96];
+        snprintf(tag, sizeof tag, "stall tid %d %.40s", i + 1, t->name);
+        ppu_dump_guest_stack(&t->ctx, tag);
+    }
+}
+uint32_t g_ppu_main_stack_size = 0;
+
+/* What the main thread is told. The default names the first allocation in the
+ * thread stack region (VM_STACK_BASE), which is where a host that gives main an
+ * lv2-style stack puts it (boot_main.cpp, PS3_MAIN_STACK_LV2). */
+static void main_stack_info(uint32_t* addr, uint32_t* size)
+{
+    if (g_ppu_main_stack_size) {
+        *addr = g_ppu_main_stack_addr;
+        *size = g_ppu_main_stack_size;
+    } else {
+        *addr = VM_STACK_BASE;
+        *size = VM_PPU_STACK_SIZE;
+    }
+}
+
 int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
     uint64_t tid = ctx->thread_id;
+    uint32_t sa, ss;
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
-    if (!t) {
-        table_unlock();
-        /* For the main thread, return sensible defaults */
-        if (out_addr != 0) {
-            uint32_t* out = (uint32_t*)vm_to_host(out_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-            /* byteswap both fields */
-            uint32_t sa = s_main_stack_size ? s_main_stack_addr : VM_STACK_BASE;
-            uint32_t ss = s_main_stack_size ? s_main_stack_size : VM_PPU_STACK_SIZE;
-            sa = ((sa >> 24) & 0xFF) | ((sa >> 8) & 0xFF00) |
-                 ((sa <<  8) & 0xFF0000) | ((sa << 24) & 0xFF000000u);
-            ss = ((ss >> 24) & 0xFF) | ((ss >> 8) & 0xFF00) |
-                 ((ss <<  8) & 0xFF0000) | ((ss << 24) & 0xFF000000u);
-            out[0] = sa;
-            out[1] = ss;
-#else
-            out[0] = VM_STACK_BASE;
-            out[1] = VM_PPU_STACK_SIZE;
-#endif
-        }
-        return CELL_OK;
+    /* The main thread is in the table (ppu_thread_register_main, slot 0) but
+     * has no recorded stack. Reporting its 0 + 0 sent a title that looks for
+     * data at (addr + size - 0x1000) to 0xFFFFF000. A context with no table
+     * entry at all gets the same main-thread answer, as before. */
+    if (t && t->stack_size) {
+        sa = t->stack_addr;
+        ss = t->stack_size;
+    } else {
+        main_stack_info(&sa, &ss);
     }
+    table_unlock();
+
+    static int s_log = -1;
+    if (s_log < 0) s_log = getenv("PPU_STACKINFO_LOG") ? 1 : 0;
+    if (s_log)
+        fprintf(stderr, "[ppu_thread] get_stack_information tid=%llu -> 0x%08X+0x%X\n",
+                (unsigned long long)tid, sa, ss);
 
     if (out_addr != 0) {
         uint32_t* out = (uint32_t*)vm_to_host(out_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        uint32_t sa = t->stack_addr;
-        uint32_t ss = t->stack_size;
+        /* byteswap both fields */
         sa = ((sa >> 24) & 0xFF) | ((sa >> 8) & 0xFF00) |
              ((sa <<  8) & 0xFF0000) | ((sa << 24) & 0xFF000000u);
         ss = ((ss >> 24) & 0xFF) | ((ss >> 8) & 0xFF00) |
              ((ss <<  8) & 0xFF0000) | ((ss << 24) & 0xFF000000u);
+#endif
         out[0] = sa;
         out[1] = ss;
-#else
-        out[0] = t->stack_addr;
-        out[1] = t->stack_size;
-#endif
     }
-
-    table_unlock();
     return CELL_OK;
 }
 

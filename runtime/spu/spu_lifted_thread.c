@@ -1,7 +1,9 @@
 /* spu_lifted_thread.c -- see spu_lifted_thread.h for what this is for. */
 
 #include "spu_lifted_thread.h"
+#include "spu_coherency.h"
 #include "spu_context.h"
+#include "ps3emu/ps3_tprof.h"   /* PS3_TPROF: in-process thread samples */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +17,6 @@ int  spu_have_function(uint32_t addr);
 int  spu_image_of_function(uint32_t addr);
 void spu_indirect_branch(struct spu_context* ctx);
 int  spu_run_with_halt(void (*entry)(struct spu_context*), struct spu_context* ctx);
-void spu_mfc_release(struct spu_context* ctx);
 
 /* Guest memory is big-endian and this file reads descriptors out of it. lv2 has
  * its own copy of this helper; duplicating four lines is cheaper than exporting
@@ -86,7 +87,7 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
      * case. Asking the registry which image owns the entry point gets the same
      * answer the title's own registration order implies, without the lv2 layer
      * having to know any image ids. */
-    { int img = spu_image_of_function(ctx->pc);
+    { int img = d->image_id > 0 ? d->image_id : spu_image_of_function(ctx->pc);
       ctx->image_id = (img >= 0) ? img : 0; }
 
     if (d->img_ea) spu_deploy_image(ctx, d->img_ea);
@@ -116,6 +117,7 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
     fflush(stderr);
 
     ctx->status = SPU_STATUS_RUNNING;
+    ps3_tprof_thread('S', ctx->spu_id);
     /* The dispatcher resolves ctx->pc in ctx->image_id and runs it; the halt
      * landing pad catches an SPU that stops from inside a nested call, and
      * drains the tail-transfer chain when it returns normally. */
@@ -149,19 +151,11 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
             r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
     fflush(stderr);
 
-    /* The SPU has stopped, so its MFC engine is idle and the slot it holds in
-     * the per-context table can go back. There are eight of those and they used
-     * to be claimed for good, which a title only notices once it has started
-     * its ninth SPU thread: from there on every thread shares one engine with
-     * every other, tags and queue included. This is the natural place to give
-     * one back -- the context may be started again (the group is destroyed
-     * later, and lv2 keeps the context until then), and a fresh run claims a
-     * freshly initialized engine, which is what a fresh SPU thread should get.
-     *
-     * The fallback and interpreter paths are unchanged: neither runs a context
-     * through here, so both keep the engine they had for as long as they had
-     * it. */
+    /* This thread run has ended; remove observer references and release its
+     * private engine before restart can reset the context or destroy frees it. */
+    spu_coh_unregister(ctx);
     spu_mfc_release(ctx);
+    ps3_tprof_thread_exit();
 
     if (out) *out = r;
 }

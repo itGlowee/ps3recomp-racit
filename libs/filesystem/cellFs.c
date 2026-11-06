@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#include "ps3emu/log_first.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -70,7 +71,9 @@ static void init_default_mappings(void)
     s_initialized = 1;
 
     cellfs_add_path_mapping("/dev_hdd0/",  "gamedata/dev_hdd0/");
-    cellfs_add_path_mapping("/dev_bdvd/",  "gamedata/dev_bdvd/");
+    const char* disc_root = getenv("PS3_VFS_ROOT");
+    cellfs_add_path_mapping("/dev_bdvd/",
+                           disc_root && *disc_root ? disc_root : "gamedata/dev_bdvd/");
     cellfs_add_path_mapping("/dev_flash/", "gamedata/dev_flash/");
     cellfs_add_path_mapping("/app_home/",  "gamedata/app_home/");
     cellfs_add_path_mapping("/dev_usb000/","gamedata/dev_usb/");
@@ -117,7 +120,15 @@ void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path)
     }
 }
 
-/* Translate a PS3 path to a host path. Returns 0 on success, -1 if no mapping found.
+static int host_path_is_absolute(const char* path)
+{
+    return path[0] == '/' || path[0] == '\\' ||
+           (((path[0] >= 'A' && path[0] <= 'Z') ||
+             (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' &&
+            (path[2] == '/' || path[2] == '\\'));
+}
+
+/* Translate a PS3 path to a host path. Returns 0 on success, -1 on failure.
  * Also exposed publicly as cellfs_translate_path() for use by other modules. */
 static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
@@ -157,25 +168,34 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
         return -1;
 
     const char* remainder = ps3_path + best_len;
-    const char* hp = s_path_mappings[best].host_path;
-    /* An absolute mapping (a port pointing a device at a real directory)
-     * stands on its own; only relative ones live under the root. */
-    if (hp[0] == '/' || hp[0] == '\\' || (hp[0] && hp[1] == ':'))
-        snprintf(host_buf, buf_size, "%s%s", hp, remainder);
-    else
-        snprintf(host_buf, buf_size, "%s/%s%s", s_root_path, hp, remainder);
+    const char* mapped = s_path_mappings[best].host_path;
+    const size_t mapped_len = strlen(mapped);
+    const char* separator = *remainder && mapped_len &&
+        mapped[mapped_len - 1] != '/' && mapped[mapped_len - 1] != '\\' ? "/" : "";
+    /* Work in a full-size path buffer: the shared fallback can expand a path
+     * by inserting PS3_GAME. Copy only after its final size is known. */
+    char translated[CELL_FS_MAX_FS_PATH_LENGTH];
+    const int length = host_path_is_absolute(mapped)
+        ? snprintf(translated, sizeof(translated), "%s%s%s", mapped, separator, remainder)
+        : snprintf(translated, sizeof(translated), "%s/%s%s%s", s_root_path,
+                   mapped, separator, remainder);
+    if (length < 0 || (size_t)length >= sizeof(translated)) {
+        host_buf[0] = '\0';
+        return -1;
+    }
 
     /* A mapped path with an empty remainder ends in a separator ("…/dev_hdd0/"),
      * and stat() rejects that on Windows -- so the directory a game asks about
      * reads as missing even when it is right there. Trim it. */
-    { size_t hl = strlen(host_buf);
-      while (hl > 1 && (host_buf[hl-1] == '/' ||
-                        host_buf[hl-1] == '\\')) {
-          host_buf[hl-1] = '\0'; hl--;
+    { size_t hl = strlen(translated);
+      const size_t root_len = translated[1] == ':' && host_path_is_absolute(translated) ? 3 : 1;
+      while (hl > root_len && (translated[hl-1] == '/' ||
+                               translated[hl-1] == '\\')) {
+          translated[hl-1] = '\0'; hl--;
       } }
 
     /* Normalize slashes */
-    for (char* p = host_buf; *p; p++) {
+    for (char* p = translated; *p; p++) {
 #ifdef _WIN32
         if (*p == '/') *p = '\\';
 #else
@@ -184,7 +204,13 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
     }
 
     extern void ps3_vfs_ps3game_fallback(char* path, size_t cap);
-    ps3_vfs_ps3game_fallback(host_buf, buf_size);
+    ps3_vfs_ps3game_fallback(translated, sizeof(translated));
+    const size_t final_size = strlen(translated) + 1;
+    if (final_size > buf_size) {
+        host_buf[0] = '\0';
+        return -1;
+    }
+    memcpy(host_buf, translated, final_size);
     return 0;
 }
 
@@ -467,7 +493,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     return CELL_OK;
 }
 
-/* NID: 0x4D5FF8E2 */
+/* NID: 0x2CB51F0D */
 s32 cellFsClose(CellFsFd fd)
 {
     printf("[cellFs] Close(fd=%d)\n", fd);
@@ -484,7 +510,7 @@ s32 cellFsClose(CellFsFd fd)
     return CELL_OK;
 }
 
-/* NID: 0xBABF9143 */
+/* NID: 0x4D5FF8E2 */
 s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 {
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
@@ -505,7 +531,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     }
 
     { static int _n = 0;
-      if ((_n < 32 && (_n++, 1)))
+      if (PS3_LOG_FIRST(_n, 32))
           { printf("[cellFs] Read(fd=%d, buf=0x%08X, %llu bytes) -> %llu", fd,
                    (uint32_t)(uintptr_t)buf,
                    (unsigned long long)nbytes, (unsigned long long)bytes_read);
@@ -526,7 +552,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     return CELL_OK;
 }
 
-/* NID: 0x1E9B6714 */
+/* NID: 0xECDCF2AB */
 s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
 {
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
@@ -576,7 +602,7 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
     return CELL_OK;
 }
 
-/* NID: 0xEF3BBD5A */
+/* NID: 0xEF3EFA34 */
 s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
 {
     printf("[cellFs] Fstat(fd=%d)\n", fd);
@@ -616,7 +642,7 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
     return CELL_OK;
 }
 
-/* NID: 0x2CB51F0D */
+/* NID: 0x7DE6DCED */
 s32 cellFsStat(const char* path, CellFsStat* sb)
 {
     printf("[cellFs] Stat(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -647,7 +673,7 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
     return CELL_OK;
 }
 
-/* NID: 0x6D3BB15B */
+/* NID: 0xC9DC3AC5 */
 s32 cellFsTruncate(const char* path, u64 size)
 {
     printf("[cellFs] Truncate(path='%s', size=%llu)\n", gpath(path) ? gpath(path) : "<null>",
@@ -679,7 +705,7 @@ s32 cellFsTruncate(const char* path, u64 size)
     return CELL_OK;
 }
 
-/* NID: 0x82D3AB53 */
+/* NID: 0x0E2939E5 */
 s32 cellFsFtruncate(CellFsFd fd, u64 size)
 {
     printf("[cellFs] Ftruncate(fd=%d, size=%llu)\n", fd, (unsigned long long)size);
@@ -701,7 +727,7 @@ s32 cellFsFtruncate(CellFsFd fd, u64 size)
     return CELL_OK;
 }
 
-/* NID: 0xC1C507E7 */
+/* NID: 0x1A108AB7 */
 s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
 {
     printf("[cellFs] GetBlockSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -715,7 +741,7 @@ s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
     return CELL_OK;
 }
 
-/* NID: 0x2C2C5F71 */
+/* NID: 0xAA3B4BCD */
 s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 {
     printf("[cellFs] GetFreeSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -745,7 +771,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
     return CELL_OK;
 }
 
-/* NID: 0x3F61245C */
+/* NID: 0x99406D0B */
 s32 cellFsChmod(const char* path, s32 mode)
 {
     printf("[cellFs] Chmod(path='%s', mode=0%o)\n", gpath(path) ? gpath(path) : "<null>", mode);
@@ -761,7 +787,7 @@ s32 cellFsChmod(const char* path, s32 mode)
  * Directory operations
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x5C74903D */
+/* NID: 0x3F61245C */
 s32 cellFsOpendir(const char* path, CellFsDir* fd)
 {
     printf("[cellFs] Opendir(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -807,7 +833,7 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
     return CELL_OK;
 }
 
-/* NID: 0x9F951810 */
+/* NID: 0x5C74903D */
 s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread)
 {
     if (fd < 0 || fd >= MAX_OPEN_DIRS || !s_dirs[fd].in_use)
@@ -893,7 +919,7 @@ s32 cellFsClosedir(CellFsDir fd)
     return CELL_OK;
 }
 
-/* NID: 0x7C1B2FCC */
+/* NID: 0xBA901FE6 */
 s32 cellFsMkdir(const char* path, s32 mode)
 {
     printf("[cellFs] Mkdir(path='%s', mode=0%o)\n", gpath(path) ? gpath(path) : "<null>", mode);
@@ -919,7 +945,7 @@ s32 cellFsMkdir(const char* path, s32 mode)
     return CELL_OK;
 }
 
-/* NID: 0xE3F6F665 */
+/* NID: 0xF12EECC8 */
 s32 cellFsRename(const char* from, const char* to)
 {
     printf("[cellFs] Rename(from='%s', to='%s')\n",
@@ -947,7 +973,7 @@ s32 cellFsRename(const char* from, const char* to)
     return CELL_OK;
 }
 
-/* NID: 0x196CE171 */
+/* NID: 0x7F4677A8 */
 s32 cellFsUnlink(const char* path)
 {
     printf("[cellFs] Unlink(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
