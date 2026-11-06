@@ -153,7 +153,6 @@ void spurs_policy_release_instance(uint32_t ea)
 }
 
 enum { SPURS_PM_MAX_WKL = 16 };
-static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];   /* per (workload, lane) */
 
 /* racacit: SPU thread-group local-store window. On hardware every SPU thread
  * of a group sees its peers' local store at EA 0xF0000000 + n*0x100000 (the
@@ -165,10 +164,23 @@ uint8_t* spurs_lane_ls_window(spu_context* self, uint32_t ea)
 {
     uint32_t off = ea - 0xF0000000u, n = off >> 20, lso = off & 0xFFFFFu;
     if (ea < 0xF0000000u || n >= 6 || lso >= 0x40000u) return NULL;
-    for (uint32_t w = 0; w < SPURS_PM_MAX_WKL; w++)
-        for (uint32_t k = 0; k < 6; k++)
-            if (s_pm_ctx[w][k] == self)
-                return s_pm_ctx[w][n] ? s_pm_ctx[w][n]->ls + lso : NULL;
+    /* The resident contexts live in upstream's per-instance slots
+     * (policy_slot): the caller's lane is the slot holding `self`, its sibling
+     * lane n the slot [wid][n] of the same instance. Read without the
+     * directory lock: the caller holds its own slot lock for the whole run,
+     * and spurs_policy_release_instance takes slot locks under the directory
+     * lock, so taking that lock here could deadlock. A slot's ctx changes only
+     * when its workload or instance is released. */
+    for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
+        struct PmInstance* pi = &s_pm_instances[i];
+        if (!__atomic_load_n(&pi->used, __ATOMIC_ACQUIRE)) continue;
+        for (uint32_t w = 0; w < 16; w++)
+            for (uint32_t k = 0; k < 6; k++) {
+                if (__atomic_load_n(&pi->slots[w][k].ctx, __ATOMIC_ACQUIRE) != self) continue;
+                spu_context* sib = __atomic_load_n(&pi->slots[w][n].ctx, __ATOMIC_ACQUIRE);
+                return sib ? sib->ls + lso : NULL;
+            }
+    }
     return NULL;
 }
 
