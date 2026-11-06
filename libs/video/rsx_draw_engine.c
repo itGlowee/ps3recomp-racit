@@ -477,9 +477,22 @@ static u64 eng_hash_long(const void* data, size_t n, u64 seed)
     h ^= h >> 33; h *= 0xC2B2AE3D27D4EB4Full; h ^= h >> 29;
     return h;
 }
+
 #else
 #define eng_hash_long eng_hash_bytes
 #endif
+
+/* ps3recomp v0.18's rsx_dsp_get_surface returns the clip at the AA sample
+ * grid (x2 wide for antialias 3-5, x2 high for 4-5). This engine keeps the
+ * guest's pixel clip and scales antialias 4/5 itself (eng_aa_scale); taking
+ * the pre-scaled clip drew A Crack in Time's 2-sample 960x704 scene into the
+ * left half of a 1920x704 target. Undo upstream's scale here. */
+static void eng_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* sf)
+{
+    rsx_dsp_get_surface(rsx, sf);
+    if (sf->aa_sx > 1u) { sf->clip_x /= sf->aa_sx; sf->clip_w /= sf->aa_sx; }
+    if (sf->aa_sy > 1u) { sf->clip_y /= sf->aa_sy; sf->clip_h /= sf->aa_sy; }
+}
 
 /* ---- render state -------------------------------------------------------- */
 
@@ -498,7 +511,7 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     if (rs->alpha_func < 8u) rs->alpha_func |= 0x0200u;
     rs->alpha_ref_raw = rsx_dsp_reg(rsx, M_ALPHA_REF);
     rsx_dsp_surface sf;
-    rsx_dsp_get_surface(rsx, &sf);
+    eng_get_surface(rsx, &sf);
     rs->alpha_ref_format = sf.color_format;
     rs->rt_fp16 = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
     rs->blend_enable = rsx_dsp_reg(rsx, M_BLEND_ENABLE) & 1;
@@ -1149,10 +1162,12 @@ static u32 eng_aa_scale(void)
     return !split && (aa == 4u || aa == 5u) ? 2u : 1u;
 }
 
+
+
 static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
 {
     rsx_dsp_surface sf;
-    rsx_dsp_get_surface(&g.rsx, &sf);
+    eng_get_surface(&g.rsx, &sf);
     { const u32 as = eng_aa_scale(); sf.clip_w *= as; sf.clip_h *= as; }
     /* SET_SURFACE_COLOR_TARGET 2 selects B alone; every other value starts at
      * A, and the MRT selectors add B, C and D on top of it. */
@@ -4495,7 +4510,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
-    rsx_dsp_get_surface(&g.rsx, &sf);
+    eng_get_surface(&g.rsx, &sf);
     rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 aas = eng_aa_scale();
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
@@ -5243,7 +5258,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     const u32 n_targets = eng_current_target_set(targets);
     { static int cl = -1; if (cl < 0) cl = getenv("RSX_ENG_CLEAR_LOG") ? 1 : 0;
       if (cl && s_clearlog_from != ~0u && g.frames >= s_clearlog_from && g.frames < s_clearlog_from + 2u) {
-          rsx_dsp_surface sf_; rsx_dsp_get_surface(&g.rsx, &sf_);
+          rsx_dsp_surface sf_; eng_get_surface(&g.rsx, &sf_);
           fprintf(stderr, "[clear] frame %u mask %X colour %08X zs %08X tgt %08X (%u targets, %ux%u) zeta %u:%08X clip %ux%u%c",
                   g.frames, mask, rsx_dsp_clear_color(&g.rsx), rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR),
                   n_targets ? g.surfaces[targets[0]].offset : 0u, n_targets,
@@ -5271,7 +5286,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;
-        rsx_dsp_get_surface(&g.rsx, &sf);
+        eng_get_surface(&g.rsx, &sf);
         const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                          sf.clip_w * eng_aa_scale(), sf.clip_h * eng_aa_scale());
         if (zslot == ENG_INVALID) return;
