@@ -354,6 +354,9 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
     rsx_texture_component_remap_ex(control1, rsx_fmt, out, 1);
 }
 
+/* RSX_TEX_LANES_V018=1 gives RACiT's engine upstream's B8/X16/depth lanes too. */
+static int lanes_v018(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_TEX_LANES_V018"); v = e && *e == '1'; } return v; }
+
 void rsx_texture_component_remap_ex(u32 control1, u32 rsx_fmt, u8 out[4], int upstream_lanes)
 {
     if (!out) return;
@@ -390,6 +393,7 @@ void rsx_texture_component_remap_ex(u32 control1, u32 rsx_fmt, u8 out[4], int up
     static int old = -1; if (old < 0) { const char* e = getenv("RSX_TEX_G8B8_OLD"); old = e && *e == '1'; }
     const u32 base = rsx_fmt & 0x9Fu;
     const u8* src2res = (base == 0x8Bu) ? (old ? lanes_g8b8_old : lanes_g8b8)
+                      : !upstream_lanes && !lanes_v018() ? lanes_argb   /* RACiT engine: v0.13 lanes (rsx_texture_layout.h) */
                       : (base == 0x81u || base == 0x94u) ? lanes_b8
                       : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
 
