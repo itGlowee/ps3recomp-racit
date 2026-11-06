@@ -3933,7 +3933,7 @@ static inline u32 eng_tex_reint_code(const rsx_dsp_texture* t, u32 slot)
 {
     if ((t->format & 0x9Fu) != 0x95u || slot >= g.n_surfaces || g.surfaces[slot].fmt != RSX_BE_FMT_R8G8B8A8) return 0;
     u8 sel[4];
-    rsx_texture_component_remap(t->remap & 0xFFFFu, 0x95u, sel);
+    rsx_texture_component_remap_ex(t->remap & 0xFFFFu, 0x95u, sel, 0);
     return 16u | ((u32)sel[0] << 5) | ((u32)sel[1] << 8) | ((u32)sel[2] << 11) | ((u32)sel[3] << 14);
 }
 /* A copy target read as a smaller texture with clamped addressing (CLAMP,

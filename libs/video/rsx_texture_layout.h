@@ -222,6 +222,12 @@ u8 rsx_texture_expand_mask(u32 format, u32 control1, u32 filter, u32 address);
  * casts. test_texture_layout.c asserts 0xAAE4 is the identity and 0xAA1B is
  * not, which is precisely that regression. */
 void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4]);
+/* The same for RACiT's Vulkan engine (upstream_lanes = 0): without upstream's
+ * Y16_X16/HILO8 16-bit-block crossbar rewrite. The engine uploads Y16_X16 as
+ * R16G16 and its Y16_X16-over-ARGB8 reinterpretation (rsx_draw_engine.c
+ * eng_tex_reint_code) indexes (Y, X, 0, 1) with the plain {A,R,G,B} table, as
+ * on ps3recomp v0.13; rewritten to 0x66, E4 read (X, Y, X, Y). */
+void rsx_texture_component_remap_ex(u32 control1, u32 rsx_fmt, u8 out[4], int upstream_lanes);
 
 /* TEX_RGBA: treat A8R8G8B8 source bytes as already R,G,B,A and copy them
  * straight through.

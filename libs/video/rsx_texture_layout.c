@@ -351,6 +351,11 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
 
 void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
 {
+    rsx_texture_component_remap_ex(control1, rsx_fmt, out, 1);
+}
+
+void rsx_texture_component_remap_ex(u32 control1, u32 rsx_fmt, u8 out[4], int upstream_lanes)
+{
     if (!out) return;
 
     /* Source codes index the presented vector {A,R,G,B}. The uploaded resource
@@ -397,7 +402,7 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * hardware with Virtua Fighter 5 / Mass Effect 3). Through the plain
      * ARGB table a .w read got the resource's empty alpha, 1.0, instead of
      * Y: inFAMOUS 2's water reads its 64x64 wave map through .yw that way. */
-    if (base == 0x95u || base == 0x98u || base == 0x99u) {
+    if (upstream_lanes && (base == 0x95u || base == 0x98u || base == 0x99u)) {
         const int ovr = (control1 >> 16) & 0xFFFFu;
         u32 lo = control1 & 0xFFu;
         switch (lo) {

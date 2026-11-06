@@ -3913,7 +3913,7 @@ static VkComponentSwizzle vk_remap_sel(u8 sel)
 static VkComponentMapping vk_remap(u32 remap, u32 rsx_fmt)
 {
     u8 sel[4];
-    rsx_texture_component_remap(remap, rsx_fmt & 0x9Fu, sel);
+    rsx_texture_component_remap_ex(remap, rsx_fmt & 0x9Fu, sel, 0);
     VkComponentMapping m = { vk_remap_sel(sel[1]), vk_remap_sel(sel[2]),
                              vk_remap_sel(sel[3]), vk_remap_sel(sel[0]) };
     return m;
