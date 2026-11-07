@@ -121,7 +121,7 @@ extern unsigned ps3_tl_tix(void);
  * t_samp_slot = -1 for threads the sampler does not take). The sampler keeps
  * only samples taken inside that job -- runtime helpers, channel waits and
  * float slow paths included, which the code-address map cannot attribute. */
-volatile uint32_t g_samp_lane_job[8];
+volatile uint32_t g_samp_lane_job[16];
 _Thread_local int t_samp_slot = -1;
 /* Lock-line wait time inside the job this lane is running (spu_lr_wait adds
  * to it): SPU_JOB_STATS reports it next to the run time -- how much of a
@@ -140,7 +140,7 @@ static void spu_job_stats(spu_context* ctx)
     if (!active) {
         if (pc < 0x100u || pc >= 0x140u) return;
         active = 1; t0 = ps3_qpc_us(); memcpy(guid, ctx->ls + 0x100, 4); t_spu_job_wait_us = 0;
-        if (t_samp_slot >= 0 && t_samp_slot < 8)
+        if (t_samp_slot >= 0 && t_samp_slot < 16)
             g_samp_lane_job[t_samp_slot] = (uint32_t)guid[0] << 24 | (uint32_t)guid[1] << 16 | (uint32_t)guid[2] << 8 | guid[3];
         if (on & 2) { extern void ps3_tl_at(unsigned long long, char, uint32_t, uint32_t);
             ps3_tl_at(t0, 'J', (uint32_t)guid[0] << 24 | (uint32_t)guid[1] << 16 | (uint32_t)guid[2] << 8 | guid[3],
@@ -149,7 +149,7 @@ static void spu_job_stats(spu_context* ctx)
     }
     if (pc < 0x3F000u) return;
     active = 0;
-    if (t_samp_slot >= 0 && t_samp_slot < 8) g_samp_lane_job[t_samp_slot] = 0;
+    if (t_samp_slot >= 0 && t_samp_slot < 16) g_samp_lane_job[t_samp_slot] = 0;
     const unsigned long long d = ps3_qpc_us() - t0;
     typedef struct { uint32_t g; unsigned long long n, us, max, wus; } ent;
     static ent e[128]; static int ne; static volatile long mu; static unsigned long long last;

@@ -1736,6 +1736,17 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
+    { char _hb[160]; snprintf(_hb, sizeof _hb, "[hosttid] %lu spurs pm worker '%s' spu=%u%c", (unsigned long)GetCurrentThreadId(), si->prefix, (unsigned)slot->spu_num, 10); fputs(_hb, stderr); }
+#ifdef _WIN32
+    /* PS3_SAMPLE_SPURS=all: policy-module workers take their turn too. A
+     * title whose workloads run through policy modules (A Crack in Time's
+     * job lists) runs every SPU job here and never starts a lane thread, so
+     * the hook in spurs_lane_thread alone sampled no SPU work at all. */
+    { const char* e = getenv("PS3_SAMPLE_SPURS");
+      extern long ps3_samp_add_tid(unsigned long tid);
+      extern _Thread_local int t_samp_slot;   /* spu_drain.c: PS3_SAMPLE_JOB */
+      if (e && !strcmp(e, "all")) t_samp_slot = (int)ps3_samp_add_tid(GetCurrentThreadId()); }
+#endif
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)

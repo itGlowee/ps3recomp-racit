@@ -650,7 +650,9 @@ static void samp_report(void)
     }
     memset(s_t2_fn, 0, sizeof s_t2_fn); memset(s_t2_fc, 0, sizeof s_t2_fc);
     static int s_rva_top = -1;   /* PS3_SAMPLE_RVAS=<n>: how many to list (scripts/dev/symbolize.py names them) */
-    if (s_rva_top < 0) { const char* e = getenv("PS3_SAMPLE_RVAS"); s_rva_top = e ? atoi(e) : 25; }
+    /* PS3_SAMPLE_RVAS may instead name the per-sample file (below): 25 then. */
+    if (s_rva_top < 0) { const char* e = getenv("PS3_SAMPLE_RVAS");
+                         s_rva_top = (e && *e >= '0' && *e <= '9') ? atoi(e) : 25; }
     for (int rank = 0; rank < s_rva_top; rank++) {
         uint64_t best = 0; int bi = -1;
         for (int k = 0; k < SAMP_RVAS; k++)
@@ -704,16 +706,17 @@ extern "C" void ps3_samp_only_tid(unsigned long tid) { if (!g_samp_only_tid) g_s
 /* PS3_SAMPLE_SPURS=all: every lane thread registers here and the sampler
  * takes them in turn -- a job runs on whichever lane picks it up, so one
  * lane's profile misses most of them. */
-static volatile unsigned long s_samp_tids[8];
+#define SAMP_MAX_TIDS 16   /* main + kernels + six lanes + the RSX threads */
+static volatile unsigned long s_samp_tids[SAMP_MAX_TIDS];
 static volatile long s_samp_ntids;
 extern "C" long ps3_samp_add_tid(unsigned long tid)
 {
     const long n = InterlockedIncrement(&s_samp_ntids) - 1;
-    if (n < 8) s_samp_tids[n] = tid; else InterlockedDecrement(&s_samp_ntids);
+    if (n < SAMP_MAX_TIDS) s_samp_tids[n] = tid; else InterlockedDecrement(&s_samp_ntids);
     if (!g_samp_only_tid) g_samp_only_tid = tid;
-    return n < 8 ? n : -1;   /* the lane's slot in g_samp_lane_job (spu_drain.c) */
+    return n < SAMP_MAX_TIDS ? n : -1;   /* the lane's slot in g_samp_lane_job (spu_drain.c) */
 }
-extern "C" volatile uint32_t g_samp_lane_job[8];
+extern "C" volatile uint32_t g_samp_lane_job[SAMP_MAX_TIDS];
 /* The guest wait the main thread is in (game/stubs.cpp racacit_wait_begin
  * sets its call-site key, 0 = none). PS3_SAMPLE_INWAIT=<hex> keeps only
  * samples taken while it is that one: what the lanes do while it waits. */
@@ -726,8 +729,9 @@ extern "C" { volatile uint32_t g_racacit_main_wait_lr = 0; }
  * parsing) attributes guest and runtime code exactly. */
 static FILE*     s_samp_rva_file;
 static uint32_t* s_samp_rvas;
+static uint8_t*  s_samp_rva_slot;   /* the sampled thread's slot (s_samp_tids) */
 static uint32_t  s_samp_rva_n, s_samp_rva_cap;
-static void samp_rva_record(uintptr_t rip)
+static void samp_rva_record(uintptr_t rip, unsigned slot = 0)
 {
     if (!s_samp_rva_file) return;
     static uintptr_t base, end;
@@ -740,15 +744,29 @@ static void samp_rva_record(uintptr_t rip)
         uint32_t cap = s_samp_rva_cap ? s_samp_rva_cap * 2 : 65536;
         uint32_t* n = (uint32_t*)realloc(s_samp_rvas, cap * sizeof *n);
         if (!n) return;
-        s_samp_rvas = n; s_samp_rva_cap = cap;
+        s_samp_rvas = n;
+        uint8_t* sl = (uint8_t*)realloc(s_samp_rva_slot, cap);
+        if (!sl) return;
+        s_samp_rva_slot = sl; s_samp_rva_cap = cap;
     }
+    s_samp_rva_slot[s_samp_rva_n] = (uint8_t)slot;
     s_samp_rvas[s_samp_rva_n++] = (rip >= base && rip < end) ? (uint32_t)(rip - base) : 0u;
 }
 static void samp_rva_flush(void)
 {
     if (!s_samp_rva_file) return;
     fprintf(s_samp_rva_file, "# %llu ms\n", (unsigned long long)GetTickCount64());  /* block end */
-    for (uint32_t i = 0; i < s_samp_rva_n; i++) fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    /* "rva" with one sampled thread; "rva slot" when several take turns
+     * (a "# tids" line names each slot's host thread). */
+    if (s_samp_ntids > 1) {
+        fprintf(s_samp_rva_file, "# tids");
+        for (long i = 0; i < s_samp_ntids && i < SAMP_MAX_TIDS; i++) fprintf(s_samp_rva_file, " %ld=%lu", i, (unsigned long)s_samp_tids[i]);
+        fprintf(s_samp_rva_file, "\n");
+    }
+    for (uint32_t i = 0; i < s_samp_rva_n; i++) {
+        if (s_samp_ntids > 1) fprintf(s_samp_rva_file, "%x %u\n", s_samp_rvas[i], (unsigned)s_samp_rva_slot[i]);
+        else fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    }
     fflush(s_samp_rva_file);
     s_samp_rva_n = 0;
 }
@@ -785,8 +803,8 @@ static DWORD WINAPI samp_thread(LPVOID p)
     if (getenv("PS3_SAMPLE_RSX") || getenv("PS3_SAMPLE_SPURS") || getenv("PS3_SAMPLE_SPURSK") || getenv("PS3_SAMPLE_BE"))
         while (!g_samp_only_tid) Sleep(10);
     while (g_samp_only_tid) {
-        static HANDLE hs[8]; static unsigned rr;
-        const long nt = s_samp_ntids > 8 ? 8 : s_samp_ntids;
+        static HANDLE hs[SAMP_MAX_TIDS]; static unsigned rr;
+        const long nt = s_samp_ntids > SAMP_MAX_TIDS ? SAMP_MAX_TIDS : s_samp_ntids;
         const unsigned k = nt > 1 ? rr++ % (unsigned)nt : 0u;
         if (!hs[k]) hs[k] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE,
                                        nt > 1 ? s_samp_tids[k] : g_samp_only_tid);
@@ -812,6 +830,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             ResumeThread(h1);
             if (ok) {
                 s_samp_total++;
+                samp_rva_record((uintptr_t)c.Rip, nt > 1 ? k : 0u);   /* PS3_SAMPLE_RVAS=<file> */
                 static uintptr_t exe_lo, exe_hi, s_code_lo, s_code_hi;
                 if (!exe_lo) {
                     exe_lo = (uintptr_t)GetModuleHandleA(NULL);
@@ -865,6 +884,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             fprintf(stderr, "[samp] --- report at t=%llums ---%c",
                     (unsigned long long)(GetTickCount64() - t0), 10);
             samp_report();
+            samp_rva_flush();   /* this path never wrote the per-sample file */
             next_report = GetTickCount64() + 10000;
         }
     }
