@@ -85,12 +85,12 @@ extern "C" {
 #define RSX_DSP_CLASS_STATE     1   /* decoded by a getter the pipeline uses */
 #define RSX_DSP_CLASS_EXEC      2   /* triggers an execution callback        */
 
-/* Cap on one INLINE_ARRAY stream. A stream is bounded by a single
- * BEGIN_END pair, and titles use inline arrays for small immediate-mode
- * batches (UI quads, debug geometry); 64 KB is several hundred vertices of
- * a fat format. Overruns are counted, not silently truncated -- half a
- * vertex stream is worse than no draw. */
-#define RSX_DSP_INLINE_MAX_BYTES 65536
+/* Cap on one INLINE_ARRAY stream (one BEGIN_END pair). The buffer grows to
+ * fit; this only bounds a runaway stream. It was a fixed 64 KB, sized for UI
+ * quads and debug geometry -- but A Crack in Time sends its time bomb's
+ * bubble inline, two layers of well over 64 KB each. An overrun is counted
+ * and drops the whole stream: half a vertex stream is worse than no draw. */
+#define RSX_DSP_INLINE_MAX_BYTES (64u << 20)
 
 typedef struct rsx_dispatch rsx_dispatch;
 
@@ -143,6 +143,7 @@ struct rsx_dispatch {
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */
+    u32 inline_overflow;              /* this primitive's stream went past it */
     u32 imm_vertices;                 /* immediate-mode vertices this prim  */
     u32 imm_attr_mask;                /* attributes each one carries        */
 
@@ -150,16 +151,11 @@ struct rsx_dispatch {
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
     u8  klass[RSX_DSP_NUM_REGS];      /* RSX_DSP_CLASS_*                    */
 
-    /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim). A fixed
-     * buffer rather than a grown allocation because rsx_dispatch_init
-     * memsets the whole struct, which would drop a pointer on the floor.
-     *
-     * LAST on purpose. Sitting it next to current_primitive pushed seen[]
-     * and klass[] 64 KB away from the register file, and those three are
-     * touched together on EVERY method write: The Simpsons Game, which
-     * emits no inline arrays at all, still lost an order of magnitude of
-     * poll rate in the regression gate purely from the added stride. */
-    u8  inline_data[RSX_DSP_INLINE_MAX_BYTES];
+    /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim): grown on
+     * the heap as a stream needs it (rsx_dispatch_init zeroes the struct,
+     * so a second init of the same dispatcher leaks the old buffer). */
+    u8* inline_data;
+    u32 inline_cap;
 };
 
 /* ---- lifecycle -------------------------------------------------------- */

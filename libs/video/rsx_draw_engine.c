@@ -57,7 +57,6 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
 #define ENG_PIPE_INDEX     16384     /* power of two, > 1.5x pipelines */
-#define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
 /* Guest textures larger than this are a misdecoded register, not an image;
@@ -285,10 +284,13 @@ static char s_ps_hlsl[256 * 1024];
 
 /* The draw accumulator: one BEGIN_END group's batches, references and cuts. */
 static struct {
-    eng_batch arr[ENG_MAX_BATCHES];
-    u32 n_arr;
-    eng_batch idx[ENG_MAX_BATCHES];
-    u32 n_idx;
+    /* Grown as needed: a group may carry any number of DRAW_ARRAYS /
+     * DRAW_INDEX_ARRAY ranges (each at most 256 vertices). They were capped
+     * at 256 ranges, and whatever came after was dropped without a word. */
+    eng_batch* arr;
+    u32 n_arr, cap_arr;
+    eng_batch* idx;
+    u32 n_idx, cap_idx;
     u32 n_packets;
 
     rsx_vertex_ref* refs;
@@ -3697,11 +3699,26 @@ static void sink_begin(void* user, const rsx_dispatch* r, u32 prim)
     dc_reset();
 }
 
+/* Room for one more range in *list (n used, *cap held); 0 = out of memory. */
+static int eng_batch_reserve(eng_batch** list, u32 n, u32* cap)
+{
+    if (n < *cap) return 1;
+    const u32 next = *cap ? *cap * 2u : 256u;
+    eng_batch* grown = (eng_batch*)realloc(*list, (size_t)next * sizeof **list);
+    if (!grown) {
+        static int warned;
+        if (!warned) { warned = 1; fprintf(stderr, "[rsx engine] out of memory for a draw's %u ranges: the rest are dropped%c", n, 10); }
+        return 0;
+    }
+    *list = grown; *cap = next;
+    return 1;
+}
+
 static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
+    if (!eng_batch_reserve(&dc.arr, dc.n_arr, &dc.cap_arr)) return;
     dc.arr[dc.n_arr].first = first;
     dc.arr[dc.n_arr].count = count;
     dc.n_arr++;
@@ -3719,7 +3736,7 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
     dc.inl = data;
     dc.inl_bytes = bytes;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
+    if (!eng_batch_reserve(&dc.arr, dc.n_arr, &dc.cap_arr)) return;
     dc.arr[dc.n_arr].first = 0;
     dc.arr[dc.n_arr].count = bytes / stride;
     dc.n_arr++;
@@ -3729,7 +3746,7 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_idx >= ENG_MAX_BATCHES) return;
+    if (!eng_batch_reserve(&dc.idx, dc.n_idx, &dc.cap_idx)) return;
     dc.idx[dc.n_idx].first = first;
     dc.idx[dc.n_idx].count = count;
     dc.n_idx++;
@@ -6011,7 +6028,7 @@ void rsx_draw_engine_shutdown(void)
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
-    free(dc.refs); free(dc.cuts); free(dc.verts);
+    free(dc.refs); free(dc.cuts); free(dc.verts); free(dc.arr); free(dc.idx);
     rsx_vertex_remap_destroy(&dc.ref_remap);
     if (s_geom) {
         for (u32 i = 0; i < ENG_GEOM_SETS * ENG_GEOM_WAYS; i++) if (s_geom[i].state == 2) eng_geom_free(&s_geom[i]);

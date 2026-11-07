@@ -332,6 +332,30 @@ static int imm_is_attr0_last_word(u32 m)
            m == 0x0A84 /*SCALED4S*/ || m == 0x1C0C /*4F*/;
 }
 
+/* Room for `more` bytes past inline_len; 0 = past RSX_DSP_INLINE_MAX_BYTES
+ * (or out of memory), and the stream is counted as dropped. */
+static int inline_reserve(rsx_dispatch* rsx, u32 more)
+{
+    if (rsx->inline_overflow) return 0;
+    const u64 need = (u64)rsx->inline_len + more;
+    if (need <= rsx->inline_cap) return 1;
+    if (need <= RSX_DSP_INLINE_MAX_BYTES) {
+        u64 cap = rsx->inline_cap ? rsx->inline_cap : 65536u;
+        while (cap < need) cap *= 2u;
+        if (cap > RSX_DSP_INLINE_MAX_BYTES) cap = RSX_DSP_INLINE_MAX_BYTES;
+        u8* grown = (u8*)realloc(rsx->inline_data, (size_t)cap);
+        if (grown) { rsx->inline_data = grown; rsx->inline_cap = (u32)cap; return 1; }
+    }
+    rsx->inline_overflow = 1;
+    rsx->inline_len = 0;
+    rsx->inline_dropped++;
+    { static int said;
+      if (said++ < 4)
+          fprintf(stderr, "[rsx-dispatch] inline vertex stream past %u bytes: dropped (%u so far)\n",
+                  (unsigned)RSX_DSP_INLINE_MAX_BYTES, rsx->inline_dropped); }
+    return 0;
+}
+
 static void imm_emit_vertex(rsx_dispatch* rsx)
 {
     if (rsx->imm_vertices == 0) {
@@ -342,11 +366,12 @@ static void imm_emit_vertex(rsx_dispatch* rsx)
             if (mask & (1u << a)) { if (++n > 15) mask &= ~(1u << a); }  /* stride fits 8 bits */
         rsx->imm_attr_mask = mask;
         rsx->inline_len = 0;
+        rsx->inline_overflow = 0;
     }
     u32 n = 0;
     for (u32 a = 0; a < 16; a++) if (rsx->imm_attr_mask & (1u << a)) n++;
     const u32 stride = n * 16u;
-    if (rsx->inline_len + stride > RSX_DSP_INLINE_MAX_BYTES) { rsx->inline_dropped++; return; }
+    if (!inline_reserve(rsx, stride)) return;
     u8* o = rsx->inline_data + rsx->inline_len;
     for (u32 a = 0; a < 16; a++) {
         if (!(rsx->imm_attr_mask & (1u << a))) continue;
@@ -474,6 +499,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
             rsx->inline_len = 0;
+            rsx->inline_overflow = 0;
             rsx->imm_vertices = 0;
             if (rsx->sink.begin)
                 rsx->sink.begin(rsx->sink.user, rsx, arg);
@@ -526,17 +552,16 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * carrying no vertices at all: the backend saw BEGIN/END with nothing
      * between them and counted an empty group. */
     case M_INLINE_ARRAY:
-        if (rsx->inline_len + 4u <= RSX_DSP_INLINE_MAX_BYTES) {
+        /* Past the cap the whole stream is dropped (inline_reserve). This
+         * used to empty the buffer and go on filling it, so the draw got the
+         * stream's tail alone: the time bomb's bubble lost a run of its
+         * quads, a square hole wherever they fell on screen. */
+        if (inline_reserve(rsx, 4u)) {
             rsx->inline_data[rsx->inline_len + 0] = (u8)(arg >> 24);
             rsx->inline_data[rsx->inline_len + 1] = (u8)(arg >> 16);
             rsx->inline_data[rsx->inline_len + 2] = (u8)(arg >> 8);
             rsx->inline_data[rsx->inline_len + 3] = (u8)arg;
             rsx->inline_len += 4;
-        } else if (rsx->inline_len) {
-            /* Truncating leaves a torn final vertex; drop the whole stream
-             * and count it instead of drawing something half-read. */
-            rsx->inline_len = 0;
-            rsx->inline_dropped++;
         }
         break;
 
