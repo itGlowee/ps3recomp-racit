@@ -23,10 +23,17 @@
  * round-to-nearest, so the mode is left alone (RACACIT_SPU_CSR_RZ=1 brings
  * the old one back, for comparison). */
 #include <stdlib.h>   /* getenv */
+/* SPU_FLOAT_FAST (spu_helpers.h: RACiT's own float model, back from v0.13) needs the mode on:
+ * its fast path is the SPU's result only under DAZ + FTZ + round toward zero. Then it is the
+ * default, and RACACIT_SPU_CSR_RZ=0 turns it off. */
 static inline unsigned long long spu_csr_spu(unsigned long long v)
 {
     static int rz = -1;
+#if defined(SPU_FLOAT_FAST)
+    if (rz < 0) { const char* e = getenv("RACACIT_SPU_CSR_RZ"); rz = !(e && *e == '0'); }
+#else
     if (rz < 0) { const char* e = getenv("RACACIT_SPU_CSR_RZ"); rz = e && *e == '1'; }
+#endif
     return rz ? (v | 0xE040u) : v;
 }
 #define SPU_CSR_SPU(v) spu_csr_spu(v)

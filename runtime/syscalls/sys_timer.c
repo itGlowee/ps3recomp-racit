@@ -291,7 +291,8 @@ static int ps3_tl_cmp(const void* x, const void* y)
  * window, and print the wait and the 30 ms before it when a main-thread wait at
  * <lr> ('Q', racacit_wait_end) took >= min us (default 3000) -- up to <dumps>
  * times (default 4), 2 s apart. A fight's long waits come at random moments;
- * a window armed by present count misses them. "[tl-ring]" heads each dump. */
+ * a window armed by present count misses them. "[tl-ring]" heads each dump.
+ * <lr> 0 = any main-thread wait that long (the slow one differs by fight). */
 #define PS3_TL_RING 32768
 static struct { unsigned long long t; char ev; uint32_t a, b; } s_tlr[PS3_TL_RING], s_tlr_cp[PS3_TL_RING];
 static volatile long s_tlr_n = 0, s_tlr_busy = 0;
@@ -309,14 +310,14 @@ static int ps3_tl_ring(unsigned long long t, char ev, uint32_t a, uint32_t b)
     const long i = InterlockedIncrement(&s_tlr_n) - 1;
     const long k = i & (PS3_TL_RING - 1);
     s_tlr[k].t = t; s_tlr[k].ev = ev; s_tlr[k].a = a; s_tlr[k].b = b;
-    if (ev == 'Q' && a == lr && b >= min_us && left > 0 && t - last > 2000000ull &&
+    if (ev == 'Q' && (lr == 0 || a == lr) && b >= min_us && left > 0 && t - last > 2000000ull &&
         !InterlockedExchange(&s_tlr_busy, 1)) {
         left--; last = t;
         Sleep(2);                            /* let in-flight writers finish */
         memcpy(s_tlr_cp, s_tlr, sizeof s_tlr_cp);
         qsort(s_tlr_cp, PS3_TL_RING, sizeof s_tlr_cp[0], ps3_tl_cmp);
         const unsigned long long lo = t > 30000ull ? t - 30000ull : 0, hi = t + b + 2000ull;
-        fprintf(stderr, "[tl-ring] wait lr %08X %u us; events from 30 ms before it (+us from there)%c", lr, b, 10);
+        fprintf(stderr, "[tl-ring] wait lr %08X %u us; events from 30 ms before it (+us from there)%c", a, b, 10);
         for (long j = 0; j < PS3_TL_RING; j++)
             if (s_tlr_cp[j].t >= lo && s_tlr_cp[j].t <= hi)
                 fprintf(stderr, "[tl] +%-8llu %c %08X %08X%c", s_tlr_cp[j].t - lo, s_tlr_cp[j].ev,
