@@ -502,13 +502,17 @@ static SPU_TLS struct {
     mfc_engine* engine;
     uint64_t generation;
 } s_mfc_recent;
+/* racacit: on by default (SPU_MFC_LOOKUP_CACHE=0 turns it off). Every MFC
+ * channel access took the registry's shared SRW lock -- one cache line all
+ * SPU threads write -- and walked the slot list: mfc_for was 3% of the SPU
+ * threads' busy time in the owner's 4x fight profile, more than most job code. */
 static int spu_mfc_cache_enabled(void)
 {
     static atomic_int cached;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (!value) {
         const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-        value = flag && !strcmp(flag, "1") ? 2 : 1;
+        value = flag && (!strcmp(flag, "0") || !strcmp(flag, "off")) ? 1 : 2;
         atomic_store_explicit(&cached, value, memory_order_relaxed);
     }
     return value == 2;
