@@ -5837,19 +5837,36 @@ static void eng_budget_enforce(void)
     u64 z_bytes = 0;
     for (u32 i = 0; i < g.n_zdepths; i++) if (g.zdepths[i].handle) z_bytes += eng_zdepth_bytes(&g.zdepths[i]);
     const u64 z_hard = z_budget * 2u;
+    /* Over the hard limit, or over the budget with the card itself nearly
+     * full (g_rsx_vram_tight), a second of protection was far too long: a
+     * crate break or a fight repacks the shadow pool every frame, each map a
+     * new address, and at 4x a map is 32-50 MB. All of them were "used in the
+     * last second", so nothing could go -- the owner's 25-minute 4x session
+     * had 12-14 GB of depth against a 3 GB budget (6 GB hard limit), the card
+     * full, 18,600 failed allocations (a GPU wait each), and the copy engine
+     * busy paging. Past that line, anything no draw used for 3 frames may go,
+     * oldest first; a buffer whose memory another has drawn over (tier 0,
+     * nothing lost) may go after 3 frames as soon as the budget is passed. */
+    const int z_over = z_bytes > z_hard || (g_rsx_vram_tight && z_bytes > z_budget);
+    const int z_quick = z_over || pressure || z_bytes > z_budget;
+    const u64 idle3 = s_frame_serial_hist[(g.frames - 3u) & 63u];
     const int z_sweep = s_dead_sweep && !pressure && z_bytes <= z_budget && g.frames - s_z_scan >= 60u;
-    if ((z_bytes > z_budget && (z_bytes > z_hard || g.frames - s_z_scan >= 30u)) || (pressure && z_bytes) || z_sweep) {
+    if ((z_bytes > z_budget && (z_over || g.frames - s_z_scan >= 30u)) || (pressure && z_bytes) || z_sweep) {
         s_z_scan = g.frames;
         const u64 tgt = z_sweep ? 0u
                       : pressure && z_bytes / 4u * 3u < z_budget / 10u * 9u ? z_bytes / 4u * 3u : z_budget / 10u * 9u;
         u32 n = 0;
         for (u32 i = 0; i < g.n_zdepths; i++) {
             const eng_zdepth* z = &g.zdepths[i];
-            if (!z->handle || z->last_use > recent || z->last_use > frame_start) continue;
+            if (!z->handle || z->last_use > idle3 || z->last_use > frame_start) continue;
+            const int old = z->last_use <= recent;
             u64 tier;
-            if (!z->had_write || eng_superseded(z->location, z->offset, z->w * z->h * 4u, z->last_write, z)) tier = 0;
+            if (!z->had_write || eng_superseded(z->location, z->offset, z->w * z->h * 4u, z->last_write, z)) {
+                if (!old && !z_quick) continue;
+                tier = 0;
+            }
             else if (z_sweep) continue;
-            else if (z_bytes > z_hard) tier = 1;
+            else if (z_over) tier = 1;
             else continue;
             lru[n].key = (tier << 60) | (z->last_use & ((1ull << 60) - 1u)); lru[n].idx = i; n++;
         }

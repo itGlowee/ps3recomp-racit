@@ -745,8 +745,9 @@ static int vk_image_memory(vk_image* im)
         { extern void vk_rbin_flush(void); vk_rbin_flush(); }   /* parked render targets first */
         vk_bt_reclaim();
         ar = (s_vkc[1]++, vk_alloc_mem(&mai, &im->mem));
-        static unsigned logs;
-        if (logs < 64u || ar != VK_SUCCESS) {
+        static unsigned logs, fails;
+        if (ar != VK_SUCCESS) fails++;
+        if (logs < 64u || (ar != VK_SUCCESS && (fails <= 256u || (fails & 255u) == 0))) {
             logs++;
             unsigned u = 0, b = 0;
             if (vk_vram_mb(&u, &b)) u = b = 0;
@@ -804,9 +805,21 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
  * view and memory intact. The create path clears it as it would a new one,
  * after a full barrier, so whatever the GPU still had queued on it runs
  * first. FIFO, 64 images / 256 MB; emptied before any failed allocation
- * retries. RSX_VK_RECYCLE=0 turns it off. */
+ * retries. RSX_VK_RECYCLE=0 turns it off.
+ * The depth and colour snapshots (the copies a target is sampled through)
+ * park here too, under their own kinds (VK_RBIN_ZSNAP / VK_RBIN_CSNAP).
+ * Sized by the internal resolution since: at 4x one 2048x2048 shadow map is
+ * 32 MB of depth and 16 MB of snapshot, so 256 MB held five while a crate
+ * break or a fight repacks dozens a frame. The owner's 25-minute 4x session
+ * made 84,000 shadow maps and recycled about half; every miss was a fresh
+ * 16-64 MB vkAllocateMemory that Windows zero-fills on the copy engine (the
+ * Copy queue busy, the 3D queue idle), and once the card was full, 18,600 of
+ * them failed, each one a GPU wait. Now 256 MB times the scale (2 GB at
+ * most, an eighth of the card's budget at most) and 256 images.
+ * RSX_VK_RECYCLE_MB sets the bytes. */
 static void vk_destroy_image(vk_image* im);
-enum { VK_RBIN_MAX = 64 };
+enum { VK_RBIN_MAX = 256 };
+enum { VK_RBIN_ZSNAP = 16, VK_RBIN_CSNAP = 17 };   /* kinds beside VK_ENG_COLOR / VK_ENG_DEPTH */
 static struct { vk_image im; VkFormat fmt; u32 w, h, kind; u64 bytes; } s_rbin[VK_RBIN_MAX];
 static u32 s_rbin_n;
 static u64 s_rbin_bytes;
@@ -816,6 +829,26 @@ static int vk_rbin_on(void)
     static int on = -1;
     if (on < 0) { const char* e = getenv("RSX_VK_RECYCLE"); on = !(e && *e == '0'); }
     return on;
+}
+static u64 vk_rbin_cap(void)
+{
+    static u64 cap;
+    if (!cap) {
+        extern float g_rsx_res_scale; extern unsigned g_rsx_vram_budget_mb;
+        const char* e = getenv("RSX_VK_RECYCLE_MB"); const long v = e ? atol(e) : 0;
+        u64 mb;
+        if (v > 0) mb = (u64)v;
+        else {
+            const float sc = g_rsx_res_scale > 1.0f ? g_rsx_res_scale : 1.0f;
+            mb = (u64)(256.0f * sc);
+            if (mb > 2048u) mb = 2048u;
+            if (g_rsx_vram_budget_mb && mb > g_rsx_vram_budget_mb / 8u) mb = g_rsx_vram_budget_mb / 8u;
+            if (mb < 256u) mb = 256u;
+        }
+        cap = mb << 20;
+        VK_LOG("render target recycle bin: %llu MB, %d images%c", (unsigned long long)mb, (int)VK_RBIN_MAX, 10);
+    }
+    return cap;
 }
 void vk_rbin_flush(void)
 {
@@ -840,8 +873,11 @@ static int vk_rbin_take(u32 kind, VkFormat fmt, u32 w, u32 h, vk_image* im)
 static int vk_rbin_park(u32 kind, VkFormat fmt, u32 w, u32 h, u32 bpp, vk_image* im)
 {
     const u64 bytes = (u64)w * h * (bpp ? bpp : 4u);
-    if (!vk_rbin_on() || !im->img || bytes > (256ull << 20)) return 0;
-    while (s_rbin_n && (s_rbin_n == VK_RBIN_MAX || s_rbin_bytes + bytes > (256ull << 20))) {
+    const u64 cap = vk_rbin_cap();
+    { extern volatile int g_rsx_vram_tight;        /* the card is nearly full: give it back instead */
+      if (g_rsx_vram_tight) return 0; }
+    if (!vk_rbin_on() || !im->img || bytes > cap) return 0;
+    while (s_rbin_n && (s_rbin_n == VK_RBIN_MAX || s_rbin_bytes + bytes > cap)) {
         s_rbin_bytes -= s_rbin[0].bytes;
         vk_destroy_image(&s_rbin[0].im);
         memmove(&s_rbin[0], &s_rbin[1], (size_t)(s_rbin_n - 1u) * sizeof s_rbin[0]);
@@ -3792,6 +3828,8 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view   */
+    u8       snap;                   /* TEXTURE: 1 a depth snapshot, 2 a colour snapshot
+                                        (recycled through the render-target bin) */
     u32      views;                  /* COLOR: its first VIEW, 0 = none     */
     u32      next_view;              /* VIEW: the next view of its surface  */
     u32      spare;                  /* DEPTH: the snapshot at the other size it is read at */
@@ -4011,8 +4049,13 @@ static void vk_eng_release(void* user, u32 handle)
         s_eobj[handle].kind == VK_ENG_VIEW)
         vk_eng_drop_framebuffers_using(handle);
     { vk_eng_obj* o = &s_eobj[handle];           /* a render target's image waits for the next of its size */
-      if (!o->lazy && !((o->kind == VK_ENG_COLOR || o->kind == VK_ENG_DEPTH) &&
-            vk_rbin_park((u32)o->kind, o->fmt, o->w, o->h, o->kind == VK_ENG_DEPTH ? 8u : o->bpp, &o->im)))
+      int parked = 0;
+      if (!o->lazy && (o->kind == VK_ENG_COLOR || o->kind == VK_ENG_DEPTH))
+          parked = vk_rbin_park((u32)o->kind, o->fmt, o->w, o->h, o->kind == VK_ENG_DEPTH ? 8u : o->bpp, &o->im);
+      else if (o->kind == VK_ENG_TEXTURE && o->snap)   /* and a snapshot for the next snapshot of its size */
+          parked = vk_rbin_park(o->snap == 1 ? (u32)VK_RBIN_ZSNAP : (u32)VK_RBIN_CSNAP, o->fmt, o->w, o->h,
+                                o->bpp ? o->bpp : 4u, &o->im);
+      if (!o->lazy && !parked)
           vk_destroy_image(&o->im);              /* idle: submissions are waited on */ }
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
@@ -4233,6 +4276,7 @@ static void vk_eng_present(void* user, u32 surface)
           else if ((unsigned long long)u * 100u < (unsigned long long)bd * 78u) g_rsx_vram_tight = 0;
           if (was != g_rsx_vram_tight) VK_LOG("video memory %u MB of %u MB budget: shadow maps %s%c", u, bd,
                                               g_rsx_vram_tight ? "at the scene's scale for now" : "back to their own scale", 10);
+          if (g_rsx_vram_tight && !was) vk_rbin_flush();   /* parked images go back to the card */
           if ((unsigned long long)u * 100u > (unsigned long long)bd * 95u && b0 - last_ev >= 5000000ull) {
               last_ev = b0; g_rsx_vram_pressure = 1; } } }
     {   /* Once a minute: how full the GPU's memory is (vk_vram_mb). */
@@ -4459,13 +4503,15 @@ static u32 vk_eng_color_snapshot(void* user, u32 color, u32 w, u32 h)
         if (!snap) return 0;
         c = vk_eng_get(color, VK_ENG_COLOR);
         t = &s_eobj[snap];
-        s_img_why[3]++;
-        if (vk_create_image(&t->im, c->fmt, w, h,
-                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                            VK_IMAGE_ASPECT_COLOR_BIT)) {
-            vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
+        if (!vk_rbin_take(VK_RBIN_CSNAP, c->fmt, w, h, &t->im)) {
+            s_img_why[3]++;
+            if (vk_create_image(&t->im, c->fmt, w, h,
+                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT)) {
+                vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
+            }
         }
-        t->kind = VK_ENG_TEXTURE; t->fmt = c->fmt; t->bpp = c->bpp; t->w = w; t->h = h;
+        t->kind = VK_ENG_TEXTURE; t->snap = 2; t->fmt = c->fmt; t->bpp = c->bpp; t->w = w; t->h = h;
         t->lw = lw; t->lh = lh;
         c->surface = snap;
         if (vk_begin()) return 0;
@@ -4534,14 +4580,18 @@ static u32 vk_eng_depth_snapshot_sized(void* user, u32 depth, u32 w, u32 h, u32 
         snap = vk_eng_alloc();
         if (!snap) return 0;
         t = &s_eobj[snap];
-        s_img_why[4]++;
-        if (vk_create_image(&t->im, VK_FORMAT_R32_SFLOAT, tw, th,
-                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                            VK_IMAGE_ASPECT_COLOR_BIT)) {
-            vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
+        /* A parked one already has the R,R,R,1 view below. */
+        const int reused = vk_rbin_take(VK_RBIN_ZSNAP, VK_FORMAT_R32_SFLOAT, tw, th, &t->im);
+        if (!reused) {
+            s_img_why[4]++;
+            if (vk_create_image(&t->im, VK_FORMAT_R32_SFLOAT, tw, th,
+                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT)) {
+                vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
+            }
         }
-        t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = tw; t->h = th;
+        t->kind = VK_ENG_TEXTURE; t->snap = 1; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = tw; t->h = th;
         t->lw = ltw; t->lh = lth; t->sc = z->sc;
         /* A depth texture read without a compare gives its depth in R, G and
          * B on the RSX (the units' remap selects that one channel for all
@@ -4549,7 +4599,8 @@ static u32 vk_eng_depth_snapshot_sized(void* user, u32 depth, u32 w, u32 h, u32 
          * Time's light composite reads .z of the hero's shadow depth, got 0,
          * and shaded the hero's whole shadow volume uniformly -- a dark
          * square on the ground. */
-        { const VkComponentMapping rrr1 = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+        if (!reused) {
+          const VkComponentMapping rrr1 = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
                                             VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE };
           VkImageView v = VK_NULL_HANDLE;
           if (!vk_eng_make_view(t->im.img, VK_FORMAT_R32_SFLOAT, 1, rrr1, &v)) {
