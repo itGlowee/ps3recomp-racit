@@ -912,7 +912,7 @@ static int rsx_fp_decompile_internal(
         }
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            (opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 reported;
             if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
@@ -930,7 +930,7 @@ static int rsx_fp_decompile_internal(
             dbg_done = 1;
         }
         /* Build the RHS expression for this opcode. */
-        char rhs[640];
+        char rhs[1024];
         int handled = 1;
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
@@ -950,6 +950,21 @@ static int rsx_fp_decompile_internal(
         case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
         case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+        /* The rest of the NV40 set (RPCS3 FragmentProgramDecompiler.cpp and
+         * GLSLCommon.cpp getFunction). As unhandled ops they wrote nothing
+         * and the destination kept its old value. A Crack in Time's water
+         * builds its reflection vector with RFL. */
+        case OP_RFL:  snprintf(rhs, sizeof(rhs), "reflect((%s), (%s))", a, b); break;
+        case OP_DP2A: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy) + (%s).x", a, b, c); break;
+        case OP_DST:  snprintf(rhs, sizeof(rhs), "float4(1.0, (%s).y * (%s).y, (%s).z, (%s).w)", a, b, a, b); break;
+        case OP_STR:  snprintf(rhs, sizeof(rhs), "1.0"); break;
+        case OP_SFL:  snprintf(rhs, sizeof(rhs), "0.0"); break;
+        /* RPCS3 _builtin_lit (lit_legacy). */
+        case OP_LIT:
+            snprintf(rhs, sizeof(rhs),
+                     "float4(1.0, max((%s).x, 0.0), (%s).x > 0.0 ? exp2((%s).w * log2(max((%s).y, 1e-10))) : 0.0, 1.0)",
+                     a, a, a, a);
+            break;
         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
          * builtins): the packed word is a scalar that replicates. */
         case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
@@ -1059,6 +1074,20 @@ static int rsx_fp_decompile_internal(
                      cube ? "xyz" : "xy", b);
             break;
         }
+        /* Explicit gradients: coordinate src0, d/dx src1, d/dy src2 (RPCS3
+         * TEXTURE_SAMPLE_GRAD_BASE). A comparison unit keeps its compare. */
+        case OP_TXD: {
+            if (shadow && shadow[tex_unit].enabled) {
+                snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz)", tex_unit, a);
+                break;
+            }
+            const char* sw = ((tex_sep_mask >> tex_unit) & 1u) ? "xyz" : "xy";
+            char tn[32];
+            snprintf(tn, sizeof(tn), tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            snprintf(rhs, sizeof(rhs), "%s.SampleGrad(rsx_samp[%u], (%s).%s, (%s).%s, (%s).%s)",
+                     tn, tex_unit, a, sw, b, sw, c, sw);
+            break;
+        }
         case OP_KIL:
             /* Fragment kill. Predicated by the same exec_if condition as any
              * other instruction (RPCS3 FragmentProgramDecompiler case
@@ -1093,7 +1122,7 @@ static int rsx_fp_decompile_internal(
         }
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL || opcode == OP_TXD)) {
             char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
             const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
                                         sample, gamma_masks[tex_unit] & 15u);
@@ -1108,7 +1137,7 @@ static int rsx_fp_decompile_internal(
          * A comparison fetch has nothing to expand. */
         if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
             !(shadow && shadow[tex_unit].enabled) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL || opcode == OP_TXD)) {
             const int bx2 = (w0 & (1u << 21)) != 0;
             u32 mask = bx2 ? 15u : (expand_masks[tex_unit] & 0x1Fu);
             if (!bx2 && gamma_masks) mask &= ~(gamma_masks[tex_unit] & 15u);
@@ -1119,7 +1148,7 @@ static int rsx_fp_decompile_internal(
                 if (length < 0 || (size_t)length >= sizeof rhs) return -1;
             }
         } else if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
-                   (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+                   (opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 reported;
             if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] sign-expand fetch opcode %u unsupported on unit %u (read unexpanded)\n",
@@ -1155,14 +1184,14 @@ static int rsx_fp_decompile_internal(
             if (has_dest && is_uncond && !set_cond) {
                 /* Common unconditional path — kept byte-identical so the 39
                  * non-predicated programs in this capture emit unchanged. */
-                char line[800];
+                char line[1400];
                 snprintf(line, sizeof(line),
                          "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
                          rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
-                char buf[1200];
+                char buf[1800];
                 snprintf(buf, sizeof(buf),
                          "    { float4 _v = (float4)(%s)%s;%s\n",
                          rhs, scale_txt[res_scale], sat);
