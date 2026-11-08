@@ -5265,11 +5265,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
                         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
                             if (!(tex_mask & (1u << u))) continue;
                             rsx_dsp_texture tt; rsx_dsp_get_texture(&g.rsx, u, &tt);
-                            fprintf(stderr, "[probe-units]   tex%u %u:%08X %ux%u fmt 0x%X remap %04X <- %s%c", u, tt.location, tt.offset,
-                                    tt.width, tt.height, tt.format, tt.remap & 0xFFFFu,
+                            fprintf(stderr, "[probe-units]   tex%u %u:%08X %ux%u fmt 0x%X remap %04X filter %08X addr %08X <- %s%c", u, tt.location, tt.offset,
+                                    tt.width, tt.height, tt.format, tt.remap & 0xFFFFu, tt.filter, tt.wrap,
                                     s_tex_src[u] && *s_tex_src[u] ? s_tex_src[u] : "?", 10);
                         }
-                        for (u32 c = 0; c < g.fp_constants.count && c < 12; c++) {
+                        for (u32 c = 0; c < g.fp_constants.count && c < 48; c++) {
                             const float* fc = (const float*)g.fp_constants.values + c * 4u;
                             fprintf(stderr, "[probe-units]   fc%u %g %g %g %g%c", c, fc[0], fc[1], fc[2], fc[3], 10);
                         }
