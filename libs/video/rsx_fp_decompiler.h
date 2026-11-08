@@ -101,6 +101,7 @@ extern u32 rsx_fp_biased_mask;   /* units returning 2x-1 (TEXTURE_ADDRESS unsign
  * where there were hundreds. rsx_fp_gamma_mask / rsx_fp_biased_mask are
  * ignored then; rsx_fp_apply_unnorm_scale with dim NULL scales by fp_texp. */
 extern int rsx_fp_dynamic_tex;
+extern u32 rsx_fp_tex3d_mask;   /* 3D units, bound as stacked slices (dynamic modes) */
 /* racacit: the HLSL buffer size ps3recomp v0.18's callers (D3D12) size theirs by. */
 #ifndef RSX_FP_HLSL_BUFFER_SIZE
 #define RSX_FP_HLSL_BUFFER_SIZE (256u * 1024u)

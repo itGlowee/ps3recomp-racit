@@ -498,6 +498,24 @@ u64 rsx_fp_gamma_mask = 0;
 int rsx_fp_srgb_out = 0;
 int rsx_fp_dynamic_tex = 0;
 static int s_fp_dyn;     /* rsx_fp_dynamic_tex, for a buffered program (it needs the block) */
+/* 3D units (dynamic texture modes only). The engine binds each as one tall
+ * 2D image, its slices stacked top to bottom, and fp_texp .w carries the
+ * depth (bits 6-17), whether r is unnormalised (bit 18), r's wrap mode (bits
+ * 19-22) and whether t repeats (bit 23); rsx_tex3d picks the two slices
+ * around r and blends them. A Crack in Time's water keeps its splash ripples
+ * as a stack of frames, the frame for each patch of water picked from an
+ * index map: read as a plain 2D image, every patch showed the first frame,
+ * the splash repeated over the whole surface. */
+u32 rsx_fp_tex3d_mask = 0;
+
+/* A lookup on a 3D unit, coordinate `c` (a float3 expression), or 0 when
+ * the unit is not one. */
+static int fp_tex3d_rhs(char* rhs, size_t n, const char* tn, u32 unit, const char* c)
+{
+    if (!s_fp_dyn || !((rsx_fp_tex3d_mask >> (unit & 15u)) & 1u)) return 0;
+    snprintf(rhs, n, "rsx_tex3d(%s, rsx_samp[%u], %s, %uu)", tn, unit & 15u, c, unit & 15u);
+    return 1;
+}
 
 /* A fetch's value as the unit returns it (rsx_fp_gamma_mask, then
  * rsx_fp_biased_mask). */
@@ -813,8 +831,10 @@ static int rsx_fp_decompile_internal(
                 break;
             }
             /* Cubemap: sample with the full 3-component direction vector. */
-            snprintf(rhs, sizeof(rhs), "%s.Sample(rsx_samp[%u], (%s).%s)", tn, tex_unit, a,
-                     ((tex_cube_mask >> tex_unit) & 1u) ? "xyz" : "xy");
+            { char c3[1100]; snprintf(c3, sizeof c3, "(%s).xyz", a);
+              if (!fp_tex3d_rhs(rhs, sizeof rhs, tn, tex_unit, c3))
+                  snprintf(rhs, sizeof(rhs), "%s.Sample(rsx_samp[%u], (%s).%s)", tn, tex_unit, a,
+                           ((tex_cube_mask >> tex_unit) & 1u) ? "xyz" : "xy"); }
             fp_tex_remap(rhs, sizeof rhs, tex_unit);
             break;
         }
@@ -826,10 +846,12 @@ static int rsx_fp_decompile_internal(
                          a, a, (unsigned)rsx_fp_shadow_func[tex_unit & 15u]);
                 break;
             }
+            char c3[1100]; snprintf(c3, sizeof c3, "(%s).xyz / (%s).w", a, a);
             if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Projective divide is meaningless for a cube lookup; sample
                  * the direction directly. */
                 snprintf(rhs, sizeof(rhs), "%s.Sample(rsx_samp[%u], (%s).xyz)", tn, tex_unit, a);
+            else if (fp_tex3d_rhs(rhs, sizeof rhs, tn, tex_unit, c3)) {}
             else
                 snprintf(rhs, sizeof(rhs), "%s.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tn, tex_unit, a, a);
@@ -843,9 +865,11 @@ static int rsx_fp_decompile_internal(
             const int cube = (tex_cube_mask >> tex_unit) & 1u;
             char tn[32];
             fp_tex_name(tn, sizeof tn, tex_cube_mask, tex_unit);
-            snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
-                     opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
-                     cube ? "xyz" : "xy", b);
+            char c3[1100]; snprintf(c3, sizeof c3, "(%s).xyz", a);
+            if (!fp_tex3d_rhs(rhs, sizeof rhs, tn, tex_unit, c3))
+                snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
+                         opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
+                         cube ? "xyz" : "xy", b);
             fp_tex_remap(rhs, sizeof rhs, tex_unit);
             break;
         }
@@ -880,8 +904,10 @@ static int rsx_fp_decompile_internal(
                 break;
             }
             const char* sw = cube ? "xyz" : "xy";
-            snprintf(rhs, sizeof(rhs), "%s.SampleGrad(rsx_samp[%u], (%s).%s, (%s).%s, (%s).%s)",
-                     tn, tex_unit, a, sw, b, sw, c, sw);
+            char c3[1100]; snprintf(c3, sizeof c3, "(%s).xyz", a);
+            if (!fp_tex3d_rhs(rhs, sizeof rhs, tn, tex_unit, c3))
+                snprintf(rhs, sizeof(rhs), "%s.SampleGrad(rsx_samp[%u], (%s).%s, (%s).%s, (%s).%s)",
+                         tn, tex_unit, a, sw, b, sw, c, sw);
             fp_tex_remap(rhs, sizeof rhs, tex_unit);
             break;
         }
@@ -1292,7 +1318,7 @@ static int rsx_fp_decompile_internal(
              * in place of gamma and BIASED for those channels. Bit 5: the
              * cache stored the bytes offset binary (XOR 0x80), so the
              * filtered value decodes linearly -- (b - 128) / 127. */
-            "    if (w > 1u) {\n"
+            "    if ((w & 62u) != 0u) {\n"
             "        uint s = (w >> 1) & 15u;\n"
             "        float4 m = float4(s & 1u, (s >> 1) & 1u, (s >> 2) & 1u, (s >> 3) & 1u);\n"
             "        float4 sv;\n"
@@ -1301,6 +1327,39 @@ static int rsx_fp_decompile_internal(
             "        c = lerp(c, sv, m);\n"
             "    }\n"
             "    return c;\n"
+            "}\n");
+    /* A 3D unit bound as its slices stacked (rsx_fp_tex3d_mask). r's texel
+     * centres sit at n + 0.5, as on s and t; wrap mode 1 repeats over the
+     * depth, BORDER (4, and 5 CLAMP, whose edge is half border) reads the
+     * border colour past either end, the rest clamp. The border is taken as
+     * 0 -- in the offset-binary store (bit 5) that is 0x80, which decodes to
+     * 0. A Crack in Time's water indexes the splash frames from 1 and leaves
+     * still patches at 0, below the first slice: clamped, each of them showed
+     * the first frame, a tilted normal, and the patch flat blue. Within a
+     * slice t clamps half a texel short of the edge so the filter never
+     * reaches the next slice. */
+    if (s_fp_dyn && rsx_fp_tex3d_mask)
+        out_puts(&p,
+            "float4 rsx_tex3d(Texture2D t, SamplerState s, float3 c, uint u) {\n"
+            "    float4 tp = fp_texp[u];\n"
+            "    uint w = (uint)tp.w;\n"
+            "    float d = max((float)((w >> 6) & 4095u), 1.0);\n"
+            "    float tw, th; t.GetDimensions(tw, th);\n"
+            "    float hs = max(th / d, 1.0);\n"
+            "    float2 uv = c.xy * tp.xy;\n"
+            "    float zt = (((w >> 18) & 1u) != 0u ? c.z : c.z * d) - 0.5;\n"
+            "    float l0 = floor(zt); float f = zt - l0; float l1 = l0 + 1.0;\n"
+            "    uint wr = (w >> 19) & 15u;\n"
+            "    bool o0 = l0 < 0.0 || l0 > d - 1.0, o1 = l1 < 0.0 || l1 > d - 1.0;\n"
+            "    if (wr == 1u) { l0 -= d * floor(l0 / d); l1 -= d * floor(l1 / d); o0 = false; o1 = false; }\n"
+            "    else { l0 = clamp(l0, 0.0, d - 1.0); l1 = clamp(l1, 0.0, d - 1.0); }\n"
+            "    bool bd = wr == 4u || wr == 5u;\n"
+            "    float4 bc = (w & 32u) != 0u ? (float4)(128.0 / 255.0) : (float4)0;\n"
+            "    float v = ((w >> 23) & 1u) != 0u ? frac(uv.y) : saturate(uv.y);\n"
+            "    v = clamp(v, 0.5 / hs, 1.0 - 0.5 / hs);\n"
+            "    float4 a = bd && o0 ? bc : t.SampleLevel(s, float2(uv.x, (l0 + v) / d), 0.0);\n"
+            "    float4 b = bd && o1 ? bc : t.SampleLevel(s, float2(uv.x, (l1 + v) / d), 0.0);\n"
+            "    return lerp(a, b, f);\n"
             "}\n");
     if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");

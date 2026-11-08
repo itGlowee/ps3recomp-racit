@@ -1686,6 +1686,36 @@ static int eng_signed_store_ok(const rsx_dsp_texture* t)
 }
 static u32 s_tex_sstore;   /* units bound from the cache in that form (fp_texp .w bit 5) */
 
+/* A 3D texture (FORMAT dimension 3) laid out linearly (format bit 0x20):
+ * its slices follow one another in memory, pitch * height bytes each, so it
+ * decodes as one 2D image `depth` slices tall and the program's rsx_tex3d
+ * picks slices out of it (rsx_fp_tex3d_mask). Swizzled 3D textures
+ * interleave their slices and are still read as their first slice. */
+static int eng_tex3d_ok(const rsx_dsp_texture* t)
+{
+    return t->enabled && t->dimension == 3u && t->depth > 1u && t->depth <= 4095u && (t->format & 0x20u) &&
+           !t->cubemap && t->width && t->height && eng_dyn_tex();
+}
+static u32 eng_tex3d_mask(void)
+{
+    u32 mask = 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16u; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (eng_tex3d_ok(&t)) mask |= 1u << u;
+        if (t.enabled && t.dimension == 3u) {   /* each distinct one, a few times */
+            static u32 seen[16]; static u32 ns;
+            const u32 k = t.offset ^ (t.depth << 20) ^ (t.format << 8);
+            u32 i = 0; while (i < ns && seen[i] != k) i++;
+            if (i == ns && ns < 16u) { seen[ns++] = k;
+                fprintf(stderr, "[rsx engine] 3D texture on unit %u: %u:0x%08X %ux%ux%u pitch %u fmt 0x%02X wrap %08X filter %08X border %08X -> %s%c",
+                        u, t.location, t.offset, t.width, t.height, t.depth, t.pitch, t.format, t.wrap, t.filter, t.border_color,
+                        eng_tex3d_ok(&t) ? "stacked slices" : "first slice only (swizzled or dynamic modes off)", 10); }
+        }
+    }
+    return mask;
+}
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap, u32 into)
 {
@@ -2582,7 +2612,7 @@ static int eng_dyn_tex(void)
 }
 /* The texture-derived modes of the draw eng_pipeline_get last saw: what
  * fp_texp in the fragment constants carries when they are dynamic. */
-static u32 s_tm_unnorm, s_tm_biased, s_tm_cube;
+static u32 s_tm_unnorm, s_tm_biased, s_tm_cube, s_tm_t3d;
 static u64 s_tm_gamma, s_tm_signed;
 static u32 s_tm_dim[RSX_DSP_NUM_TEXTURES][2];
 #define PSTAGE(i) do { const u64 _n = eng_rdtsc(); s_pstage[i] += _n - _pt; _pt = _n; } while (0)
@@ -2604,9 +2634,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     /* The texture-derived masks change only with texture registers: kept
      * until a texture or vertex-texture register takes a new value. */
-    static struct { int valid; u32 tgen, vgen, cube, vtex, unnorm, shadow, biased; u64 gamma, sgn; u32 dim[RSX_DSP_NUM_TEXTURES][2]; u8 func[16]; } mc;
+    static struct { int valid; u32 tgen, vgen, cube, vtex, unnorm, shadow, biased, t3d; u64 gamma, sgn; u32 dim[RSX_DSP_NUM_TEXTURES][2]; u8 func[16]; } mc;
     if (!mc.valid || mc.tgen != g.rsx.tex_gen_all || mc.vgen != g.rsx.vtex_gen) {
         mc.cube = eng_cube_mask();
+        mc.t3d = eng_tex3d_mask() & ~mc.cube;
         mc.vtex = eng_vtex_mask();
         mc.unnorm = eng_unnorm_mask(mc.dim);
         mc.shadow = eng_shadow_mask(mc.func);
@@ -2627,6 +2658,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u64 gamma_mask = mc.gamma;
     const int dyn_tex = eng_dyn_tex();
     s_tm_unnorm = unnorm_mask; s_tm_biased = biased_mask; s_tm_gamma = gamma_mask; s_tm_cube = cube_mask; s_tm_signed = mc.sgn;
+    s_tm_t3d = dyn_tex ? mc.t3d : 0u;
     memcpy(s_tm_dim, unnorm_dim, sizeof s_tm_dim);
     /* SET_SHADER_PACKER (0x1FEC) bit 0: colour outputs are written as sRGB
      * (the RSX's sRGB-write, libgcm's fragment program gamma). A Crack in
@@ -2688,6 +2720,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (dyn_tex) {
             static const u32 dyn_tag = 0x44594E54u;   /* "TNYD": a different program text */
             key = eng_fnv1a(&dyn_tag, sizeof dyn_tag, key);
+            if (mc.t3d) key = eng_fnv1a(&mc.t3d, sizeof mc.t3d, key ^ 0x3D3Dull);
         } else {
             if (unnorm_mask) {
                 key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
@@ -2742,6 +2775,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_fp_biased_mask = dyn_tex ? 0u : biased_mask;
         rsx_fp_gamma_mask = dyn_tex ? 0u : gamma_mask;
         rsx_fp_dynamic_tex = dyn_tex;
+        rsx_fp_tex3d_mask = dyn_tex ? mc.t3d : 0u;
         rsx_fp_srgb_out = srgb_out;
         memcpy(rsx_fp_shadow_func, shadow_func, sizeof shadow_func);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
@@ -2750,6 +2784,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_fp_biased_mask = 0;
         rsx_fp_gamma_mask = 0;
         rsx_fp_dynamic_tex = 0;
+        rsx_fp_tex3d_mask = 0;
         rsx_fp_srgb_out = 0;
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
@@ -4344,7 +4379,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         { const u64 t0 = eng_rdtsc();
           const u32 epoch0 = g.bind_epoch;
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
-                                       t.width, t.height, t.mipmaps, t.pitch,
+                                       t.width, eng_tex3d_ok(&t) ? t.height * t.depth : t.height,
+                                       eng_tex3d_ok(&t) ? 1u : t.mipmaps, t.pitch,
                                        (int)t.cubemap, (t.remap & 0xFFFFu) |
                                        (eng_signed_store_ok(&t) ? ENG_REMAP_SIGNED_STORE : 0u));
           s_tex_slot_cyc += eng_rdtsc() - t0;
@@ -4918,11 +4954,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
              * so this cannot change a pass that reads colour. */
             if (((s_tm_biased >> u) & 1u) && ((s_tex_srgb_src >> u) & 1u)) gam |= 7u;
             tp[2] = s_tex_reint[u] ? (float)s_tex_reint[u] : (float)gam;
-            /* .w: bit 0 BIASED (x2-1), bits 1-4 the signed channels (R, G, B, A). */
             /* .w: bit 0 BIASED (x2-1), bits 1-4 the signed channels (R, G, B, A),
-             * bit 5 those channels' bytes are stored offset binary. */
+             * bit 5 those channels' bytes are stored offset binary; for a 3D
+             * unit (rsx_tex3d) bits 6-17 the depth, 18 r unnormalised, 19-22
+             * r's wrap mode, 23 t repeats. All under 2^24: exact in a float. */
+            u32 w3 = 0;
+            if ((s_tm_t3d >> u) & 1u) {
+                rsx_dsp_texture t3; rsx_dsp_get_texture(&g.rsx, u, &t3);
+                if (eng_tex3d_ok(&t3))
+                    w3 = (t3.depth << 6) | ((t3.format & RSX_TEX_FMT_UNNORM) ? 1u << 18 : 0u) |
+                         (((t3.wrap >> 16) & 0xFu) << 19) | (((t3.wrap >> 8) & 0xFu) == 1u ? 1u << 23 : 0u);
+            }
             tp[3] = (float)(((s_tm_biased >> u) & 1u) | ((u32)((s_tm_signed >> (u * 4u)) & 0xFu) << 1) |
-                            (((s_tex_sstore >> u) & 1u) << 5));
+                            (((s_tex_sstore >> u) & 1u) << 5) | w3);
         }
     }
 
@@ -5265,8 +5309,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
                         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
                             if (!(tex_mask & (1u << u))) continue;
                             rsx_dsp_texture tt; rsx_dsp_get_texture(&g.rsx, u, &tt);
-                            fprintf(stderr, "[probe-units]   tex%u %u:%08X %ux%u fmt 0x%X remap %04X filter %08X addr %08X <- %s%c", u, tt.location, tt.offset,
-                                    tt.width, tt.height, tt.format, tt.remap & 0xFFFFu, tt.filter, tt.wrap,
+                            fprintf(stderr, "[probe-units]   tex%u %u:%08X %ux%ux%u dim %u pitch %u fmt 0x%X remap %04X filter %08X addr %08X <- %s%c", u, tt.location, tt.offset,
+                                    tt.width, tt.height, tt.depth, tt.dimension, tt.pitch, tt.format, tt.remap & 0xFFFFu, tt.filter, tt.wrap,
                                     s_tex_src[u] && *s_tex_src[u] ? s_tex_src[u] : "?", 10);
                         }
                         for (u32 c = 0; c < g.fp_constants.count && c < 48; c++) {
