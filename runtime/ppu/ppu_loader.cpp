@@ -1252,7 +1252,12 @@ static DWORD WINAPI ppu_stall_probe(LPVOID)
         }
         const unsigned long long dark = now - last_t;
         if (events >= 8 || before < (lim < 400 ? 18u : 90u)) continue;   /* 2 s of history at 50 ms, 0.4 s at 10 ms */
-        if ((dark >= (unsigned long long)lim && reported == 0) || (dark >= 2ull * lim && reported == 1)) {
+        /* Two samples early, then one a second up to six: the owner's 2.4 s
+         * and 8.3 s Agorian Arena freezes were sampled only at 0.4 s, when the
+         * walker and the game were still running normally -- what held them
+         * for the seconds after was never seen. */
+        if ((dark >= (unsigned long long)lim && reported == 0) || (dark >= 2ull * lim && reported == 1) ||
+            (reported >= 2 && reported < 6 && dark >= 2ull * lim + 1000ull * (unsigned long long)(reported - 1))) {
             fprintf(stderr, "[stall] no flip for %llu ms (flip %u, %u in the 2 s before): every guest thread%c",
                     dark, last, before, 10);
             ppu_report_guest_lrs();

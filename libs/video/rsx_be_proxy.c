@@ -133,6 +133,41 @@ static unsigned long long px_us(void)
     return (unsigned long long)(c.QuadPart * 1000000.0 / (double)f.QuadPart);
 }
 
+/* ---- long waits on the worker -------------------------------------------
+ * The owner's Agorian Arena session froze twice for 3.4 s with the render
+ * thread inside present (the second time inside the budget pass), which is
+ * where it blocks when the worker is frames behind: the ring is full or more
+ * than two presents are queued. Nothing said what the worker was doing. It
+ * now records the op it is replaying (one relaxed store per command, no clock
+ * read), and a front-end wait of 200 ms or more is logged with that op and
+ * whether the worker replayed anything meanwhile: stuck inside one backend
+ * call, or slow on many. */
+static _Atomic u32 s_cur_op;                    /* worker: op being replayed, 0 = idle */
+static _Atomic unsigned long long s_ops_done;   /* worker: commands replayed */
+static const char* px_op_name(u32 op)
+{
+    static const char* const n[] = { "?", "pad", "tex_create", "tex_upload", "tex_release", "color_create",
+        "color_release", "view", "depth_create", "depth_release", "dsnap", "dsnap_sized", "csnap", "blit",
+        "pipe_create", "pipe_release", "bind_targets", "bind_pipe", "vs_const", "ps_const", "bind_tex",
+        "bind_vtex", "viewport", "scissor", "stencil_ref", "draw", "clear_color", "clear_ds", "present",
+        "geom_upload", "geom_release", "draw_cached", "submit", "vs_delta", "draw_cached_vi", "depth_bias",
+        "blend_color" };
+    return op < sizeof n / sizeof n[0] ? n[op] : "?";
+}
+static unsigned long long px_us(void);
+static void px_note_wait(const char* what, unsigned long long t0, unsigned long long ops0)
+{
+    const unsigned long long d = px_us() - t0;
+    if (d < 200000ull) return;
+    static int logs;
+    if (logs >= 32) return;
+    logs++;
+    const u32 op = atomic_load_explicit(&s_cur_op, memory_order_relaxed);
+    fprintf(stderr, "[be-proxy] the renderer waited %.0f ms for the backend worker (%s); the worker is %s%s, "
+            "%llu commands replayed meanwhile%c", d / 1e3, what, op ? "replaying " : "idle", op ? px_op_name(op) : "",
+            atomic_load_explicit(&s_ops_done, memory_order_relaxed) - ops0, 10);
+}
+
 /* ---- present pacing (RACACIT_PRESENT_PACE=0 off) ------------------------
  * A frame reaches the window when the render thread has drained it, and
  * that drain varies with the frame: in Axiom City the game kicks a frame
@@ -257,6 +292,7 @@ static void px_publish(void)
 
 static u8* px_reserve(u32 n)
 {
+    unsigned long long wt0 = 0, wops0 = 0;   /* first wait for room, for px_note_wait */
     for (;;) {
         const unsigned long long w = s_wl;
         const u32 off = (u32)(w % PX_RING_BYTES);
@@ -271,9 +307,11 @@ static u8* px_reserve(u32 n)
                 s_wl = w + tail;
                 continue;
             }
+            if (wt0) px_note_wait("ring full", wt0, wops0);
             return s_ring + off;
         }
         px_publish();
+        if (!wt0) { wt0 = px_us(); wops0 = atomic_load_explicit(&s_ops_done, memory_order_relaxed); }
         const unsigned long long t0 = s_stats > 0 ? px_us() : 0;
         AcquireSRWLockExclusive(&s_lk);
         if (PX_RING_BYTES - (s_wl - atomic_load(&s_r)) < need)
@@ -479,6 +517,7 @@ static void px_worker_loop(void)
         }
         const u8* rec = s_ring + (u32)(r % PX_RING_BYTES);
         const u32 n = ((const px_hdr*)rec)->bytes;
+        atomic_store_explicit(&s_cur_op, ((const px_hdr*)rec)->op, memory_order_relaxed);
         if (s_stats > 0) {
             const unsigned long long t0 = px_us();
             px_replay(rec);
@@ -486,6 +525,9 @@ static void px_worker_loop(void)
             st_busy_us += d; st_bytes += n; st_cmds++;
             if (d >= 20000) fprintf(stderr, "[be-proxy] slow call: op %u took %.1f ms%c", ((const px_hdr*)rec)->op, d / 1e3, 10);
         } else px_replay(rec);
+        atomic_store_explicit(&s_cur_op, 0, memory_order_relaxed);
+        atomic_store_explicit(&s_ops_done, atomic_load_explicit(&s_ops_done, memory_order_relaxed) + 1u,
+                              memory_order_relaxed);
         r += n;
         if (r - r_pub >= PX_R_BATCH) {
             atomic_store_explicit(&s_r, r, memory_order_release); r_pub = r;
@@ -499,7 +541,7 @@ static void px_worker_loop(void)
 /* Wait until every queued command has been replayed and the worker sleeps. */
 static void px_sync(void)
 {
-    const unsigned long long t0 = s_stats > 0 ? px_us() : 0;
+    const unsigned long long t0 = px_us(), ops0 = atomic_load_explicit(&s_ops_done, memory_order_relaxed);
     if (s_stats > 0) st_sync++;
     px_publish();
     AcquireSRWLockExclusive(&s_lk);
@@ -508,6 +550,7 @@ static void px_sync(void)
         SleepConditionVariableSRW(&s_cv_room, &s_lk, 1, 0);
     ReleaseSRWLockExclusive(&s_lk);
     if (s_stats > 0) st_sync_us += px_us() - t0;
+    px_note_wait("sync", t0, ops0);
 }
 
 /* ---- the proxy's rsx_draw_backend ---------------------------------------- */
@@ -782,11 +825,12 @@ static void p_present(void* user, u32 s)
     px_publish();
     /* No more than two frames queued behind the worker. */
     if (atomic_load(&s_presents) > 2) {
-        const unsigned long long t0 = s_stats > 0 ? px_us() : 0;
+        const unsigned long long t0 = px_us(), ops0 = atomic_load_explicit(&s_ops_done, memory_order_relaxed);
         AcquireSRWLockExclusive(&s_lk);
         while (atomic_load(&s_presents) > 2) SleepConditionVariableSRW(&s_cv_room, &s_lk, 2, 0);
         ReleaseSRWLockExclusive(&s_lk);
         if (s_stats > 0) { st_thr++; st_thr_us += px_us() - t0; }
+        px_note_wait("three frames queued", t0, ops0);
     }
     static unsigned n_presents; static unsigned long long t_last;
     if (s_stats > 0 && ++n_presents % 240u == 0) {
