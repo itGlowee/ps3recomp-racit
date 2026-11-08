@@ -1665,9 +1665,32 @@ static u32 eng_tex_skip_levels(u32 w, u32 h, u32 nlv)
     while (k < (u32)q && k + 1u < nlv && (w >> (k + 1u)) >= floor_ && (h >> (k + 1u)) >= floor_) k++;
     return k;
 }
+/* A texture whose every channel the unit reads signed (TEXTURE_FILTER
+ * [28:31] = 0xF) in a plain 8-bit format is kept in the cache as offset
+ * binary, each byte XOR 0x80: the sampler then filters values in their
+ * signed order and the shader's decode is linear (rsx_texmode, fp_texp .w
+ * bit 5). Read as raw unorm and sign-extended after filtering, two texels
+ * either side of zero (0x02 and 0xFE: +0.016 and -0.016) blend to 0x80,
+ * -1.0 -- A Crack in Time's water normals came out as a field of
+ * full-strength spikes wherever a wave slope crossed zero. The flag rides in
+ * the cache key's remap word, bit 30 (the crossbar uses the low 16). */
+#define ENG_REMAP_SIGNED_STORE (1u << 30)
+static int eng_dyn_tex(void);
+/* Only with the dynamic texture modes (the default): RSX_FP_DYNAMIC_TEX=0
+ * bakes the modes into the programs, which do not decode signed channels. */
+static int eng_signed_store_ok(const rsx_dsp_texture* t)
+{
+    const u32 base = t->format & 0x9Fu;
+    return ((t->filter >> 28) & 0xFu) == 0xFu && (base == 0x85u || base == 0x8Bu) && !t->cubemap &&
+           eng_dyn_tex();
+}
+static u32 s_tex_sstore;   /* units bound from the cache in that form (fp_texp .w bit 5) */
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap, u32 into)
 {
+    const int signed_store = (remap & ENG_REMAP_SIGNED_STORE) != 0;
+    remap &= 0xFFFFu;
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || !lv[0].tl.face_bytes) return 0;
@@ -1718,6 +1741,11 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
                                face + lv[m].offset, lv[m].w, lv[m].h, tl,
                                rsx_texture_argb_is_rgba());
+            if (signed_store) {
+                u8* b = (u8*)g.tex_staging;
+                const size_t n = (size_t)tl->dst_row_bytes * tl->rows;
+                for (size_t i = 0; i < n; i++) b[i] ^= 0x80u;
+            }
             g.be->texture_upload(g.be->user, handle, f, m - skip, lv[m].w, lv[m].h,
                                  g.tex_staging, tl->dst_row_bytes, tl->rows);
         }
@@ -2290,6 +2318,45 @@ static u32 eng_biased_mask(void)
     return mask;
 }
 
+/* TEXTURE_FILTER [28:31] (A, R, G, B signed): the unit reads those bytes
+ * of the texel as two's-complement, -128..127 over 127 (RPCS3 RSXTexture.cpp
+ * format_ex, _sext_unorm8x4). The flags belong to the incoming channels, so
+ * they follow the crossbar to the output channels; a channel the crossbar
+ * forces to 0 or 1 is not touched. Four bits per unit in output order R, G,
+ * B, A. The 8-bit colour formats only: RPCS3's get_format_features, minus
+ * Y16_X16 (16-bit sign extension, not done here).
+ *
+ * A Crack in Time's water reads its two G8B8 wave normal maps this way.
+ * Read unsigned, every slope came out positive, the surface normal leaned
+ * ~50 degrees the same way everywhere, every reflection ray left the
+ * reflection map, and the river showed one flat blue at any shallow angle. */
+static u64 eng_signed_mask(void)
+{
+    u64 mask = 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const u32 argb = (t.filter >> 28) & 0xFu;          /* bit0 A, 1 R, 2 G, 3 B */
+        if (!t.enabled || !argb) continue;
+        switch (t.format & 0x9Fu) {
+        case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87: case 0x88:
+        case 0x8B: case 0x8D: case 0x8E: case 0x8F: case 0x97: case 0x9D: case 0x9E:
+            break;
+        default:
+            continue;
+        }
+        u32 out = 0;
+        /* remap: source select at bit 2i, op at 8 + 2i, i = A, R, G, B; op 2 = from the texel */
+        static const u32 out_bit[4] = { 3u, 0u, 1u, 2u };  /* A, R, G, B -> R0 G1 B2 A3 */
+        for (u32 i = 0; i < 4u; i++) {
+            const u32 sel = (t.remap >> (2u * i)) & 3u, op = (t.remap >> (8u + 2u * i)) & 3u;
+            if (op == 2u && ((argb >> sel) & 1u)) out |= 1u << out_bit[i];
+        }
+        mask |= (u64)out << (u * 4u);
+    }
+    return mask;
+}
+
 /* TEXTURE_ADDRESS gamma [20:23] (R, G, B, A): the unit converts those
  * channels from sRGB to linear on read. Four bits per unit. */
 static u64 eng_gamma_mask(void)
@@ -2516,7 +2583,7 @@ static int eng_dyn_tex(void)
 /* The texture-derived modes of the draw eng_pipeline_get last saw: what
  * fp_texp in the fragment constants carries when they are dynamic. */
 static u32 s_tm_unnorm, s_tm_biased, s_tm_cube;
-static u64 s_tm_gamma;
+static u64 s_tm_gamma, s_tm_signed;
 static u32 s_tm_dim[RSX_DSP_NUM_TEXTURES][2];
 #define PSTAGE(i) do { const u64 _n = eng_rdtsc(); s_pstage[i] += _n - _pt; _pt = _n; } while (0)
 static u64 s_last_pipe_key;   /* the key eng_pipeline_get last resolved (RSX_ENG_PROBE) */
@@ -2537,7 +2604,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     /* The texture-derived masks change only with texture registers: kept
      * until a texture or vertex-texture register takes a new value. */
-    static struct { int valid; u32 tgen, vgen, cube, vtex, unnorm, shadow, biased; u64 gamma; u32 dim[RSX_DSP_NUM_TEXTURES][2]; u8 func[16]; } mc;
+    static struct { int valid; u32 tgen, vgen, cube, vtex, unnorm, shadow, biased; u64 gamma, sgn; u32 dim[RSX_DSP_NUM_TEXTURES][2]; u8 func[16]; } mc;
     if (!mc.valid || mc.tgen != g.rsx.tex_gen_all || mc.vgen != g.rsx.vtex_gen) {
         mc.cube = eng_cube_mask();
         mc.vtex = eng_vtex_mask();
@@ -2545,6 +2612,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         mc.shadow = eng_shadow_mask(mc.func);
         mc.biased = eng_biased_mask();
         mc.gamma = eng_gamma_mask();
+        mc.sgn = eng_signed_mask();
         mc.tgen = g.rsx.tex_gen_all; mc.vgen = g.rsx.vtex_gen; mc.valid = 1;
     }
     const u32 cube_mask = mc.cube;
@@ -2558,7 +2626,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 biased_mask = mc.biased;
     const u64 gamma_mask = mc.gamma;
     const int dyn_tex = eng_dyn_tex();
-    s_tm_unnorm = unnorm_mask; s_tm_biased = biased_mask; s_tm_gamma = gamma_mask; s_tm_cube = cube_mask;
+    s_tm_unnorm = unnorm_mask; s_tm_biased = biased_mask; s_tm_gamma = gamma_mask; s_tm_cube = cube_mask; s_tm_signed = mc.sgn;
     memcpy(s_tm_dim, unnorm_dim, sizeof s_tm_dim);
     /* SET_SHADER_PACKER (0x1FEC) bit 0: colour outputs are written as sRGB
      * (the RSX's sRGB-write, libgcm's fragment program gamma). A Crack in
@@ -4277,7 +4345,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
           const u32 epoch0 = g.bind_epoch;
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
-                                       (int)t.cubemap, t.remap & 0xFFFFu);
+                                       (int)t.cubemap, (t.remap & 0xFFFFu) |
+                                       (eng_signed_store_ok(&t) ? ENG_REMAP_SIGNED_STORE : 0u));
           s_tex_slot_cyc += eng_rdtsc() - t0;
           if (textures[u] && g.bind_epoch == epoch0) {
               eng_unit_memo* mm = &s_unit_memo[u];
@@ -4286,6 +4355,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
               mm->rt = 0; mm->slot = ENG_INVALID;
               mm->gen = g.rsx.tex_gen[u]; mm->enabled = 1;
           } }
+    }
+    /* Which cache-bound units hold offset-binary bytes (eng_signed_store_ok). */
+    s_tex_sstore = 0;
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+        if (!((mask >> u) & 1u) || !s_tex_src[u] || strcmp(s_tex_src[u], "texture cache") != 0) continue;
+        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (eng_signed_store_ok(&t)) s_tex_sstore |= 1u << u;
     }
     return mask;
 }
@@ -4842,7 +4918,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
              * so this cannot change a pass that reads colour. */
             if (((s_tm_biased >> u) & 1u) && ((s_tex_srgb_src >> u) & 1u)) gam |= 7u;
             tp[2] = s_tex_reint[u] ? (float)s_tex_reint[u] : (float)gam;
-            tp[3] = (float)((s_tm_biased >> u) & 1u);
+            /* .w: bit 0 BIASED (x2-1), bits 1-4 the signed channels (R, G, B, A). */
+            /* .w: bit 0 BIASED (x2-1), bits 1-4 the signed channels (R, G, B, A),
+             * bit 5 those channels' bytes are stored offset binary. */
+            tp[3] = (float)(((s_tm_biased >> u) & 1u) | ((u32)((s_tm_signed >> (u * 4u)) & 0xFu) << 1) |
+                            (((s_tex_sstore >> u) & 1u) << 5));
         }
     }
 

@@ -1272,7 +1272,8 @@ static int rsx_fp_decompile_internal(
         out_puts(&p,
             "float4 rsx_texmode(float4 c, uint u) {\n"
             "    float4 tp = fp_texp[u];\n"
-            "    if (tp.z >= 16.0) {\n"                     /* RGBA8 bytes read as Y16_X16 */
+            "    float4 c0 = c;\n"
+            "    if (tp.z >= 16.0) {\n"                    /* RGBA8 bytes read as Y16_X16 */
             "        uint q = (uint)tp.z;\n"
             "        float4 b = round(saturate(c) * 255.0);\n"
             "        float k[6] = { (b.a * 256.0 + b.r) / 65535.0, (b.g * 256.0 + b.b) / 65535.0, 0.0, 1.0, 0.0, 1.0 };\n"
@@ -1284,7 +1285,21 @@ static int rsx_fp_decompile_internal(
             "        float4 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);\n"
             "        c = lerp(c, lerp(hi, c / 12.92, step(c, 0.04045)), m);\n"
             "    }\n"
-            "    if (tp.w != 0.0) c = c * 2.0 - 1.0;\n"
+            "    uint w = (uint)tp.w;\n"
+            "    if ((w & 1u) != 0u) c = c * 2.0 - 1.0;\n"
+            /* Signed channels (fp_texp .w bits 1-4, R G B A): the texel's
+             * bytes as two's-complement over 127 (RPCS3 _sext_unorm8x4),
+             * in place of gamma and BIASED for those channels. Bit 5: the
+             * cache stored the bytes offset binary (XOR 0x80), so the
+             * filtered value decodes linearly -- (b - 128) / 127. */
+            "    if (w > 1u) {\n"
+            "        uint s = (w >> 1) & 15u;\n"
+            "        float4 m = float4(s & 1u, (s >> 1) & 1u, (s >> 2) & 1u, (s >> 3) & 1u);\n"
+            "        float4 sv;\n"
+            "        if ((w & 32u) != 0u) sv = (c0 * 255.0 - 128.0) / 127.0;\n"
+            "        else sv = (float4)(((int4)((uint4)floor(saturate(c0) * 255.0 + 0.5) << 24)) >> 24) / 127.0;\n"
+            "        c = lerp(c, sv, m);\n"
+            "    }\n"
             "    return c;\n"
             "}\n");
     if (targets == 1 && !depth_export) {
