@@ -5273,6 +5273,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
           fprintf(stderr, "[probe] frame %u prim %u n=%u stencil %u -> (%u,%u) = %u %u %u %u pipe %016llx blend %u %X/%X tgt %08X %ux%u%c", g.frames, (unsigned)prim, n_draw,
                   rs.stencil_enable, px_, py_, pv[0], pv[1], pv[2], pv[3], (unsigned long long)s_last_pipe_key,
                   rs.blend_enable, rs.sf_rgb, rs.df_rgb, g.surfaces[target].offset, g.surfaces[target].w, g.surfaces[target].h, 10);
+          /* Depth state, for z-fighting: test/write/func, polygon offset (raw
+           * registers too), CONTROL0 (bit 12 = floating-point depth buffer),
+           * ZMIN_MAX_CONTROL, the viewport z transform and depth format. */
+          { const u32 cmin = rsx_dsp_reg(&g.rsx, 0x0394), cmax = rsx_dsp_reg(&g.rsx, 0x0398);
+            float fmin, fmax; memcpy(&fmin, &cmin, 4); memcpy(&fmax, &cmax, 4);
+            fprintf(stderr, "[probe]   depth t%u w%u f%X | poly fill %u scale %g bias %g (regs %08X %08X) | control0 %08X zminmax %X"
+                            " | vp z scale %.7f tr %.7f clip %g..%g | zfmt %u%c",
+                    rs.depth_test, rs.depth_write, rs.depth_func, rsx_dsp_reg(&g.rsx, 0x0A68) & 1u,
+                    rs.poly_scale, rs.poly_bias, rsx_dsp_reg(&g.rsx, 0x0A78), rsx_dsp_reg(&g.rsx, 0x0A7C),
+                    rsx_dsp_reg(&g.rsx, 0x03B0), rsx_dsp_reg(&g.rsx, 0x1D78),
+                    vp.scale[2], vp.translate[2], fmin, fmax, sf.depth_format, 10); }
           /* ... and the bound depth buffer's snapshot and as-colour bytes there. */
           if (zslot != ENG_INVALID) {
               eng_zdepth* z = &g.zdepths[zslot];
