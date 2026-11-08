@@ -504,14 +504,14 @@ static int s_fp_dyn;     /* rsx_fp_dynamic_tex, for a buffered program (it needs
 static void fp_tex_remap(char* rhs, size_t n, u32 unit)
 {
     if (s_fp_dyn) {
-        char t[704];
+        char t[2200];
         snprintf(t, sizeof t, "rsx_texmode(%s, %uu)", rhs, unit & 15u);
         snprintf(rhs, n, "%s", t);
         return;
     }
     const u32 gm = (u32)(rsx_fp_gamma_mask >> ((unit & 15u) * 4u)) & 0xFu;
     if (gm) {
-        char t[704];
+        char t[2200];
         snprintf(t, sizeof t, "rsx_gamma(%s, float4(%u, %u, %u, %u))", rhs,
                  gm & 1u, (gm >> 1) & 1u, (gm >> 2) & 1u, (gm >> 3) & 1u);
         snprintf(rhs, n, "%s", t);
@@ -609,10 +609,9 @@ static int rsx_fp_decompile_internal(
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
-        /* Texture lookups this decompiler does not compare or does not do at
-         * all: TXD anywhere, TXB/TXL or a cube map on a depth-compare unit
-         * (those sample the raw depth). Logged once each, to see whether a
-         * title uses them. */
+        /* Texture lookups worth knowing a title uses: TXD anywhere (explicit
+         * gradients), TXB/TXL or a cube map on a depth-compare unit (those
+         * sample the raw depth). Logged once each. */
         if (!is_branch && (opcode == OP_TXD || opcode == OP_TXB || opcode == OP_TXL || opcode == OP_TEX || opcode == OP_TXP)) {
             const int shadow = (rsx_fp_shadow_mask >> tex_unit) & 1u, cube = (tex_cube_mask >> tex_unit) & 1u;
             const int kind = opcode == OP_TXD ? 0 : (shadow && cube) ? 1 : (shadow && (opcode == OP_TXB || opcode == OP_TXL)) ? 2 : -1;
@@ -744,7 +743,7 @@ static int rsx_fp_decompile_internal(
         }
 
         /* Build the RHS expression for this opcode. */
-        char rhs[640];
+        char rhs[2048];
         int handled = 1;
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
@@ -850,6 +849,80 @@ static int rsx_fp_decompile_internal(
             fp_tex_remap(rhs, sizeof rhs, tex_unit);
             break;
         }
+        /* The rest of the NV40 set (RPCS3 FragmentProgramDecompiler.cpp +
+         * GLSLCommon.cpp getFunction). Every one of these used to fall to the
+         * TODO below, which writes nothing: the destination kept whatever it
+         * held before. A Crack in Time's water builds its reflection vector
+         * with RFL, so the environment lookup sampled one fixed direction and
+         * the surface showed a flat blue at every grazing angle. */
+        case OP_RFL: snprintf(rhs, sizeof(rhs), "reflect((%s), (%s))", a, b); break;
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
+        case OP_DP2A: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy) + (%s).x", a, b, c); break;
+        case OP_DST: snprintf(rhs, sizeof(rhs), "float4(1.0, (%s).y * (%s).y, (%s).z, (%s).w)", a, b, a, b); break;
+        case OP_STR: snprintf(rhs, sizeof(rhs), "1.0"); break;
+        case OP_SFL: snprintf(rhs, sizeof(rhs), "0.0"); break;
+        /* RPCS3 _builtin_lit (lit_legacy). */
+        case OP_LIT:
+            snprintf(rhs, sizeof(rhs),
+                     "float4(1.0, max((%s).x, 0.0), (%s).x > 0.0 ? exp2((%s).w * log2(max((%s).y, 1e-10))) : 0.0, 1.0)",
+                     a, a, a, a);
+            break;
+        case OP_TXD: {
+            /* Explicit gradients: coordinate a, d/dx b, d/dy c. A depth-
+             * compare unit keeps the plain comparison. */
+            const int cube = (tex_cube_mask >> tex_unit) & 1u;
+            char tn[32];
+            fp_tex_name(tn, sizeof tn, tex_cube_mask, tex_unit);
+            if (((rsx_fp_shadow_mask >> tex_unit) & 1u) && !cube) {
+                snprintf(rhs, sizeof(rhs), "rsx_shadow(%s, rsx_samp[%u], (%s).xyz, %u)", tn, tex_unit, a,
+                         (unsigned)rsx_fp_shadow_func[tex_unit & 15u]);
+                break;
+            }
+            const char* sw = cube ? "xyz" : "xy";
+            snprintf(rhs, sizeof(rhs), "%s.SampleGrad(rsx_samp[%u], (%s).%s, (%s).%s, (%s).%s)",
+                     tn, tex_unit, a, sw, b, sw, c, sw);
+            fp_tex_remap(rhs, sizeof rhs, tex_unit);
+            break;
+        }
+        /* Pack/unpack (NV_fragment_program PK2H/PK2US/PK4B/PK4UB and the
+         * UP forms): the packed word travels as the bits of a float. */
+        case OP_PK2H:
+            snprintf(rhs, sizeof(rhs), "asfloat(f32tof16((%s).x) | (f32tof16((%s).y) << 16))", a, a);
+            break;
+        case OP_UP2H:
+            snprintf(rhs, sizeof(rhs), "f16tof32(asuint((%s).x).xxxx >> uint4(0u, 16u, 0u, 16u))", a);
+            break;
+        case OP_PK2US:
+            snprintf(rhs, sizeof(rhs),
+                     "asfloat((uint)round(saturate((%s).x) * 65535.0) | ((uint)round(saturate((%s).y) * 65535.0) << 16))",
+                     a, a);
+            break;
+        case OP_UP2US:
+            snprintf(rhs, sizeof(rhs),
+                     "((float4)((asuint((%s).x).xxxx >> uint4(0u, 16u, 0u, 16u)) & 0xFFFFu) / 65535.0)", a);
+            break;
+        case OP_PK4UB:
+            snprintf(rhs, sizeof(rhs),
+                     "asfloat((uint)dot(round(saturate(%s) * 255.0).xy, float2(1.0, 256.0)) |"
+                     " ((uint)dot(round(saturate(%s) * 255.0).zw, float2(1.0, 256.0)) << 16))", a, a);
+            break;
+        case OP_UP4UB:
+            snprintf(rhs, sizeof(rhs),
+                     "((float4)((asuint((%s).x).xxxx >> uint4(0u, 8u, 16u, 24u)) & 0xFFu) / 255.0)", a);
+            break;
+        /* Signed bytes: 256 * frac(q / 256) is q's two's-complement byte,
+         * exact for |q| <= 127. */
+        case OP_PK4B:
+            snprintf(rhs, sizeof(rhs),
+                     "asfloat((uint)dot((256.0 * frac(round(clamp((%s), -1.0, 1.0) * 127.0) / 256.0)).xy, float2(1.0, 256.0)) |"
+                     " ((uint)dot((256.0 * frac(round(clamp((%s), -1.0, 1.0) * 127.0) / 256.0)).zw, float2(1.0, 256.0)) << 16))",
+                     a, a);
+            break;
+        case OP_UP4B:
+            snprintf(rhs, sizeof(rhs),
+                     "clamp((float4)((int4)(asuint((%s).x).xxxx << uint4(24u, 16u, 8u, 0u)) >> 24) / 127.0, -1.0, 1.0)", a);
+            break;
         case OP_KIL:
             /* Fragment kill. Predicated by the same exec_if condition as any
              * other instruction (RPCS3 FragmentProgramDecompiler case
@@ -906,14 +979,14 @@ static int rsx_fp_decompile_internal(
             if (has_dest && is_uncond && !set_cond) {
                 /* Common unconditional path — kept byte-identical so the 39
                  * non-predicated programs in this capture emit unchanged. */
-                char line[800];
+                char line[2400];
                 snprintf(line, sizeof(line),
                          "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
                          rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
-                char buf[1200];
+                char buf[2600];
                 snprintf(buf, sizeof(buf),
                          "    { float4 _v = (float4)(%s)%s;%s\n",
                          rhs, scale_txt[res_scale], sat);
