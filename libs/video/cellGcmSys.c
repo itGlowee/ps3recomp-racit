@@ -1728,6 +1728,24 @@ static void gcm_cf_dump(void)
     }
 }
 
+/* Where the block `put` sits in starts: the target of the most recent JUMP the
+ * walker took that lands at or a little before `put`, or 0xFFFFFFFF. A title
+ * that links its frame blocks with JUMPs enters each one at its header, and
+ * `put` stops a few words into it. */
+#define GCM_RESYNC_BLOCK_BYTES 0x10000u     /* how far before put a block may start */
+#define GCM_RESYNC_NEAR_BYTES  0x100000u    /* a resync from further below than this is not in the ring */
+static u32 gcm_cf_block_start_for(u32 put)
+{
+    const u32 n = s_cf_i < GCM_CF_N ? s_cf_i : GCM_CF_N;
+    for (u32 t = 1; t <= n; t++) {
+        const u32 k = (s_cf_i - t) % GCM_CF_N;
+        if (s_cf[k].kind != 'J') continue;
+        const u32 to = s_cf[k].to;
+        if (to <= put && put - to <= GCM_RESYNC_BLOCK_BYTES) return to;
+    }
+    return 0xFFFFFFFFu;
+}
+
 static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 {
     static int n = 0;
@@ -1871,6 +1889,29 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * fences inside the block itself, and pushing them here too would publish
      * every one twice. */
     u32 from = (*getoff <= land) ? *getoff : s_last_ring_off;
+    /* ...but only when that range is the stream the walker skipped. If the
+     * walker left the ring through a JUMP into data, `from` is wherever it
+     * stopped, possibly megabytes below put, and from there to `land` is
+     * unrelated IO memory. Ratchet & Clank: A Crack in Time hit this when
+     * reading text in the museum and the Battleplex: get left the start of
+     * one frame block for a table in low IO (0x0003C780) and stopped on a
+     * bad word, with put just past the other block's header (0x0161AF24).
+     * The linear sweep crossed 22 to 27 MB of textures, vertex data and stale
+     * frames and queued 781 to 5724 old fences, more the longer the session
+     * ran. The label walk stopped on the first bad word, so the header's
+     * releases were never replayed. The title spun on that release until
+     * its own 40 second "GPU sit and spin" timeout, with the screen frozen.
+     * The walker took a JUMP into the start of put's block a frame or two
+     * earlier. When `from` lies far below that block, sweep from the block
+     * instead: its header is exactly what was skipped. */
+    { const u32 blk = gcm_cf_block_start_for(land);
+      if (blk != 0xFFFFFFFFu && from < blk && blk - from > GCM_RESYNC_NEAR_BYTES) {
+          static int x = 0;
+          if (PS3_LOG_FIRST(x, 8))
+              fprintf(stderr, "[cellGcmSys] resync from 0x%08X, outside the ring: "
+                      "sweeping put's block 0x%08X..0x%08X instead\n", from, blk, land);
+          from = blk;
+      } }
     if (from < land) {
         unsigned rescued = 0;
         for (u32 io = from; io + 8 <= land; io += 4) {
