@@ -427,7 +427,7 @@ static int rsx_vp_decompile_impl(
             case 0x03: snprintf(rhs,sizeof rhs,"(%s)+(%s)",A,C); break;        /* ADD: src0 + src2 */
             case 0x04: snprintf(rhs,sizeof rhs,"vp_mul((%s),(%s))+(%s)",A,B,C); break; /* MAD */
             case 0x05: snprintf(rhs,sizeof rhs,"vp_dot3((%s),(%s))",A,B); break; /* DP3 */
-            case 0x06: snprintf(rhs,sizeof rhs,"(vp_dot3((%s),(%s))+(%s).w)",A,B,B); break; /* DPH */
+            case 0x06: snprintf(rhs,sizeof rhs,"vp_dot4(float4((%s).xyz,1.0),(%s))",A,B); break; /* DPH: dot3 + b.w */
             case 0x07: snprintf(rhs,sizeof rhs,"vp_dot4((%s),(%s))",A,B); break; /* DP4 */
             case 0x08: snprintf(rhs,sizeof rhs,"float4(1,(%s).y*(%s).y,(%s).z,(%s).w)",A,B,A,B); break; /* DST */
             case 0x09: snprintf(rhs,sizeof rhs,"min((%s),(%s))",A,B); break;   /* MIN */
@@ -474,7 +474,7 @@ static int rsx_vp_decompile_impl(
             if (handled) {
                 char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
                 char line[600];
-                snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
+                snprintf(line,sizeof line,"    { precise float4 _v = (float4)(%s);%s\n",
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
                 if (vec_result && dst_out != 0x1F)
@@ -562,7 +562,7 @@ static int rsx_vp_decompile_impl(
             if (rhs[0]) {
                 char m[6]; mask_str(smx,smy,smz,smw,m);
                 char line[600];
-                snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
+                snprintf(line,sizeof line,"    { precise float4 _v = (float4)(%s);%s\n",
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
                 /* SCA writes the output register when the VEC unit does not
@@ -633,11 +633,50 @@ static int rsx_vp_decompile_impl(
          * text came out NaN, which the FP's NaN guard turned into black. */
         /* Scalar logic per component: glslang's HLSL front end (the Metal
          * path) does not take || on vectors. */
-        "float vp_mul1(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }\n"
+        /* DP3/DP4/DPH as if summed in double precision, then rounded once
+         * (Ogita-Rump-Oishi Dot2: each product's rounding error from an FMA,
+         * each sum's from TwoSum, all added back at the end). Rounding after
+         * every product and add, as plain HLSL does, is not what the RSX
+         * gives: a position far from the map origin (world coordinates in the
+         * thousands) times a camera row nearly cancels against the row's
+         * translation, and the per-step roundings left ~0.3 mm of error that
+         * changed with every camera move. Ratchet's eyes, his ear stripes
+         * and the decals on his gun z-fought their own model in the Insomniac
+         * Museum and parts of the story -- worst looking along the axis with
+         * the large coordinate, clean on the console. Everything is `precise`
+         * (NoContraction): the error terms are only exact if the compiler
+         * neither fuses nor reorders them. A non-finite result (an overflow,
+         * where the error terms turn NaN) falls back to the plain sum. */
+        "float vp_mul1(float a, float b) { precise float p = a * b; return (a == 0.0 || b == 0.0) ? 0.0 : p; }\n"
         "float4 vp_mul(float4 a, float4 b) { return float4(vp_mul1(a.x, b.x), vp_mul1(a.y, b.y),"
         " vp_mul1(a.z, b.z), vp_mul1(a.w, b.w)); }\n"
-        "float vp_dot3(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z; }\n"
-        "float vp_dot4(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n");
+        /* a*b - p exactly, for p = the rounded product (0 under the 0*x rule):
+         * Dekker's product from Veltkamp halves. Only multiplies and adds,
+         * which Vulkan requires correctly rounded -- an FMA (mad) need not be
+         * fused there, and an unfused one would make the error term wrong. */
+        "float vp_mul_err(float a, float b, float p) {\n"
+        "    precise float ca = 4097.0 * a; precise float ah = ca - (ca - a); precise float al = a - ah;\n"
+        "    precise float cb = 4097.0 * b; precise float bh = cb - (cb - b); precise float bl = b - bh;\n"
+        "    precise float e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;\n"
+        "    return (a == 0.0 || b == 0.0) ? 0.0 : e; }\n"
+        /* (p, s) += a*b: p the running rounded sum, s the running error */
+        "void vp_dot_step(inout float p, inout float s, float a, float b) {\n"
+        "    precise float h = vp_mul1(a, b); precise float r = vp_mul_err(a, b, h);\n"
+        "    precise float t = p + h; precise float z = t - p;\n"
+        "    precise float q = (p - (t - z)) + (h - z);\n"
+        "    p = t; precise float s2 = s + (q + r); s = s2; }\n"
+        "float vp_dot3(float4 a, float4 b) {\n"
+        "    precise float p = vp_mul1(a.x, b.x); precise float s = vp_mul_err(a.x, b.x, p);\n"
+        "    vp_dot_step(p, s, a.y, b.y); vp_dot_step(p, s, a.z, b.z);\n"
+        "    precise float d = p + s;\n"
+        "    float4 m = vp_mul(a, b); precise float plain = m.x + m.y + m.z;\n"
+        "    return isfinite(d) ? d : plain; }\n"
+        "float vp_dot4(float4 a, float4 b) {\n"
+        "    precise float p = vp_mul1(a.x, b.x); precise float s = vp_mul_err(a.x, b.x, p);\n"
+        "    vp_dot_step(p, s, a.y, b.y); vp_dot_step(p, s, a.z, b.z); vp_dot_step(p, s, a.w, b.w);\n"
+        "    precise float d = p + s;\n"
+        "    float4 m = vp_mul(a, b); precise float plain = m.x + m.y + m.z + m.w;\n"
+        "    return isfinite(d) ? d : plain; }\n");
 
     for (u32 vtu = 0; vtu < 4; vtu++) {
         if (!((vtex_mask >> vtu) & 1u)) continue;
@@ -670,7 +709,7 @@ static int rsx_vp_decompile_impl(
         }
     }
     emit(&o,
-        "    float4 r[32]; float4 o[16];\n"
+        "    precise float4 r[32]; precise float4 o[16];\n"
         "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
         "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
         "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n"
@@ -689,7 +728,8 @@ static int rsx_vp_decompile_impl(
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"
-        "    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n");
+        "    precise float4 _hpos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n"
+        "    Out.pos = _hpos;\n");
     /* RSX_VP_Z_DEBUG=1: every vertex at mid depth -- separates "the geometry
      * is off the target" from "its depth is out of range" (a diagnostic). */
     if (getenv("RSX_VP_Z_DEBUG")) emit(&o, "    Out.pos.z = Out.pos.w * 0.5;\n");

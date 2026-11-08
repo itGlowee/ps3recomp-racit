@@ -2016,8 +2016,8 @@ static int vp_get_vs(const rsx_state* st)
     }
     if (getenv("VP_BYPASS")) {
         static const char anchor[] =
-            "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
-        static const char repl[] = "Out.pos = float4(v[0].xy * 0.5, 0.5, 1.0);";
+            "_hpos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
+        static const char repl[] = "_hpos = float4(v[0].xy * 0.5, 0.5, 1.0);";
         char* at = hlsl;
         while ((at = strstr(at, anchor)) != NULL) {
             size_t n = sizeof(anchor) - 1, m = sizeof(repl) - 1;
